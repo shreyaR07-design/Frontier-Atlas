@@ -1,13 +1,16 @@
-import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import dotenv from "dotenv";
 import express from "express";
 import { createServer as createViteServer } from "vite";
+import { AtlasBackendService } from "./src/server/atlasBackend.ts";
 
 const PORT = 3000;
 const ROOT_DIR = process.cwd();
 const ATLAS_DIR = path.resolve(ROOT_DIR, "frontier-atlas");
-const VENV_PYTHON = path.resolve(ATLAS_DIR, ".venv/bin/python");
+
+dotenv.config({ path: path.resolve(ROOT_DIR, ".env") });
+dotenv.config({ path: path.resolve(ATLAS_DIR, ".env") });
 
 const ALLOWED_DATASETS = new Set([
   "startups",
@@ -63,59 +66,16 @@ let currentRun: RunJobState = {
   error: null,
 };
 
-function resolvePythonBin(): string {
-  if (fs.existsSync(VENV_PYTHON)) {
-    return VENV_PYTHON;
-  }
-  return "python3";
-}
-
-function runBridgeCommand(args: string[]): Promise<{ ok: boolean; stdout: string; stderr: string; code: number | null }> {
-  return new Promise((resolve) => {
-    const pythonBin = resolvePythonBin();
-    const child = spawn(pythonBin, ["-m", "src.pipeline.bridge", ...args], {
-      cwd: ATLAS_DIR,
-      env: {
-        ...process.env,
-        PYTHONPATH: ATLAS_DIR,
-        PYTHONUNBUFFERED: "1",
-      },
-    });
-
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString("utf-8");
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString("utf-8");
-    });
-    child.on("error", (err) => {
-      resolve({ ok: false, stdout, stderr: err.message, code: 1 });
-    });
-    child.on("close", (code) => {
-      resolve({ ok: code === 0, stdout, stderr, code });
-    });
-  });
-}
-
 async function startServer(): Promise<void> {
+  const atlas = new AtlasBackendService(ATLAS_DIR);
   const app = express();
   app.use(express.json());
 
-  app.get("/api/atlas/status", async (_req, res) => {
-    const exec = await runBridgeCommand(["status"]);
-    if (!exec.ok) {
-      res.status(500).json({
-        error: "Unable to query FrontierAtlas Python backend.",
-        details: exec.stderr || exec.stdout,
-      });
-      return;
-    }
+  app.get("/api/atlas/status", (_req, res) => {
     try {
-      const parsed = JSON.parse(exec.stdout);
+      const statusPayload = atlas.getStatus();
       res.json({
-        ...parsed,
+        ...statusPayload,
         activeRun: {
           id: currentRun.id,
           status: currentRun.status,
@@ -128,13 +88,13 @@ async function startServer(): Promise<void> {
       });
     } catch (err) {
       res.status(500).json({
-        error: "Malformed JSON returned from FrontierAtlas status bridge.",
-        details: String(err),
+        error: "Unable to query FrontierAtlas backend.",
+        details: err instanceof Error ? err.message : String(err),
       });
     }
   });
 
-  app.get("/api/atlas/datasets/:category", async (req, res) => {
+  app.get("/api/atlas/datasets/:category", (req, res) => {
     const { category } = req.params;
     if (!ALLOWED_DATASETS.has(category)) {
       res.status(400).json({ error: `Unsupported dataset category: ${category}` });
@@ -143,18 +103,13 @@ async function startServer(): Promise<void> {
     const rawLimit = Number(req.query.limit ?? 500);
     const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(1, Math.floor(rawLimit)), 2000) : 500;
 
-    const exec = await runBridgeCommand(["dataset", "--category", category, "--limit", String(limit)]);
-    if (!exec.ok) {
+    try {
+      res.json(atlas.getDataset(category, limit));
+    } catch (err) {
       res.status(500).json({
         error: `Failed to query dataset '${category}'.`,
-        details: exec.stderr || exec.stdout,
+        details: err instanceof Error ? err.message : String(err),
       });
-      return;
-    }
-    try {
-      res.json(JSON.parse(exec.stdout));
-    } catch (err) {
-      res.status(500).json({ error: "Invalid dataset JSON response.", details: String(err) });
     }
   });
 
@@ -196,71 +151,29 @@ async function startServer(): Promise<void> {
       error: null,
     };
 
-    const pythonBin = resolvePythonBin();
-    const child = spawn(
-      pythonBin,
-      [
-        "-m",
-        "src.pipeline.bridge",
-        "run",
-        "--categories",
-        ...categories,
-        "--limit",
-        String(limit),
-        "--page",
-        String(page),
-      ],
-      {
-        cwd: ATLAS_DIR,
-        env: {
-          ...process.env,
-          PYTHONPATH: ATLAS_DIR,
-          PYTHONUNBUFFERED: "1",
+    void atlas
+      .runPipeline({
+        categories,
+        limit,
+        page,
+        onLog: (line) => {
+          currentRun.logs = [...currentRun.logs, line].slice(-80);
         },
-      }
-    );
-
-    let stdoutBuffer = "";
-    let stderrBuffer = "";
-
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdoutBuffer += chunk.toString("utf-8");
-    });
-
-    child.stderr.on("data", (chunk: Buffer) => {
-      const text = chunk.toString("utf-8");
-      stderrBuffer += text;
-      const lines = text
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter(Boolean);
-      if (lines.length > 0) {
-        currentRun.logs = [...currentRun.logs, ...lines].slice(-80);
-      }
-    });
-
-    child.on("error", (err) => {
-      currentRun.status = "failed";
-      currentRun.finishedAt = new Date().toISOString();
-      currentRun.error = err.message;
-    });
-
-    child.on("close", (code) => {
-      currentRun.finishedAt = new Date().toISOString();
-      if (code === 0) {
-        try {
-          currentRun.result = JSON.parse(stdoutBuffer);
-          currentRun.status = "completed";
-          currentRun.logs = [...currentRun.logs, "Pipeline run completed and persisted to SQLite + CSV."].slice(-80);
-        } catch (err) {
-          currentRun.status = "failed";
-          currentRun.error = `Run exited 0 but failed to parse output: ${String(err)}`;
-        }
-      } else {
+      })
+      .then((result) => {
+        currentRun.finishedAt = new Date().toISOString();
+        currentRun.result = result;
+        currentRun.status = "completed";
+        currentRun.logs = [
+          ...currentRun.logs,
+          "Pipeline run completed and persisted to SQLite + CSV.",
+        ].slice(-80);
+      })
+      .catch((err) => {
+        currentRun.finishedAt = new Date().toISOString();
         currentRun.status = "failed";
-        currentRun.error = stderrBuffer.trim() || `Pipeline exited with code ${code}`;
-      }
-    });
+        currentRun.error = err instanceof Error ? err.message : String(err);
+      });
 
     res.status(202).json({ run: currentRun });
   });
@@ -269,32 +182,25 @@ async function startServer(): Promise<void> {
     res.json({ run: currentRun });
   });
 
-  app.get("/api/atlas/audit-trail", async (req, res) => {
+  app.get("/api/atlas/audit-trail", (req, res) => {
     const rawCat = typeof req.query.category === "string" ? req.query.category : "";
     const rawRecordId = typeof req.query.recordId === "string" ? req.query.recordId : "";
     const rawLimit = Number(req.query.limit ?? 100);
     const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(1, Math.floor(rawLimit)), 500) : 100;
 
-    const args = ["audit-trail", "--limit", String(limit)];
-    if (rawCat && ALLOWED_RUN_CATEGORIES.has(rawCat)) {
-      args.push("--category", rawCat);
-    }
-    if (rawRecordId.trim()) {
-      args.push("--record-id", rawRecordId.trim());
-    }
-
-    const exec = await runBridgeCommand(args);
-    if (!exec.ok) {
+    try {
+      res.json(
+        atlas.getAuditTrail({
+          category: rawCat && ALLOWED_RUN_CATEGORIES.has(rawCat) ? rawCat : null,
+          recordId: rawRecordId.trim() || null,
+          limit,
+        })
+      );
+    } catch (err) {
       res.status(500).json({
         error: "Failed to query verification audit trail.",
-        details: exec.stderr || exec.stdout,
+        details: err instanceof Error ? err.message : String(err),
       });
-      return;
-    }
-    try {
-      res.json(JSON.parse(exec.stdout));
-    } catch (err) {
-      res.status(500).json({ error: "Invalid audit trail JSON response.", details: String(err) });
     }
   });
 
@@ -310,50 +216,34 @@ async function startServer(): Promise<void> {
       ? reqCats.filter((c): c is string => typeof c === "string" && ALLOWED_AUDIT_CATEGORIES.has(c))
       : Array.from(ALLOWED_AUDIT_CATEGORIES);
 
-    const args = categories.length > 0 ? ["audit", "--categories", ...categories] : ["audit"];
-    if (req.body?.offline === true) {
-      args.push("--offline");
-    }
-    const exec = await runBridgeCommand(args);
-    if (!exec.ok) {
-      res.status(500).json({
-        error: exec.stderr || "Source verification audit failed.",
-      });
-      return;
-    }
     try {
-      res.json(JSON.parse(exec.stdout));
+      const result = await atlas.auditExisting({
+        categories: categories.length > 0 ? categories : Array.from(ALLOWED_AUDIT_CATEGORIES),
+        liveCheck: req.body?.offline !== true,
+        removeDuplicates: req.body?.keepDuplicates !== true,
+      });
+      res.json(result);
     } catch (err) {
-      res.status(500).json({ error: "Invalid audit JSON response.", details: String(err) });
+      res.status(500).json({
+        error: err instanceof Error ? err.message : "Source verification audit failed.",
+      });
     }
   });
 
   app.post("/api/atlas/export/sheets", async (_req, res) => {
-    const exec = await runBridgeCommand(["export-sheets"]);
-    if (!exec.ok && !exec.stdout) {
-      res.status(500).json({
-        success: false,
-        error: exec.stderr || "Google Sheets export command failed.",
-      });
-      return;
-    }
     try {
-      res.json(JSON.parse(exec.stdout));
+      const result = await atlas.exportGoogleSheets();
+      res.json(result);
     } catch (err) {
-      res.status(500).json({ success: false, error: String(err) });
+      res.status(500).json({ success: false, error: err instanceof Error ? err.message : String(err) });
     }
   });
 
-  app.post("/api/atlas/export/csv", async (_req, res) => {
-    const exec = await runBridgeCommand(["export-csv"]);
-    if (!exec.ok) {
-      res.status(500).json({ error: exec.stderr || "CSV export failed." });
-      return;
-    }
+  app.post("/api/atlas/export/csv", (_req, res) => {
     try {
-      res.json(JSON.parse(exec.stdout));
+      res.json(atlas.exportAllCsv());
     } catch (err) {
-      res.status(500).json({ error: String(err) });
+      res.status(500).json({ error: err instanceof Error ? err.message : "CSV export failed." });
     }
   });
 
