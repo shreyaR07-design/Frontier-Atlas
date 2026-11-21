@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+build/
+dist/
+*.egg-info/
+
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+*credentials*.json
+*service_account*.json
+
+# Local Data & Logs
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.csv
+data/*.json
+!data/.gitkeep
+logs/
+*.log
+
+# Testing & Cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# OS
+.DS_Store
+Thumbs.db

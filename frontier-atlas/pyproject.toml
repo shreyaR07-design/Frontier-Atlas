@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "frontier-atlas"
+version = "0.1.0"
+description = "AI-Powered Data Intelligence & Entity Resolution Pipeline"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "live: marks integration tests that make live external HTTP requests (deselected by default unless ENABLE_LIVE_TESTS=true)",
+]

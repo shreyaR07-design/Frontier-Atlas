@@ -1,0 +1,44 @@
+{
+  "generated_at_utc": "2026-11-21T11:30:11.896074+00:00",
+  "categories": {
+    "startups": {
+      "discovered": 5,
+      "extracted": 5,
+      "validated": 5,
+      "rejected": 0,
+      "duplicates": 0,
+      "persisted_total": 23,
+      "target_minimum": 1000,
+      "target_met": false,
+      "verification_breakdown": {
+        "Verified": 1,
+        "Partially Verified": 4,
+        "Unverified": 0,
+        "Source Unavailable": 0,
+        "Rejected": 0
+      },
+      "missing_fields": {},
+      "source_distribution": {
+        "yc_oss_directory": 5
+      },
+      "freshness": null,
+      "sample_rejection_reasons": []
+    }
+  },
+  "entity_resolution": {
+    "total_logged": 5,
+    "exact_match": 0,
+    "auto_merge": 0,
+    "manual_review": 0,
+    "new_entity": 5,
+    "rejected": 0
+  },
+  "verification_summary": {
+    "Verified": 1,
+    "Partially Verified": 4,
+    "Unverified": 0,
+    "Source Unavailable": 0,
+    "Rejected": 0
+  },
+  "unavailable_sources": []
+}

@@ -1,0 +1,6 @@
+{
+  "name": "FrontierAtlas",
+  "description": "AI-powered data intelligence, structured extraction, and entity resolution pipeline.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
