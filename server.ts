@@ -5,12 +5,17 @@ import express from "express";
 import { createServer as createViteServer } from "vite";
 import { AtlasBackendService } from "./src/server/atlasBackend.ts";
 
-const PORT = 3000;
 const ROOT_DIR = process.cwd();
 const ATLAS_DIR = path.resolve(ROOT_DIR, "frontier-atlas");
 
 dotenv.config({ path: path.resolve(ROOT_DIR, ".env") });
 dotenv.config({ path: path.resolve(ATLAS_DIR, ".env") });
+
+const PORT = Number(process.env.PORT ?? 3000);
+const HOST = process.env.HOST ?? "0.0.0.0";
+if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
+  throw new Error(`Invalid PORT '${process.env.PORT}'. PORT must be an integer from 1 to 65535.`);
+}
 
 const ALLOWED_DATASETS = new Set([
   "startups",
@@ -69,7 +74,12 @@ let currentRun: RunJobState = {
 async function startServer(): Promise<void> {
   const atlas = new AtlasBackendService(ATLAS_DIR);
   const app = express();
-  app.use(express.json());
+  // Avoid accepting arbitrarily large API payloads from clients.
+  app.use(express.json({ limit: "1mb" }));
+
+  app.get("/api/health", (_req, res) => {
+    res.json({ ok: true, service: "frontier-atlas", timestamp: new Date().toISOString() });
+  });
 
   app.get("/api/atlas/status", (_req, res) => {
     try {
@@ -191,7 +201,7 @@ async function startServer(): Promise<void> {
     try {
       res.json(
         atlas.getAuditTrail({
-          category: rawCat && ALLOWED_RUN_CATEGORIES.has(rawCat) ? rawCat : null,
+          category: rawCat && ALLOWED_AUDIT_CATEGORIES.has(rawCat) ? rawCat : null,
           recordId: rawRecordId.trim() || null,
           limit,
         })
@@ -275,8 +285,8 @@ async function startServer(): Promise<void> {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`FrontierAtlas dashboard server listening on http://0.0.0.0:${PORT}`);
+  app.listen(PORT, HOST, () => {
+    console.log(`FrontierAtlas dashboard server listening on http://${HOST}:${PORT}`);
   });
 }
 
