@@ -266,11 +266,13 @@ function classifyHttpError(providerName: string, status: number, bodyText: strin
 
 export class GeminiLLMProvider implements LLMProvider {
   public readonly providerName = "gemini";
+  private readonly apiKey: string | null;
+  private readonly model: string;
 
-  constructor(
-    private readonly apiKey: string | null,
-    private readonly model: string
-  ) {}
+  constructor(apiKey: string | null, model: string) {
+    this.apiKey = apiKey;
+    this.model = model;
+  }
 
   public isConfigured(): boolean {
     return Boolean(this.apiKey && this.apiKey.trim());
@@ -325,14 +327,22 @@ export class GeminiLLMProvider implements LLMProvider {
 
 export class OpenAICompatibleLLMProvider implements LLMProvider {
   public readonly providerName: string;
+  private readonly opts: {
+    providerName: string;
+    apiKey: string | null;
+    model: string;
+    endpointUrl: string;
+    timeoutMs?: number;
+  };
 
-  constructor(private readonly opts: {
+  constructor(opts: {
     providerName: string;
     apiKey: string | null;
     model: string;
     endpointUrl: string;
     timeoutMs?: number;
   }) {
+    this.opts = opts;
     this.providerName = opts.providerName;
   }
 
@@ -567,11 +577,13 @@ export interface LLMExtractionResult {
 export class LLMRouter {
   private readonly maxInputTokens: number;
   private readonly overlapTokens: number;
+  private readonly providers: LLMProvider[];
 
   constructor(
-    private readonly providers: LLMProvider[],
+    providers: LLMProvider[],
     opts: { maxInputTokens?: number; overlapTokens?: number } = {}
   ) {
+    this.providers = providers;
     this.maxInputTokens = opts.maxInputTokens ?? 5500;
     this.overlapTokens = opts.overlapTokens ?? 180;
   }
@@ -636,8 +648,8 @@ export class LLMRouter {
         : [];
       return { rawRecords: recs, providerUsed: providerName, attemptedProviders, subSplits: 0, errors: [] };
     } catch (err) {
-      if (err instanceof PayloadTooLargeError && depth < 3 && tokenBudget > 600) {
-        const nextBudget = Math.max(600, Math.floor(tokenBudget / 2));
+      if (err instanceof PayloadTooLargeError && depth < 4 && tokenBudget > 250) {
+        const nextBudget = Math.max(250, Math.floor(tokenBudget / 2));
         const subChunks = chunkText(text, {
           maxTokens: nextBudget,
           overlapTokens: Math.min(100, this.overlapTokens),

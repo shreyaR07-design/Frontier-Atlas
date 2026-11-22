@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import re
 from typing import Any, Awaitable, Callable, TypeVar
 
@@ -87,7 +88,8 @@ async def run_with_retry(
             last_error = exc
             if attempt == max_attempts:
                 break
-            delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+            jitter = random.uniform(0.0, 0.35)
+            delay = min(max_delay, base_delay * (2 ** (attempt - 1)) + jitter)
             logger.warning(
                 "Retrying LLM operation",
                 extra={

@@ -297,11 +297,12 @@ export interface SheetsConnectionStatus {
 export class GoogleSheetsService {
   private cachedToken: { token: string; expiresAtMs: number } | null = null;
   private readonly apiBase: string;
+  private readonly config: GoogleSheetsConfig;
+  private readonly db: AtlasDatabase;
 
-  constructor(
-    private readonly config: GoogleSheetsConfig,
-    private readonly db: AtlasDatabase
-  ) {
+  constructor(config: GoogleSheetsConfig, db: AtlasDatabase) {
+    this.config = config;
+    this.db = db;
     this.apiBase = (config.apiBaseUrl || "https://sheets.googleapis.com/v4").replace(/\/+$/, "");
   }
 

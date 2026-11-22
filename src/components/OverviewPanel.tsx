@@ -203,6 +203,21 @@ export function OverviewPanel({
   if (status && !status.credentials.geminiConfigured) missingCredsList.push("GEMINI_API_KEY");
   if (status && !status.credentials.githubTokenConfigured) missingCredsList.push("GITHUB_TOKEN");
 
+  const assessedTotal =
+    verificationTotals.Verified +
+    verificationTotals["Partially Verified"] +
+    verificationTotals.Unverified +
+    verificationTotals["Source Unavailable"] +
+    verificationTotals.Rejected;
+  const verifiedPct =
+    assessedTotal > 0 ? ((verificationTotals.Verified / assessedTotal) * 100).toFixed(1) : "0.0";
+  const corroboratedPct =
+    assessedTotal > 0
+      ? (((verificationTotals.Verified + verificationTotals["Partially Verified"]) / assessedTotal) * 100).toFixed(1)
+      : "0.0";
+  const jobsFresh = report?.categories?.jobs?.freshness ?? null;
+  const newsFresh = report?.categories?.news?.freshness ?? null;
+
   return (
     <div className="space-y-8">
       {/* Top Pipeline Summary Strip */}
@@ -274,14 +289,15 @@ export function OverviewPanel({
           </div>
         </div>
 
-        {/* Verification Status Summary Row (Verified / Partially Verified / Unverified / Source Unavailable / Rejected) */}
-        <div className="mt-5 pt-4 border-t border-slate-800/80 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4">
+        {/* Verification & Freshness KPI Strip */}
+        <div className="mt-5 pt-4 border-t border-slate-800/80 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
           <div className="space-y-0.5">
             <div className="text-xs text-slate-400">Verified</div>
             <div className="font-mono text-lg font-semibold text-emerald-400 tabular-nums">
               {verificationTotals.Verified.toLocaleString()}
+              <span className="text-xs font-normal text-emerald-400/80 ml-1.5">({verifiedPct}%)</span>
             </div>
-            <div className="text-[11px] text-slate-500">Accessible &amp; corroborated</div>
+            <div className="text-[11px] text-slate-500">Corroborated total: {corroboratedPct}%</div>
           </div>
 
           <div className="space-y-0.5">
@@ -305,7 +321,11 @@ export function OverviewPanel({
             <div className="font-mono text-lg font-semibold text-slate-300 tabular-nums">
               {verificationTotals["Source Unavailable"].toLocaleString()}
             </div>
-            <div className="text-[11px] text-slate-500">HTTP error, timeout, or blocked</div>
+            <div className="text-[11px] text-slate-500">
+              {unavailableSources.length > 0
+                ? `${unavailableSources.length} feed${unavailableSources.length === 1 ? "" : "s"} degraded`
+                : "HTTP error, timeout, or blocked"}
+            </div>
           </div>
 
           <div className="space-y-0.5">
@@ -313,7 +333,19 @@ export function OverviewPanel({
             <div className="font-mono text-lg font-semibold text-rose-400 tabular-nums">
               {verificationTotals.Rejected.toLocaleString()}
             </div>
-            <div className="text-[11px] text-slate-500">Preserved rejected rows &amp; failures</div>
+            <div className="text-[11px] text-slate-500">Preserved rows &amp; rule failures</div>
+          </div>
+
+          <div className="space-y-0.5">
+            <div className="text-xs text-slate-400">24h UTC Freshness</div>
+            <div className="font-mono text-sm font-semibold text-slate-100 tabular-nums pt-0.5">
+              {(status?.counts.jobs ?? 0).toLocaleString()} Jobs · {(status?.counts.news ?? 0).toLocaleString()} News
+            </div>
+            <div className="text-[11px] text-slate-500 tabular-nums">
+              {jobsFresh || newsFresh
+                ? `Window: ${status?.freshnessWindowHours ?? 24}h (${jobsFresh?.accepted ?? 0}J / ${newsFresh?.accepted ?? 0}N accepted)`
+                : `Strict ${status?.freshnessWindowHours ?? 24}h UTC filter`}
+            </div>
           </div>
         </div>
 
@@ -480,74 +512,109 @@ export function OverviewPanel({
         {/* Freshness & Verification Quality Audit */}
         <div className="rounded-xl bg-[#0E172B] border border-slate-800/80 p-5 sm:p-6 flex flex-col">
           <div className="flex items-center justify-between gap-2 mb-4">
-            <h2 className="font-display text-base font-semibold text-slate-100">
-              Source Verification &amp; 24h UTC Audit
-            </h2>
+            <div>
+              <h2 className="font-display text-base font-semibold text-slate-100">
+                Dataset Quality &amp; Verification Matrix
+              </h2>
+              <p className="text-xs text-slate-400 mt-0.5">
+                Live SQLite verification counts, source health, and 24h UTC freshness enforcement.
+              </p>
+            </div>
             <Clock className="w-4 h-4 text-slate-400 shrink-0" />
           </div>
 
-          {!report ? (
-            <div className="flex-1 flex flex-col justify-center py-6 text-sm text-slate-400 space-y-2">
-              <p>No quality report has been generated yet (`data/quality_report.json` not present).</p>
-              <p className="text-xs text-slate-500 font-mono">
-                Run `Run Collection` above or execute `python -m src.pipeline.orchestrator --limit 25` to audit real sources.
-              </p>
+          <div className="space-y-4 text-sm">
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse">
+                <thead>
+                  <tr className="border-b border-slate-800 text-xs text-slate-400">
+                    <th className="py-2 pr-3 font-medium">Dataset</th>
+                    <th className="py-2 px-2 font-medium text-right">Total</th>
+                    <th className="py-2 px-2 font-medium text-right">Verified</th>
+                    <th className="py-2 px-2 font-medium text-right">Partial</th>
+                    <th className="py-2 px-2 font-medium text-right">Unverified</th>
+                    <th className="py-2 px-2 font-medium text-right">Unavail.</th>
+                    <th className="py-2 px-2 font-medium text-right">Rejected</th>
+                    <th className="py-2 pl-2 font-medium text-right">Ver. %</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/60 text-xs font-mono tabular-nums">
+                  {DATASET_META.map((meta) => {
+                    const rowTotal = status?.counts[meta.key] ?? 0;
+                    const catVer = verificationByCategory[meta.key];
+                    const repVer = report?.categories?.[meta.key]?.verification_breakdown ?? {};
+                    const verCount = catVer?.Verified ?? repVer.Verified ?? 0;
+                    const partCount = catVer?.["Partially Verified"] ?? repVer["Partially Verified"] ?? 0;
+                    const unvCount = catVer?.Unverified ?? repVer.Unverified ?? 0;
+                    const unavailCount = catVer?.["Source Unavailable"] ?? repVer["Source Unavailable"] ?? 0;
+                    const rejCount =
+                      catVer?.Rejected ??
+                      repVer.Rejected ??
+                      report?.categories?.[meta.key]?.rejected ??
+                      0;
+                    const isEntityLog = meta.key === "entity_mapping_log";
+                    const pctStr = isEntityLog
+                      ? "Audit"
+                      : rowTotal > 0
+                      ? `${((verCount / rowTotal) * 100).toFixed(1)}%`
+                      : "0.0%";
+                    return (
+                      <tr
+                        key={meta.key}
+                        onClick={() => onSelectSection(meta.key)}
+                        className="hover:bg-slate-800/40 cursor-pointer transition-colors"
+                      >
+                        <td className="py-2.5 pr-3 font-sans text-slate-200 font-medium">{meta.label}</td>
+                        <td className="py-2.5 px-2 text-right text-slate-200">{rowTotal.toLocaleString()}</td>
+                        <td className="py-2.5 px-2 text-right text-emerald-400">
+                          {isEntityLog ? "—" : verCount.toLocaleString()}
+                        </td>
+                        <td className="py-2.5 px-2 text-right text-sky-400">
+                          {isEntityLog ? "—" : partCount.toLocaleString()}
+                        </td>
+                        <td className="py-2.5 px-2 text-right text-amber-400">
+                          {isEntityLog ? "—" : unvCount.toLocaleString()}
+                        </td>
+                        <td className="py-2.5 px-2 text-right text-slate-400">
+                          {isEntityLog ? "—" : unavailCount.toLocaleString()}
+                        </td>
+                        <td className="py-2.5 px-2 text-right text-rose-400">
+                          {isEntityLog ? "—" : rejCount.toLocaleString()}
+                        </td>
+                        <td className="py-2.5 pl-2 text-right text-slate-300">{pctStr}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
             </div>
-          ) : (
-            <div className="space-y-4 text-sm">
-              <div className="overflow-x-auto">
-                <table className="w-full text-left border-collapse">
-                  <thead>
-                    <tr className="border-b border-slate-800 text-xs text-slate-400">
-                      <th className="py-2 pr-3 font-medium">Dataset</th>
-                      <th className="py-2 px-2 font-medium text-right">Verified</th>
-                      <th className="py-2 px-2 font-medium text-right">Partial</th>
-                      <th className="py-2 px-2 font-medium text-right">Unverified</th>
-                      <th className="py-2 px-2 font-medium text-right">Dupes</th>
-                      <th className="py-2 pl-2 font-medium text-right">Rejected</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-800/60 text-xs font-mono tabular-nums">
-                    {Object.entries(report.categories).map(([cat, stats]) => {
-                      const vb = stats.verification_breakdown ?? {};
-                      const verCount = verificationByCategory[cat]?.Verified ?? vb.Verified ?? 0;
-                      const partCount =
-                        verificationByCategory[cat]?.["Partially Verified"] ?? vb["Partially Verified"] ?? 0;
-                      const unvCount =
-                        (verificationByCategory[cat]?.Unverified ?? vb.Unverified ?? 0) +
-                        (verificationByCategory[cat]?.["Source Unavailable"] ?? vb["Source Unavailable"] ?? 0);
-                      return (
-                        <tr key={cat} className="hover:bg-slate-800/30">
-                          <td className="py-2.5 pr-3 font-sans text-slate-200 font-medium">{cat}</td>
-                          <td className="py-2.5 px-2 text-right text-emerald-400">{verCount}</td>
-                          <td className="py-2.5 px-2 text-right text-sky-400">{partCount}</td>
-                          <td className="py-2.5 px-2 text-right text-amber-400">{unvCount}</td>
-                          <td className="py-2.5 px-2 text-right text-slate-400">{stats.duplicates}</td>
-                          <td className="py-2.5 pl-2 text-right text-rose-400">{stats.rejected}</td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
+
+            {report?.entity_resolution && (
+              <div className="pt-3 border-t border-slate-800/70 text-xs text-slate-300 flex flex-wrap gap-x-4 gap-y-1 tabular-nums">
+                <span className="font-medium text-slate-200">Entity Resolution:</span>
+                <span>Exact {report.entity_resolution.exact_match ?? 0}</span>
+                <span>Auto Merge {report.entity_resolution.auto_merge ?? 0}</span>
+                <span>Manual Review {report.entity_resolution.manual_review ?? 0}</span>
+                <span>New Entities {report.entity_resolution.new_entity ?? 0}</span>
               </div>
+            )}
 
-              {report.entity_resolution && (
-                <div className="pt-3 border-t border-slate-800/70 text-xs text-slate-300 flex flex-wrap gap-x-4 gap-y-1 tabular-nums">
-                  <span className="font-medium text-slate-200">Entity Resolution:</span>
-                  <span>Exact {report.entity_resolution.exact_match ?? 0}</span>
-                  <span>Auto Merge {report.entity_resolution.auto_merge ?? 0}</span>
-                  <span>Manual Review {report.entity_resolution.manual_review ?? 0}</span>
-                  <span>New Entities {report.entity_resolution.new_entity ?? 0}</span>
-                </div>
-              )}
-
-              {report.unavailable_sources.length > 0 && (
-                <div className="pt-2 text-xs text-amber-300">
-                  Unavailable sources during last run: {report.unavailable_sources.join(", ")}
-                </div>
+            <div className="pt-2 border-t border-slate-800/70 text-xs flex flex-wrap items-center justify-between gap-2">
+              <span className="text-slate-400">
+                Source Health:{" "}
+                <span className={unavailableSources.length > 0 ? "text-amber-300" : "text-emerald-400"}>
+                  {unavailableSources.length > 0
+                    ? `${unavailableSources.length} degraded (${unavailableSources.slice(0, 4).join(", ")}${unavailableSources.length > 4 ? "..." : ""})`
+                    : "All monitored API & RSS endpoints operational"}
+                </span>
+              </span>
+              {report?.generated_at_utc && (
+                <span className="font-mono text-slate-500 tabular-nums">
+                  {new Date(report.generated_at_utc).toLocaleTimeString()}
+                </span>
               )}
             </div>
-          )}
+          </div>
         </div>
 
         {/* Credentials & Integration Status */}
@@ -564,7 +631,7 @@ export function OverviewPanel({
 
           <div>
             <CredentialRow
-              label={`Google Gemini (${status?.credentials.geminiModel ?? "gemini-2.5-flash"})`}
+              label={`Google Gemini (${status?.credentials.geminiModel ?? "gemini-4-hydrogen"})`}
               envKey="GEMINI_API_KEY"
               configured={status?.credentials.geminiConfigured ?? false}
               detail="Primary provider in LLMRouter for unstructured HTML extraction with token-aware chunking and 413 sub-chunking."
@@ -615,7 +682,7 @@ export function OverviewPanel({
               </div>
               <div className="flex items-center gap-2">
                 <span
-                  className={`inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-0.5 rounded-full border ${
+                  className={`inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-0.5 rounded-md border ${
                     sheetsStatus.status === "Connected" || googleHasToken
                       ? "bg-emerald-950/50 border-emerald-700/60 text-emerald-300"
                       : sheetsStatus.status === "Sync Failed"

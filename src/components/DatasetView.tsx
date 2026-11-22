@@ -21,6 +21,7 @@ interface DatasetViewProps {
   loading: boolean;
   error: string | null;
   hasCsvExport: boolean;
+  onSelectCategory?: (category: DatasetCategory) => void;
   onRetry: () => void;
   onOpenRunModal: () => void;
 }
@@ -200,6 +201,7 @@ export function DatasetView({
   loading,
   error,
   hasCsvExport,
+  onSelectCategory,
   onRetry,
   onOpenRunModal,
 }: DatasetViewProps) {
@@ -349,6 +351,21 @@ export function DatasetView({
               className="w-full pl-9 pr-3 py-2 rounded-lg bg-[#070D1A] border border-slate-800 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500"
             />
           </div>
+
+          {onSelectCategory && (
+            <select
+              value={category}
+              onChange={(e) => onSelectCategory(e.target.value as DatasetCategory)}
+              aria-label="Filter by dataset"
+              className="px-3 py-2 rounded-lg bg-[#070D1A] border border-slate-800 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-sky-500"
+            >
+              {(Object.keys(CATEGORY_INFO) as DatasetCategory[]).map((catKey) => (
+                <option key={catKey} value={catKey}>
+                  {CATEGORY_INFO[catKey].title}
+                </option>
+              ))}
+            </select>
+          )}
 
           {supportsVerification && (
             <select
@@ -821,6 +838,14 @@ export function DatasetView({
 
                   if (category === "jobs") {
                     const r = row as JobRow;
+                    const jobMeta = parseJsonRecord(r.source_metadata_json);
+                    const roleFamily = typeof jobMeta.role_family === "string" ? jobMeta.role_family : null;
+                    const remoteElig =
+                      jobMeta.remote_eligible === true
+                        ? "Remote-Eligible"
+                        : jobMeta.remote_eligible === false
+                        ? "On-Site / Hybrid"
+                        : null;
                     return (
                       <tr
                         key={r.job_id || idx}
@@ -832,7 +857,12 @@ export function DatasetView({
                           <div className="text-xs text-slate-400 mt-0.5">{r.company || "Unknown"}</div>
                         </td>
                         <td className="py-3 px-4 text-xs text-slate-300">
-                          {[r.location || "Unknown", r.employment_type || "Unknown"].join(" · ")}
+                          <div>{[r.location || "Unknown", r.employment_type || "Unknown"].join(" · ")}</div>
+                          {(roleFamily || remoteElig) && (
+                            <div className="text-[11px] text-slate-400 mt-0.5">
+                              {[roleFamily, remoteElig].filter(Boolean).join(" · ")}
+                            </div>
+                          )}
                         </td>
                         <td className="py-3 px-4">
                           <VerificationStatusCell
@@ -1096,7 +1126,25 @@ export function DatasetView({
         const meta = parseJsonRecord(rec.source_metadata_json);
         const verStatus = String(rec.verification_status ?? "Unverified");
         const verMode = String(meta.verification_mode ?? "");
-        const isLiveChecked = verMode === "live_http_check";
+        const LIVE_MODES = new Set([
+          "live_http_check",
+          "live_api_corroboration",
+          "live_article_corroboration",
+          "live_api_snapshot_check",
+        ]);
+        const isLiveChecked = LIVE_MODES.has(verMode);
+        const verModeLabel =
+          verMode === "live_api_corroboration"
+            ? "Live Authoritative API Verified"
+            : verMode === "live_article_corroboration"
+            ? "Live Article URL Corroborated"
+            : verMode === "live_api_snapshot_check"
+            ? "Live Feed Snapshot Verified"
+            : verMode === "live_http_check"
+            ? "Live HTTP Source Checked"
+            : "Offline / Not Live-Verified";
+        const confidenceScore =
+          typeof meta.confidence_score === "number" ? meta.confidence_score : null;
         const evidenceExcerpt =
           typeof meta.source_evidence_excerpt === "string" && meta.source_evidence_excerpt.trim()
             ? meta.source_evidence_excerpt
@@ -1104,6 +1152,11 @@ export function DatasetView({
         const auditIssues = Array.isArray(meta.audit_issues) ? meta.audit_issues.map(String) : [];
         const unsupportedFields = Array.isArray(meta.unsupported_fields) ? meta.unsupported_fields.map(String) : [];
         const incompleteFields = Array.isArray(meta.incomplete_fields) ? meta.incomplete_fields.map(String) : [];
+        const verifiedFields = Array.isArray(meta.verified_fields) ? meta.verified_fields.map(String) : [];
+        const unverifiedFields = Array.isArray(meta.unverified_fields)
+          ? meta.unverified_fields.map(String)
+          : Array.from(new Set([...unsupportedFields, ...incompleteFields]));
+        const ghMetrics = parseJsonRecord(meta.github_metrics);
         const duplicateOf = typeof meta.duplicate_of === "string" ? meta.duplicate_of : null;
         const rejectionReason = typeof rec.rejection_reason === "string" && rec.rejection_reason.trim()
           ? rec.rejection_reason
@@ -1146,9 +1199,17 @@ export function DatasetView({
                   {supportsVerification && (
                     <div className="flex flex-wrap items-center gap-x-3 gap-y-1 pt-1 text-xs">
                       <span className={`font-semibold ${statusColor}`}>{verStatus}</span>
+                      {confidenceScore !== null && (
+                        <>
+                          <span className="text-slate-600" aria-hidden="true">·</span>
+                          <span className="font-mono text-slate-200 tabular-nums">
+                            Confidence {(confidenceScore * 100).toFixed(0)}%
+                          </span>
+                        </>
+                      )}
                       <span className="text-slate-600" aria-hidden="true">·</span>
                       <span className={isLiveChecked ? "text-emerald-300" : "text-amber-300"}>
-                        {isLiveChecked ? "Live HTTP Source Checked" : "Offline / Not Live-Verified"}
+                        {verModeLabel}
                       </span>
                       {typeof meta.source_http_status === "number" && (
                         <>
@@ -1477,16 +1538,90 @@ export function DatasetView({
                   )}
 
                   <div>
-                    <div className="text-slate-500 mb-0.5">Supported Fields</div>
+                    <div className="text-slate-500 mb-0.5">Verified Fields</div>
                     <div className="font-mono text-emerald-300">
-                      {parseSupportedFields(rec.supported_fields_json)}
+                      {verifiedFields.length > 0 ? verifiedFields.join(", ") : parseSupportedFields(rec.supported_fields_json)}
                     </div>
                   </div>
 
-                  {unsupportedFields.length > 0 && (
+                  {unverifiedFields.length > 0 && (
                     <div>
-                      <div className="text-slate-500 mb-0.5">Unsupported / Stripped Fields</div>
-                      <div className="font-mono text-amber-300">{unsupportedFields.join(", ")}</div>
+                      <div className="text-slate-500 mb-0.5">Unverified / Missing Fields</div>
+                      <div className="font-mono text-amber-300">{unverifiedFields.join(", ")}</div>
+                    </div>
+                  )}
+
+                  {category === "research_papers" && Boolean(rec.github_repository) && (
+                    <div className="rounded-lg border border-slate-800 bg-[#0B1324] p-3 space-y-1.5">
+                      <div className="text-slate-400 font-medium">Associated GitHub Repository Metrics</div>
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <a
+                          href={String(rec.github_repository)}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-sky-400 hover:underline font-mono inline-flex items-center gap-1 break-all"
+                        >
+                          <span>{String(rec.github_repository)}</span>
+                          <ExternalLink className="w-3 h-3 shrink-0" />
+                        </a>
+                        <span className="font-mono text-slate-200 tabular-nums">
+                          Stars: {typeof rec.github_stars === "number" ? rec.github_stars.toLocaleString() : "—"}
+                        </span>
+                      </div>
+                      <div className="text-[11px] font-mono text-slate-400 tabular-nums">
+                        Metrics Updated:{" "}
+                        {typeof ghMetrics.metrics_updated_at === "string"
+                          ? formatUtc(ghMetrics.metrics_updated_at)
+                          : "—"}
+                        {typeof ghMetrics.metrics_status === "string" ? ` · ${ghMetrics.metrics_status}` : ""}
+                      </div>
+                    </div>
+                  )}
+
+                  {category === "jobs" && (
+                    <div className="rounded-lg border border-slate-800 bg-[#0B1324] p-3 space-y-1.5">
+                      <div className="text-slate-400 font-medium">Job Role &amp; Remote Eligibility Audit</div>
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <div className="text-slate-500">Role Family</div>
+                          <div className="text-slate-200 font-medium">
+                            {typeof meta.role_family === "string" ? meta.role_family : "AI / ML Role"}
+                          </div>
+                        </div>
+                        <div>
+                          <div className="text-slate-500">Remote Eligible</div>
+                          <div className="text-slate-200 font-mono">
+                            {meta.remote_eligible === true
+                              ? "true"
+                              : meta.remote_eligible === false
+                              ? "false"
+                              : "Unknown"}
+                          </div>
+                        </div>
+                      </div>
+                      {typeof meta.remote_evidence === "string" && (
+                        <div className="text-[11px] text-slate-400">Evidence: {meta.remote_evidence}</div>
+                      )}
+                      <div className="text-[11px] font-mono text-slate-400 tabular-nums">
+                        Posted: {formatUtc(typeof rec.posted_at === "string" ? rec.posted_at : null)}
+                      </div>
+                    </div>
+                  )}
+
+                  {category === "news" && (
+                    <div className="rounded-lg border border-slate-800 bg-[#0B1324] p-3 space-y-1.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-slate-400 font-medium">Article Content &amp; Freshness Audit</span>
+                        {typeof meta.timestamp_precision === "string" && (
+                          <span className="font-mono text-[11px] text-slate-400">{meta.timestamp_precision}</span>
+                        )}
+                      </div>
+                      <div className="text-[11px] font-mono text-slate-400 tabular-nums">
+                        Published (UTC): {formatUtc(typeof rec.published_at === "string" ? rec.published_at : null)}
+                      </div>
+                      {typeof meta.full_text_excerpt === "string" && meta.full_text_excerpt.trim() && (
+                        <p className="text-slate-300 leading-relaxed line-clamp-4">{meta.full_text_excerpt}</p>
+                      )}
                     </div>
                   )}
 

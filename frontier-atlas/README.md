@@ -18,7 +18,7 @@ FrontierAtlas collects, extracts, validates, deduplicates, resolves, stores, and
 - **Compliant Asynchronous Collection**: Built on `asyncio` and `aiohttp` with bounded concurrency (`asyncio.Semaphore`), per-domain rate limiting, request deduplication, exponential backoff retries, `robots.txt` policy checks, and optional Playwright rendering only for permitted JS pages.
 - **Official Public APIs & Feeds**: Integrates OpenAlex, arXiv Atom API, Crossref, GitHub REST API (repositories + star enrichment), Remotive, Arbeitnow, public Greenhouse boards, Hacker News Algolia API, RSS/Atom feeds, and the YC OSS public directory.
 - **Gemini LLM Extraction Engine**: Uses the official `google-genai` Python SDK (`GEMINI_API_KEY`, `GEMINI_MODEL`) with JSON-only structured output, token-aware chunking, controlled retries (`429`, `5xx`, malformed JSON), automatic sub-chunking on `413`, and source-evidence verification so LLM outputs are audited against original source text.
-- **Provider Routing**: Gemini is the primary provider. Optional fallback providers (`groq`, `deepseek`) activate only when their API keys are configured; otherwise the router fails gracefully and logs errors without fabricating results.
+- **Provider Routing**: Gemini (`gemini-4-hydrogen`) is the primary provider. Optional fallback providers (`groq`, `llama3`, `deepseek`) activate only when their API keys are configured; otherwise the router fails gracefully and logs errors without fabricating results.
 - **Conservative Entity Resolution**: NFKC/lowercase/punctuation/legal-suffix normalization, alias registry, compact spacing checks, domain matching (excluding generic hosts like `github.com`), false-positive guards, and `EntityMappingLog` auditing (`exact_match`, `auto_merge`, `manual_review`, `new_entity`).
 - **24-Hour UTC Freshness & Data Quality**: Strict UTC window filtering for Jobs and News, canonical URL/DOI/arXiv deduplication, Pydantic v2 validation, failure preservation (`failure_logs`), and JSON quality reporting (`data/quality_report.json`).
 - **Storage & Exports**: Local SQLite (`WAL` mode, transactional batch upserts, unique constraints, incremental checkpoints) with PostgreSQL-compatible SQL schema (`psycopg`), six-tab Google Sheets batch exporter with quota retry, and deterministic CSV fallback export.
@@ -133,10 +133,13 @@ Configure values in `.env` (never commit `.env` or credential JSON files):
 | Variable | Description | Default |
 |---|---|---|
 | `GEMINI_API_KEY` | Google Gemini API key | *(empty)* |
-| `GEMINI_MODEL` | Active Gemini model name | `gemini-2.5-flash` |
+| `GEMINI_MODEL` | Active Gemini model name | `gemini-4-hydrogen` |
 | `GROQ_API_KEY` | Optional Groq tier-2 fallback API key | *(empty)* |
 | `GROQ_MODEL` | Optional Groq model | `llama-3.3-70b-versatile` |
-| `DEEPSEEK_API_KEY` | Optional DeepSeek tier-3 fallback API key | *(empty)* |
+| `LLAMA3_API_KEY` | Optional Llama 3 tier-3 fallback API key | *(empty)* |
+| `LLAMA3_MODEL` | Optional Llama 3 model | `meta-llama/Llama-3.3-70B-Instruct` |
+| `LLAMA3_ENDPOINT_URL` | Optional Llama 3 OpenAI-compatible endpoint | `https://api.together.xyz/v1/chat/completions` |
+| `DEEPSEEK_API_KEY` | Optional DeepSeek tier-4 fallback API key | *(empty)* |
 | `DEEPSEEK_MODEL` | Optional DeepSeek model | `deepseek-chat` |
 | `DATABASE_URL` | SQLite or PostgreSQL DSN | `sqlite:///data/frontier_atlas.db` |
 | `GITHUB_TOKEN` | Optional GitHub PAT for higher API rate limits | *(empty)* |
@@ -153,7 +156,7 @@ Configure values in `.env` (never commit `.env` or credential JSON files):
 
 ## API Setup
 
-1. **Gemini / Groq / DeepSeek APIs**: Set `GEMINI_API_KEY` (primary), and optionally `GROQ_API_KEY` + `DEEPSEEK_API_KEY` for multi-tier fallback (`Gemini -> Groq -> DeepSeek`).
+1. **Gemini / Groq / Llama 3 / DeepSeek APIs**: Set `GEMINI_API_KEY` (primary), and optionally `GROQ_API_KEY`, `LLAMA3_API_KEY`, and `DEEPSEEK_API_KEY` for 4-tier fallback (`Gemini -> Groq -> Llama 3 -> DeepSeek`).
 2. **GitHub API (Optional)**: Create a read-only personal access token (`public_repo` not required for public read) and set `GITHUB_TOKEN` to raise the unauthenticated 60 req/hr limit to 5,000 req/hr when enriching research paper star counts/metrics and product repos.
 3. **Public Structured APIs & Feeds**: Collects from YC OSS, Hugging Face Spaces & Daily Papers, arXiv, OpenAlex, Crossref, WeWorkRemotely, Jobicy, Arbeitnow, Greenhouse/Ashby/Lever ATS boards, Himalayas, Remotive, RemoteOK, 12+ AI RSS/Atom feeds, and HN Algolia while honoring `robots.txt` and rate limits.
 
@@ -228,7 +231,7 @@ If credentials are missing or invalid, the exporter explicitly sets status to `N
 
 - **GitHub Unauthenticated Quota**: Without `GITHUB_TOKEN`, GitHub REST API limits requests to 60/hour; `ResearchCollector` detects HTTP `403`/`429` and leaves remaining `github_stars` as `null` rather than fabricating counts.
 - **Anti-Bot / Auth-Gated Sites**: `AsyncCrawler` strictly respects `robots.txt` and never bypasses CAPTCHAs, logins, or `401`/`403` protections.
-- **Optional LLM Fallback**: `groq` and `deepseek` fallbacks activate only if `GROQ_API_KEY` or `DEEPSEEK_API_KEY` is provided in the environment; unit tests verify routing behavior with mocked providers.
+- **Optional LLM Fallback**: `groq`, `llama3`, and `deepseek` fallbacks activate only if `GROQ_API_KEY`, `LLAMA3_API_KEY`, or `DEEPSEEK_API_KEY` is provided in the environment; unit tests verify routing behavior with mocked providers.
 - **Target Volumes Require Explicit Runs**: The codebase ships without fabricated records; reaching 1,000+ rows in `startups`, `products`, and `research_papers` requires executing live collection runs against external networks.
 
 ---

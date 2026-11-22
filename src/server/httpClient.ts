@@ -143,12 +143,15 @@ function isPathAllowedByRobots(pathWithQuery: string, rule: RobotsRule): boolean
 export class RobotsPolicyManager {
   private readonly cache = new Map<string, RobotsRule | null>();
   private readonly inflight = new Map<string, Promise<RobotsRule | null>>();
+  private readonly userAgent: string;
+  private readonly respectRobotsTxt: boolean;
+  private readonly timeoutMs: number;
 
-  constructor(
-    private readonly userAgent: string,
-    private readonly respectRobotsTxt = true,
-    private readonly timeoutMs = 8000
-  ) {}
+  constructor(userAgent: string, respectRobotsTxt = true, timeoutMs = 8000) {
+    this.userAgent = userAgent;
+    this.respectRobotsTxt = respectRobotsTxt;
+    this.timeoutMs = timeoutMs;
+  }
 
   private async loadRules(origin: string, timeoutOverrideMs?: number): Promise<RobotsRule | null> {
     if (this.cache.has(origin)) return this.cache.get(origin) ?? null;
@@ -253,16 +256,22 @@ export class PoliteHttpClient {
   public readonly robots: RobotsPolicyManager;
   public readonly rateLimiter: DomainRateLimiter;
   private readonly seenUrls = new Set<string>();
+  private readonly opts: {
+    userAgent: string;
+    timeoutMs: number;
+    rateLimitPerSecond: number;
+    respectRobotsTxt: boolean;
+    defaultMaxAttempts?: number;
+  };
 
-  constructor(
-    private readonly opts: {
-      userAgent: string;
-      timeoutMs: number;
-      rateLimitPerSecond: number;
-      respectRobotsTxt: boolean;
-      defaultMaxAttempts?: number;
-    }
-  ) {
+  constructor(opts: {
+    userAgent: string;
+    timeoutMs: number;
+    rateLimitPerSecond: number;
+    respectRobotsTxt: boolean;
+    defaultMaxAttempts?: number;
+  }) {
+    this.opts = opts;
     this.robots = new RobotsPolicyManager(opts.userAgent, opts.respectRobotsTxt, Math.min(8000, opts.timeoutMs));
     this.rateLimiter = new DomainRateLimiter(opts.rateLimitPerSecond);
   }

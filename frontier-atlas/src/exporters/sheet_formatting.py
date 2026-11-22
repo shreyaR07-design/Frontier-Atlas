@@ -49,6 +49,7 @@ EXPORT_SPECS: tuple[DatasetExportSpec, ...] = (
             "collected_at",
             "canonical_entity_id",
             *TRACEABILITY_EXPORT_COLUMNS,
+            "source_metadata_json",
         ),
     ),
     DatasetExportSpec(
@@ -68,6 +69,7 @@ EXPORT_SPECS: tuple[DatasetExportSpec, ...] = (
             "collected_at",
             "canonical_entity_id",
             *TRACEABILITY_EXPORT_COLUMNS,
+            "source_metadata_json",
         ),
     ),
     DatasetExportSpec(
@@ -89,6 +91,7 @@ EXPORT_SPECS: tuple[DatasetExportSpec, ...] = (
             "source_url",
             "collected_at",
             *TRACEABILITY_EXPORT_COLUMNS,
+            "source_metadata_json",
         ),
     ),
     DatasetExportSpec(
@@ -105,10 +108,12 @@ EXPORT_SPECS: tuple[DatasetExportSpec, ...] = (
             "description",
             "posted_at",
             "application_url",
+            "canonical_company_id",
             "source_name",
             "source_url",
             "collected_at",
             *TRACEABILITY_EXPORT_COLUMNS,
+            "source_metadata_json",
         ),
     ),
     DatasetExportSpec(
@@ -128,6 +133,7 @@ EXPORT_SPECS: tuple[DatasetExportSpec, ...] = (
             "source_url",
             "collected_at",
             *TRACEABILITY_EXPORT_COLUMNS,
+            "source_metadata_json",
         ),
     ),
     DatasetExportSpec(
@@ -199,6 +205,13 @@ def _format_cell(col: str, row: dict[str, Any], *, for_sheets: bool = True) -> A
             except ValueError:
                 pass
         return ""
+
+    if col == "source_metadata_json":
+        raw_meta = row.get("source_metadata_json") if "source_metadata_json" in row else row.get("source_metadata")
+        if raw_meta is None:
+            return "{}"
+        serialized = raw_meta if isinstance(raw_meta, str) else json.dumps(raw_meta)
+        return serialized[:45000] if for_sheets and len(serialized) > 45000 else serialized
 
     val = row.get(col)
     if val is None:

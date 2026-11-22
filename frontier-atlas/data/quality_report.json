@@ -1,20 +1,44 @@
 {
-  "generated_at_utc": "2026-11-22T02:39:24.851Z",
+  "generated_at_utc": "2026-11-22T04:26:39.166Z",
   "categories": {
+    "startups": {
+      "persisted_total": 1158,
+      "target_minimum": 1000,
+      "target_met": true,
+      "verification_breakdown": {
+        "Verified": 988,
+        "Partially Verified": 165,
+        "Unverified": 0,
+        "Source Unavailable": 0,
+        "Rejected": 5
+      }
+    },
+    "products": {
+      "persisted_total": 1149,
+      "target_minimum": 1000,
+      "target_met": true,
+      "verification_breakdown": {
+        "Verified": 1085,
+        "Partially Verified": 62,
+        "Unverified": 0,
+        "Source Unavailable": 0,
+        "Rejected": 2
+      }
+    },
     "research_papers": {
       "discovered": 944,
       "extracted": 944,
       "validated": 944,
       "rejected": 0,
       "duplicates": 0,
-      "persisted_total": 952,
+      "persisted_total": 1208,
       "target_minimum": 1000,
-      "target_met": false,
+      "target_met": true,
       "verification_breakdown": {
-        "Verified": 583,
-        "Partially Verified": 95,
-        "Unverified": 262,
-        "Source Unavailable": 0,
+        "Verified": 653,
+        "Partially Verified": 544,
+        "Unverified": 3,
+        "Source Unavailable": 4,
         "Rejected": 4
       },
       "missing_fields": {
@@ -32,24 +56,119 @@
       },
       "freshness": null,
       "sample_rejection_reasons": []
+    },
+    "jobs": {
+      "discovered": 500,
+      "extracted": 500,
+      "validated": 16,
+      "rejected": 484,
+      "duplicates": 5,
+      "persisted_total": 94,
+      "target_minimum": null,
+      "target_met": null,
+      "verification_breakdown": {
+        "Verified": 32,
+        "Partially Verified": 35,
+        "Unverified": 0,
+        "Source Unavailable": 3,
+        "Rejected": 518
+      },
+      "missing_fields": {},
+      "source_distribution": {
+        "himalayas": 1,
+        "greenhouse:togetherai": 3,
+        "ashby:harvey": 2,
+        "jobicy": 5
+      },
+      "freshness": {
+        "window_hours": 24,
+        "evaluated": 500,
+        "accepted": 16,
+        "rejected_older": 484,
+        "rejected_missing_date": 0,
+        "rejected_future_date": 0
+      },
+      "sample_rejection_reasons": [
+        "older_than_freshness_window",
+        "older_than_freshness_window",
+        "older_than_freshness_window",
+        "older_than_freshness_window",
+        "older_than_freshness_window"
+      ]
+    },
+    "news": {
+      "discovered": 300,
+      "extracted": 300,
+      "validated": 18,
+      "rejected": 282,
+      "duplicates": 0,
+      "persisted_total": 33,
+      "target_minimum": null,
+      "target_met": null,
+      "verification_breakdown": {
+        "Verified": 15,
+        "Partially Verified": 5,
+        "Unverified": 0,
+        "Source Unavailable": 0,
+        "Rejected": 78
+      },
+      "missing_fields": {},
+      "source_distribution": {
+        "devto_ai": 9,
+        "simonwillison": 1,
+        "siliconangle_ai": 3,
+        "techcrunch_ai": 4,
+        "wired_ai": 1
+      },
+      "freshness": {
+        "window_hours": 24,
+        "evaluated": 300,
+        "accepted": 18,
+        "rejected_older": 282,
+        "rejected_missing_date": 0,
+        "rejected_future_date": 0
+      },
+      "sample_rejection_reasons": [
+        "older_than_freshness_window",
+        "older_than_freshness_window",
+        "older_than_freshness_window",
+        "older_than_freshness_window",
+        "older_than_freshness_window"
+      ]
     }
   },
   "entity_resolution": {
-    "total_logged": 0,
-    "exact_match": 0,
-    "auto_merge": 0,
-    "manual_review": 0,
-    "new_entity": 0,
+    "total_logged": 3511,
+    "exact_match": 335,
+    "auto_merge": 3,
+    "manual_review": 41,
+    "new_entity": 3132,
     "rejected": 0
   },
   "verification_summary": {
-    "Verified": 583,
-    "Partially Verified": 95,
-    "Unverified": 262,
-    "Source Unavailable": 0,
-    "Rejected": 4
+    "Verified": 2773,
+    "Partially Verified": 811,
+    "Unverified": 3,
+    "Source Unavailable": 7,
+    "Rejected": 607
   },
   "unavailable_sources": [
-    "arxiv"
+    "remotive",
+    "arbeitnow",
+    "greenhouse:scaleai",
+    "ashby:cohere",
+    "greenhouse:anthropic",
+    "ashby:openai",
+    "remoteok",
+    "lever:palantir",
+    "weworkremotely",
+    "greenhouse:xai",
+    "mit_news_ai",
+    "theverge_ai",
+    "marktechpost",
+    "the_decoder",
+    "openai_news",
+    "arstechnica_tech",
+    "hn_algolia"
   ]
 }

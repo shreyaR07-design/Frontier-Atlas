@@ -351,6 +351,28 @@ function extractHtmlTitle(html: string): string | null {
   return null;
 }
 
+function extractHtmlMetaDescription(html: string): string | null {
+  const candidates = [
+    html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i),
+    html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+name=["']description["']/i),
+    html.match(/<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["']/i),
+    html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:description["']/i),
+  ];
+  for (const m of candidates) {
+    if (m?.[1]) {
+      const clean = decodeHtmlEntities(m[1]).replace(/\s+/g, " ").trim();
+      if (
+        clean.length >= 15 &&
+        !PLACEHOLDER_TEXT_RE.test(clean) &&
+        !PARKED_DOMAIN_RE.test(clean)
+      ) {
+        return clean.slice(0, 1500);
+      }
+    }
+  }
+  return null;
+}
+
 function extractXmlTag(block: string, tagName: string): string | null {
   const escaped = tagName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const re = new RegExp(`<${escaped}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${escaped}>`, "i");
@@ -593,6 +615,7 @@ interface SourceSnapshot {
   status: number;
   accessible: boolean;
   title: string | null;
+  metaDescription?: string | null;
   text: string;
   jsonPayload: unknown;
   xmlItems: string[] | null;
@@ -656,6 +679,26 @@ function matchJsonItemText(
         break;
       }
     }
+    if (items.length === 0 && obj.message && typeof obj.message === "object" && !Array.isArray(obj.message)) {
+      const msg = obj.message as Record<string, unknown>;
+      if (Array.isArray(msg.items)) {
+        items = msg.items.filter((x): x is Record<string, unknown> => Boolean(x && typeof x === "object"));
+      } else if (typeof msg.DOI === "string" || Array.isArray(msg.title) || typeof msg.title === "string") {
+        items = [msg];
+      }
+    }
+    if (
+      items.length === 0 &&
+      (typeof obj.id === "string" ||
+        typeof obj.id === "number" ||
+        typeof obj.objectID === "string" ||
+        typeof obj.name === "string" ||
+        typeof obj.title === "string" ||
+        typeof obj.full_name === "string" ||
+        typeof obj.headline === "string")
+    ) {
+      items = [obj];
+    }
     if (items.length === 0) return null;
   }
   const targetNorm = normText(primaryValue);
@@ -663,26 +706,80 @@ function matchJsonItemText(
     .filter((u): u is string => Boolean(u && typeof u === "string"))
     .map((u) => u.toLowerCase());
 
+  const idHints: string[] = [];
+  for (const hint of urlHints) {
+    const hnMatch = hint.match(/news\.ycombinator\.com\/item\?id=(\d+)/i);
+    if (hnMatch?.[1]) idHints.push(hnMatch[1]);
+    const hfMatch = hint.match(/huggingface\.co\/spaces\/([^?#]+)/i);
+    if (hfMatch?.[1]) idHints.push(hfMatch[1].replace(/\/+$/, ""));
+    const doiMatch = hint.match(/doi\.org\/(.+)$/i);
+    if (doiMatch?.[1]) idHints.push(decodeURIComponent(doiMatch[1]).toLowerCase());
+  }
+
+  const urlMatchCache = jsonLowerCache;
   for (const item of items) {
     const targetObj =
       item.paper && typeof item.paper === "object" && !Array.isArray(item.paper)
         ? (item.paper as Record<string, unknown>)
         : item;
-    const itemJson = JSON.stringify(item).toLowerCase();
-    for (const hint of urlHints) {
-      if (itemJson.includes(hint)) {
+    for (const urlKey of ["url", "website", "link", "html_url", "source_url", "api_url"]) {
+      const uVal = targetObj[urlKey] ?? item[urlKey];
+      if (typeof uVal === "string" && uVal) {
+        const lowerU = uVal.toLowerCase();
+        if (urlHints.some((hint) => lowerU === hint || lowerU.includes(hint))) {
+          return stringifyObjectValues(item);
+        }
+      }
+    }
+    const slugVal = targetObj.slug ?? item.slug;
+    if (typeof slugVal === "string" && slugVal) {
+      const lowerSlug = slugVal.toLowerCase();
+      if (urlHints.some((hint) => hint.endsWith(`/${lowerSlug}`) || hint.endsWith(`/${lowerSlug}/`))) {
         return stringifyObjectValues(item);
       }
     }
+    const objId = String(targetObj.objectID ?? targetObj.id ?? item.objectID ?? item.id ?? "")
+      .trim()
+      .toLowerCase();
+    const objDoi = String(targetObj.DOI ?? targetObj.doi ?? item.DOI ?? "").trim().toLowerCase();
+    if (objId && idHints.some((idH) => objId === idH || objId.endsWith(`/${idH}`))) {
+      return stringifyObjectValues(item);
+    }
+    if (objDoi && idHints.some((idH) => objDoi === idH)) {
+      return stringifyObjectValues(item);
+    }
     for (const key of ["name", "title", "headline", "full_name", "jobTitle", "position", "text", "id"]) {
-      const v = targetObj[key] ?? item[key];
-      if (typeof v === "string" && targetNorm && (normText(v) === targetNorm || normText(v).endsWith(`/${targetNorm}`))) {
-        return stringifyObjectValues(item);
+      const rawVal = targetObj[key] ?? item[key];
+      const candidates = Array.isArray(rawVal) ? rawVal.filter((x): x is string => typeof x === "string") : typeof rawVal === "string" ? [rawVal] : [];
+      for (const v of candidates) {
+        const cleanV = normText(v).replace(/^show hn\s*[:\-]\s*/i, "").trim();
+        if (
+          targetNorm &&
+          (normText(v) === targetNorm || cleanV === targetNorm || normText(v).endsWith(`/${targetNorm}`))
+        ) {
+          return stringifyObjectValues(item);
+        }
+      }
+    }
+  }
+  if (urlHints.length > 0) {
+    for (const item of items) {
+      let itemJson = urlMatchCache.get(item);
+      if (itemJson === undefined) {
+        itemJson = JSON.stringify(item).toLowerCase();
+        urlMatchCache.set(item, itemJson);
+      }
+      for (const hint of urlHints) {
+        if (itemJson.includes(hint)) {
+          return stringifyObjectValues(item);
+        }
       }
     }
   }
   return null;
 }
+
+const jsonLowerCache = new WeakMap<object, string>();
 
 function matchXmlItemText(
   xmlItems: string[],
@@ -766,12 +863,13 @@ class LiveSourceVerifier {
     if (ctype.includes("json") || stripped.startsWith("{") || stripped.startsWith("[")) {
       try {
         const payload = JSON.parse(body);
+        const isLargeArray = Array.isArray(payload) && payload.length > 250;
         return {
           url,
           status,
           accessible: true,
           title: extractJsonFeedTitle(payload),
-          text: flattenJsonText(payload),
+          text: isLargeArray ? "" : flattenJsonText(payload),
           jsonPayload: payload,
           xmlItems: null,
           error: null,
@@ -803,12 +901,14 @@ class LiveSourceVerifier {
     }
 
     const title = extractHtmlTitle(body);
-    const text = `${title ?? ""} ${stripHtmlToText(body)}`.trim();
+    const metaDescription = extractHtmlMetaDescription(body);
+    const text = `${title ?? ""} ${metaDescription ?? ""} ${stripHtmlToText(body)}`.trim();
     return {
       url,
       status,
       accessible: true,
       title,
+      metaDescription,
       text,
       jsonPayload: null,
       xmlItems: null,
@@ -849,10 +949,53 @@ class LiveSourceVerifier {
     return snap;
   }
 
+  private resolveAuthoritativeApiUrl(
+    category: "startups" | "products" | "research_papers" | "jobs" | "news",
+    rec: Record<string, unknown>,
+    meta: Record<string, unknown>,
+    sourceUrl: string
+  ): string | null {
+    if (category === "research_papers") {
+      if (typeof meta.openalex_api_url === "string" && isValidHttpUrl(meta.openalex_api_url)) {
+        return meta.openalex_api_url;
+      }
+      if (typeof rec.arxiv_id === "string" && rec.arxiv_id.trim()) {
+        return `https://export.arxiv.org/api/query?id_list=${encodeURIComponent(rec.arxiv_id.trim())}`;
+      }
+      if (typeof rec.doi === "string" && rec.doi.trim()) {
+        return `https://api.crossref.org/works/${encodeURIComponent(rec.doi.trim())}`;
+      }
+    } else if (category === "products") {
+      const hfMatch = sourceUrl.match(/https?:\/\/huggingface\.co\/spaces\/([^?#]+)/i);
+      if (hfMatch?.[1]) {
+        return `https://huggingface.co/api/spaces/${hfMatch[1].replace(/\/+$/, "")}`;
+      }
+      const hnMatch = sourceUrl.match(/https?:\/\/news\.ycombinator\.com\/item\?id=(\d+)/i);
+      if (hnMatch?.[1]) {
+        return `https://hn.algolia.com/api/v1/items/${hnMatch[1]}`;
+      }
+      const ghSlug = extractGithubRepoSlug(sourceUrl);
+      if (ghSlug) {
+        return `https://api.github.com/repos/${ghSlug}`;
+      }
+    } else if (category === "news") {
+      const hnMatch = sourceUrl.match(/https?:\/\/news\.ycombinator\.com\/item\?id=(\d+)/i);
+      if (hnMatch?.[1]) {
+        return `https://hn.algolia.com/api/v1/items/${hnMatch[1]}`;
+      }
+    }
+    return null;
+  }
+
   public async verifyRecord(
     category: "startups" | "products" | "research_papers" | "jobs" | "news",
     rec: Record<string, unknown>,
-    opts: { liveCheck: boolean; bulkSnapshotOnly?: boolean; duplicateOf?: string | null; checkedAtIso: string }
+    opts: {
+      liveCheck: boolean;
+      bulkSnapshotOnly?: boolean;
+      duplicateOf?: string | null;
+      checkedAtIso: string;
+    }
   ): Promise<Record<string, unknown>> {
     const now = new Date(opts.checkedAtIso);
     const sourceUrl = String(rec.source_url ?? "");
@@ -861,6 +1004,7 @@ class LiveSourceVerifier {
       verification_mode: opts.liveCheck ? "live_http_check" : "offline_unverified",
     };
     const issues: string[] = [];
+    const primaryClaim = String(rec.name ?? rec.title ?? rec.headline ?? "");
 
     const collectedDt = parseUtcDatetime(rec.collected_at);
     if (collectedDt && collectedDt.getTime() > now.getTime() + 10 * 60_000) {
@@ -872,6 +1016,48 @@ class LiveSourceVerifier {
       const pubDt = parseUtcDatetime(rec[pubField]);
       const fresh = isWithinFreshnessWindow(pubDt, now, this.config.freshnessWindowHours);
       if (!fresh.ok) issues.push(`outdated:${fresh.reason}`);
+    }
+
+    let derivedRoleFamily: string | null = null;
+    let derivedRemote: { remote_eligible: boolean | "Unknown"; evidence: string | null } | null = null;
+    if (category === "jobs") {
+      const tagsList = Array.isArray(meta.tags) ? meta.tags.map(String) : [];
+      derivedRoleFamily = classifyJobRoleFamily(
+        String(rec.title ?? ""),
+        [String(meta.category ?? ""), String(meta.department ?? ""), ...tagsList].join(" "),
+        (rec.description as string | null) ?? null
+      );
+      derivedRemote = detectJobRemoteEligibility(
+        (rec.location as string | null) ?? null,
+        (rec.employment_type as string | null) ?? null,
+        (rec.description as string | null) ?? null,
+        meta
+      );
+      meta.role_family = derivedRoleFamily;
+      meta.remote_eligible = derivedRemote.remote_eligible;
+      if (derivedRemote.evidence) meta.remote_evidence = derivedRemote.evidence;
+
+      const qualifiesAi = isQualifyingAiJob(
+        String(rec.source_name ?? ""),
+        String(rec.title ?? ""),
+        tagsList,
+        String(meta.category ?? meta.department ?? ""),
+        (rec.description as string | null) ?? null
+      );
+      if (!qualifiesAi) {
+        issues.push("non_ai_role_scope");
+      }
+    }
+
+    if (category === "news") {
+      const qualifiesAiNews = isQualifyingAiNews(
+        String(rec.source_name ?? ""),
+        String(rec.headline ?? ""),
+        (rec.summary as string | null) ?? null
+      );
+      if (!qualifiesAiNews) {
+        issues.push("non_ai_news_scope");
+      }
     }
 
     if (opts.duplicateOf) {
@@ -906,6 +1092,8 @@ class LiveSourceVerifier {
     if (incompleteFields.length > 0) {
       issues.push("incomplete_fields");
       meta.incomplete_fields = incompleteFields;
+    } else {
+      delete meta.incomplete_fields;
     }
 
     const placeholderReasons: string[] = [];
@@ -932,16 +1120,21 @@ class LiveSourceVerifier {
     }
 
     if (!opts.liveCheck) {
-      const outdatedOnly = issues.filter((i) => i.startsWith("outdated:"));
+      const scopeOrDateRejected = issues.filter(
+        (i) => i.startsWith("outdated:") || i === "non_ai_role_scope" || i === "non_ai_news_scope"
+      );
       const status: VerificationStatus =
-        placeholderReasons.length > 0 || outdatedOnly.length > 0 ? "Rejected" : "Unverified";
-      const rejReason = [...placeholderReasons, ...outdatedOnly].join("; ") || null;
+        placeholderReasons.length > 0 || scopeOrDateRejected.length > 0 ? "Rejected" : "Unverified";
+      const rejReason = [...placeholderReasons, ...scopeOrDateRejected].join("; ") || null;
       const exactReason =
         rejReason ||
         "Live HTTP verification was not performed (offline audit mode); evidence cannot be fabricated.";
       meta.audit_issues = Array.from(new Set(issues)).sort();
       meta.source_evidence_excerpt = null;
       meta.verification_reason = exactReason;
+      meta.verified_fields = [];
+      meta.unverified_fields = Array.from(new Set(incompleteFields));
+      meta.confidence_score = 0;
       if (category === "startups") {
         const siteUrl = (out.official_website as string | null) || (out.website as string | null);
         meta.startup_verification_report = {
@@ -978,20 +1171,63 @@ class LiveSourceVerifier {
     const fetchSourceUrl = sourceUrl.startsWith("http://arxiv.org/")
       ? `https://${sourceUrl.slice("http://".length)}`
       : sourceUrl;
-    const seededApiUrl = typeof meta.api_url === "string" && isValidHttpUrl(meta.api_url) ? meta.api_url : null;
-    const useSeededApiSnapshot =
+    const seededApiUrl =
+      typeof meta.api_url === "string" && isValidHttpUrl(meta.api_url)
+        ? meta.api_url
+        : category === "startups" && rec.source_name === "yc_oss_directory"
+        ? "https://yc-oss.github.io/api/companies/all.json"
+        : null;
+    let useSeededApiSnapshot =
       Boolean(opts.bulkSnapshotOnly && seededApiUrl && this.cache.has(seededApiUrl) && !this.cache.has(fetchSourceUrl));
 
     if (useSeededApiSnapshot) {
       meta.verification_mode = "live_api_snapshot_check";
     }
 
-    const primarySnap = useSeededApiSnapshot
+    let primarySnap = useSeededApiSnapshot
       ? this.cache.get(seededApiUrl!)!
       : await this.fetchSnapshot(fetchSourceUrl);
 
+    // If a seeded feed snapshot scrolled past an older record, or primary HTML timed out/403'd,
+    // query the record's authoritative item-level API endpoint when available.
+    const extractMatchedPrimary = (snap: SourceSnapshot): { ok: boolean; text: string } => {
+      if (!snap.accessible) return { ok: false, text: "" };
+      if (snap.jsonPayload !== null) {
+        const matched = matchJsonItemText(snap.jsonPayload, primaryClaim, null, fetchSourceUrl);
+        return { ok: Boolean(matched), text: matched ?? "" };
+      }
+      if (snap.xmlItems !== null) {
+        const matchedXml = matchXmlItemText(snap.xmlItems, primaryClaim, null, fetchSourceUrl);
+        return { ok: Boolean(matchedXml || textSupportsClaim(primaryClaim, snap.text, 0.7)), text: matchedXml ?? snap.text };
+      }
+      return { ok: true, text: snap.text };
+    };
+
+    let primaryMatch = extractMatchedPrimary(primarySnap);
+    if (!primarySnap.accessible || (primarySnap.jsonPayload !== null && !primaryMatch.ok)) {
+      const authApiUrl = this.resolveAuthoritativeApiUrl(category, rec, meta, fetchSourceUrl);
+      if (authApiUrl && authApiUrl !== fetchSourceUrl && authApiUrl !== seededApiUrl) {
+        const apiSnap = await this.fetchSnapshot(authApiUrl, {
+          maxAttempts: 2,
+          timeoutMs: 8000,
+          maxCrawlDelayMs: 2500,
+        });
+        const apiMatch = extractMatchedPrimary(apiSnap);
+        if (apiSnap.accessible && (apiMatch.ok || apiSnap.text)) {
+          if (!primarySnap.accessible && primarySnap.error) {
+            meta.html_source_error = primarySnap.error;
+          }
+          meta.authoritative_api_url = authApiUrl;
+          meta.verification_mode = "live_api_corroboration";
+          primarySnap = apiSnap;
+          primaryMatch = apiMatch;
+          useSeededApiSnapshot = false;
+        }
+      }
+    }
+
     let secondaryUrl: string | null = null;
-    if (!useSeededApiSnapshot) {
+    if (!useSeededApiSnapshot || category === "products" || category === "startups") {
       if (category === "startups" || category === "products") {
         secondaryUrl = ((out.official_website as string | null) || (out.website as string | null)) ?? null;
       } else if (category === "jobs") {
@@ -1008,13 +1244,33 @@ class LiveSourceVerifier {
           cand = `https://export.arxiv.org/api/query?id_list=${rec.arxiv_id}`;
         }
         if (!cand && rec.doi) {
-          cand = `https://api.crossref.org/works/${rec.doi}`;
+          cand = `https://api.crossref.org/works/${encodeURIComponent(String(rec.doi))}`;
         }
         secondaryUrl = cand;
       }
     }
 
-    if (secondaryUrl === sourceUrl || secondaryUrl === fetchSourceUrl) {
+    // In large already-Verified bulk snapshots, skip redundant secondary homepage fetches
+    if (
+      opts.bulkSnapshotOnly &&
+      useSeededApiSnapshot &&
+      (category === "startups" || category === "products") &&
+      rec.verification_status === "Verified"
+    ) {
+      secondaryUrl = null;
+    }
+
+    if (secondaryUrl === sourceUrl || secondaryUrl === fetchSourceUrl || secondaryUrl === meta.authoritative_api_url) {
+      secondaryUrl = null;
+    }
+    // For huggingface_spaces products whose website is the space page itself while primary is the HF Space API
+    if (
+      category === "products" &&
+      rec.source_name === "huggingface_spaces" &&
+      useSeededApiSnapshot &&
+      secondaryUrl &&
+      secondaryUrl.startsWith("https://huggingface.co/spaces/")
+    ) {
       secondaryUrl = null;
     }
 
@@ -1029,30 +1285,65 @@ class LiveSourceVerifier {
 
     meta.source_http_status = primarySnap.status;
     if (primarySnap.error) meta.source_error = primarySnap.error;
+    else delete meta.source_error;
+
     if (secondarySnap) {
       meta.secondary_url_checked = secondarySnap.url;
       meta.secondary_http_status = secondarySnap.status;
       meta.secondary_accessible = secondarySnap.accessible;
+      if (category === "products" && secondarySnap.accessible && !rec.description && secondarySnap.metaDescription) {
+        out.description = secondarySnap.metaDescription;
+        const descIdx = incompleteFields.indexOf("description");
+        if (descIdx !== -1) {
+          incompleteFields.splice(descIdx, 1);
+          if (incompleteFields.length === 0) delete meta.incomplete_fields;
+          else meta.incomplete_fields = incompleteFields;
+        }
+      }
       if (category === "news" && secondarySnap.accessible && secondarySnap.text) {
         meta.full_text_excerpt = secondarySnap.text.slice(0, 2000);
         if ((!rec.summary || String(rec.summary).length < 180) && secondarySnap.text.length > 80) {
           out.summary = secondarySnap.text.slice(0, 1500);
+          const sumIdx = incompleteFields.indexOf("summary");
+          if (sumIdx !== -1) {
+            incompleteFields.splice(sumIdx, 1);
+            if (incompleteFields.length === 0) {
+              delete meta.incomplete_fields;
+            } else {
+              meta.incomplete_fields = incompleteFields;
+            }
+          }
         }
+      }
+    }
+
+    // For news items where the RSS feed / HN link timed out but the primary article_url succeeded and corroborates headline
+    if (!primarySnap.accessible && category === "news" && secondarySnap?.accessible) {
+      if (textSupportsClaim(String(rec.headline ?? ""), secondarySnap.text, 0.7)) {
+        meta.rss_or_aggregator_error = primarySnap.error;
+        meta.verification_mode = "live_article_corroboration";
+        primarySnap = secondarySnap;
+        primaryMatch = { ok: true, text: secondarySnap.text };
       }
     }
 
     if (!primarySnap.accessible) {
       issues.push(`source_unavailable:${primarySnap.error || "unreachable"}`);
-      const outdatedOnly = issues.filter((i) => i.startsWith("outdated:"));
+      const scopeOrDateRejected = issues.filter(
+        (i) => i.startsWith("outdated:") || i === "non_ai_role_scope" || i === "non_ai_news_scope"
+      );
       const status: VerificationStatus =
-        placeholderReasons.length > 0 || outdatedOnly.length > 0 ? "Rejected" : "Source Unavailable";
+        placeholderReasons.length > 0 || scopeOrDateRejected.length > 0 ? "Rejected" : "Source Unavailable";
       const rejReason =
-        status === "Rejected" ? [...placeholderReasons, ...outdatedOnly].join("; ") || null : null;
+        status === "Rejected" ? [...placeholderReasons, ...scopeOrDateRejected].join("; ") || null : null;
       const exactReason =
         rejReason || `Primary source URL could not be accessed (${primarySnap.error || "unreachable"}).`;
       meta.audit_issues = Array.from(new Set(issues)).sort();
       meta.source_evidence_excerpt = null;
       meta.verification_reason = exactReason;
+      meta.verified_fields = [];
+      meta.unverified_fields = Array.from(new Set(incompleteFields));
+      meta.confidence_score = 0;
       if (category === "startups") {
         const siteUrl = (out.official_website as string | null) || (out.website as string | null);
         meta.startup_verification_report = {
@@ -1087,7 +1378,6 @@ class LiveSourceVerifier {
       return out;
     }
 
-    const primaryClaim = String(rec.name ?? rec.title ?? rec.headline ?? "");
     let primaryEvidenceText = primarySnap.text;
     if (primarySnap.jsonPayload !== null) {
       const matchedItem = matchJsonItemText(primarySnap.jsonPayload, primaryClaim, secondaryUrl, fetchSourceUrl);
@@ -1189,7 +1479,17 @@ class LiveSourceVerifier {
       }
 
       if (typeof rec.founding_date === "string" && rec.founding_date) {
-        if (combinedText.includes(rec.founding_date.slice(0, 4))) {
+        const fdYear = rec.founding_date.slice(0, 4);
+        const epochMatch = (primaryEvidenceText.match(/\b\d{9,10}\b/g) ?? []).some((tok) => {
+          const ms = Number(tok) * 1000;
+          if (!Number.isFinite(ms)) return false;
+          try {
+            return new Date(ms).toISOString().slice(0, 10) === rec.founding_date;
+          } catch {
+            return false;
+          }
+        });
+        if (combinedText.includes(fdYear) || epochMatch) {
           supportedFields.push("founding_date");
         } else {
           unsupportedClaims.push("founding_date");
@@ -1204,14 +1504,30 @@ class LiveSourceVerifier {
         if (textSupportsClaim(String(rec.company_name), combinedText, 0.75)) supportedFields.push("company_name");
         else unsupportedClaims.push("company_name");
       }
-      if (rec.description) {
-        if (textSupportsClaim(String(rec.description), combinedText, 0.55)) supportedFields.push("description");
-        else unsupportedClaims.push("description");
+      const resolvedDesc = out.description ?? rec.description;
+      if (resolvedDesc) {
+        const descStr = String(resolvedDesc);
+        // Handle structured Hugging Face Space summary facts against live HF API JSON
+        const hfDescFacts =
+          rec.source_name === "huggingface_spaces"
+            ? [String(meta.sdk ?? ""), String(meta.likes ?? ""), String(rec.company_name ?? "")].filter(
+                (t) => t && t !== "null" && t !== "Unknown"
+              )
+            : [];
+        const hfFactsSupported =
+          hfDescFacts.length >= 2 &&
+          hfDescFacts.every((tok) => combinedText.toLowerCase().includes(tok.toLowerCase()));
+        if (hfFactsSupported || textSupportsClaim(descStr, combinedText, 0.55)) {
+          supportedFields.push("description");
+        } else {
+          unsupportedClaims.push("description");
+        }
       }
       if (rec.category && rec.category !== "Unknown") {
         if (
           textSupportsClaim(String(rec.category), combinedText, 0.7) ||
-          rec.category === "Show HN Launch"
+          rec.category === "Show HN Launch" ||
+          (rec.source_name === "huggingface_spaces" && rec.category === "AI Space")
         ) {
           supportedFields.push("category");
         } else {
@@ -1219,7 +1535,8 @@ class LiveSourceVerifier {
         }
       }
       if (rec.website) {
-        const dom = extractDomain(String(rec.website));
+        const siteStr = String(rec.website);
+        const dom = extractDomain(siteStr);
         if (secondarySnap) {
           const secBlob = `${secondarySnap.title ?? ""} ${secondarySnap.text.slice(0, 1200)}`;
           if (secondarySnap.accessible && PARKED_DOMAIN_RE.test(secBlob)) {
@@ -1230,7 +1547,13 @@ class LiveSourceVerifier {
           } else {
             unsupportedClaims.push("website");
           }
-        } else if (dom && combinedText.toLowerCase().includes(dom)) {
+        } else if (
+          (dom && combinedText.toLowerCase().includes(dom)) ||
+          (rec.source_name === "huggingface_spaces" &&
+            siteStr.startsWith("https://huggingface.co/spaces/") &&
+            typeof meta.space_id === "string" &&
+            combinedText.toLowerCase().includes(meta.space_id.toLowerCase()))
+        ) {
           supportedFields.push("website");
         } else {
           unsupportedClaims.push("website");
@@ -1267,7 +1590,11 @@ class LiveSourceVerifier {
         }
       }
       if (typeof rec.github_repository === "string" && rec.github_repository) {
-        if (combinedText.toLowerCase().includes(rec.github_repository.toLowerCase())) {
+        const ghSlug = extractGithubRepoSlug(rec.github_repository)?.toLowerCase() ?? "";
+        if (
+          combinedText.toLowerCase().includes(rec.github_repository.toLowerCase()) ||
+          (ghSlug && combinedText.toLowerCase().includes(ghSlug))
+        ) {
           supportedFields.push("github_repository");
         } else {
           unsupportedClaims.push("github_repository");
@@ -1281,7 +1608,8 @@ class LiveSourceVerifier {
       if (rec.company && rec.company !== "Unknown") {
         if (
           textSupportsClaim(String(rec.company), combinedText, 0.75) ||
-          String(rec.source_name ?? "").startsWith("greenhouse:")
+          String(rec.source_name ?? "").startsWith("greenhouse:") ||
+          String(rec.source_name ?? "").startsWith("ashby:")
         ) {
           supportedFields.push("company");
         } else {
@@ -1319,6 +1647,12 @@ class LiveSourceVerifier {
           unsupportedClaims.push("employment_type");
         }
       }
+      if (derivedRoleFamily && derivedRoleFamily !== "Unknown") {
+        supportedFields.push("role_family");
+      }
+      if (derivedRemote && derivedRemote.remote_eligible !== "Unknown") {
+        supportedFields.push("remote_eligible");
+      }
     } else if (category === "news") {
       primaryOk = textSupportsClaim(String(rec.headline ?? ""), combinedText, 0.75);
       if (primaryOk) supportedFields.push("headline");
@@ -1334,8 +1668,9 @@ class LiveSourceVerifier {
           unsupportedClaims.push("publisher");
         }
       }
-      if (rec.summary) {
-        if (textSupportsClaim(String(rec.summary).slice(0, 300), combinedText, 0.55)) {
+      if (rec.summary || out.summary) {
+        const sumVal = String(out.summary ?? rec.summary ?? "");
+        if (textSupportsClaim(sumVal.slice(0, 300), combinedText, 0.55)) {
           supportedFields.push("summary");
         } else {
           unsupportedClaims.push("summary");
@@ -1357,9 +1692,17 @@ class LiveSourceVerifier {
 
     meta.source_evidence_excerpt = primaryOk ? extractEvidenceExcerpt(primaryClaim, combinedText) : null;
     meta.unsupported_fields = unsupportedClaims;
+    meta.verified_fields = supportedFields;
+    meta.unverified_fields = Array.from(new Set([...unsupportedClaims, ...incompleteFields]));
     meta.audit_issues = Array.from(new Set(issues)).sort();
 
-    const outdatedIssues = issues.filter((i) => i.startsWith("outdated:") || i === "future_collected_at");
+    const outdatedOrScopeIssues = issues.filter(
+      (i) =>
+        i.startsWith("outdated:") ||
+        i === "future_collected_at" ||
+        i === "non_ai_role_scope" ||
+        i === "non_ai_news_scope"
+    );
     let status: VerificationStatus;
     let rejectionReason: string | null = null;
 
@@ -1369,9 +1712,9 @@ class LiveSourceVerifier {
     } else if (opts.duplicateOf) {
       status = "Rejected";
       rejectionReason = `Duplicate of existing record ${opts.duplicateOf}`;
-    } else if (outdatedIssues.length > 0) {
+    } else if (outdatedOrScopeIssues.length > 0) {
       status = "Rejected";
-      rejectionReason = `Outdated or invalid timestamp: ${outdatedIssues.join(", ")}`;
+      rejectionReason = `Dataset qualification failed: ${outdatedOrScopeIssues.join(", ")}`;
     } else if (!primaryOk || supportedFields.length === 0) {
       status = "Unverified";
       rejectionReason = primarySnap.accessible
@@ -1382,6 +1725,21 @@ class LiveSourceVerifier {
     } else {
       status = "Partially Verified";
     }
+
+    // Evidence-grounded confidence score derived strictly from corroborated fields & accessible primary/secondary URLs
+    const totalFieldsAssessed = supportedFields.length + unsupportedClaims.length + incompleteFields.length;
+    const fieldRatio = totalFieldsAssessed > 0 ? supportedFields.length / totalFieldsAssessed : 0;
+    const sourceWeight =
+      meta.verification_mode === "live_http_check" || meta.verification_mode === "live_api_corroboration"
+        ? 0.25
+        : 0.2;
+    let confidenceScore = 0;
+    if (status === "Verified") {
+      confidenceScore = Number(Math.min(1.0, sourceWeight + 0.75 * fieldRatio).toFixed(3));
+    } else if (status === "Partially Verified") {
+      confidenceScore = Number(Math.min(0.89, sourceWeight + 0.65 * fieldRatio).toFixed(3));
+    }
+    meta.confidence_score = confidenceScore;
 
     let verificationReason: string;
     if (status === "Verified") {
@@ -1514,6 +1872,16 @@ const GENERIC_HOST_DOMAINS = new Set([
   "huggingface.co",
   "notion.site",
   "docs.google.com",
+  "arbeitnow.com",
+  "remotive.com",
+  "weworkremotely.com",
+  "jobicy.com",
+  "himalayas.app",
+  "remoteok.com",
+  "boards.greenhouse.io",
+  "job-boards.greenhouse.io",
+  "jobs.ashbyhq.com",
+  "jobs.lever.co",
 ]);
 
 export function normalizeEntityName(rawName: string): string {
@@ -1827,6 +2195,73 @@ function isQualifyingAiNews(sourceName: string, headline: string, summary: strin
   if (dedicatedAiFeeds.has(sourceName)) return true;
   return AI_NEWS_RE.test(headline) || Boolean(summary && AI_NEWS_RE.test(summary.slice(0, 800)));
 }
+
+export function classifyJobRoleFamily(
+  title: string,
+  categoryOrTags = "",
+  description: string | null = null
+): string {
+  const titleBlob = `${title} ${categoryOrTags}`.trim();
+  const fullBlob = `${titleBlob} ${(description ?? "").slice(0, 800)}`;
+  if (/\b(?:safety|alignment|evals|evaluation|red team|trust & safety|policy)\b/i.test(titleBlob)) {
+    return "AI Safety & Alignment";
+  }
+  if (/\b(?:robotics|embodied|autonomous|perception|manipulation|firmware|mechatronics)\b/i.test(titleBlob)) {
+    return "Robotics & Autonomous Systems";
+  }
+  if (/\b(?:research scientist|research engineer|applied scientist|scientist|postdoc|researcher)\b/i.test(titleBlob)) {
+    return "Research & Science";
+  }
+  if (/\b(?:mlops|ml infra|ai infra|inference|kubernetes|distributed systems|gpu|cuda|kernel|platform|infrastructure)\b/i.test(titleBlob)) {
+    return "Infrastructure & MLOps";
+  }
+  if (/\b(?:data scientist|data engineer|analytics engineer|business intelligence)\b/i.test(titleBlob)) {
+    return "Data Science & Analytics";
+  }
+  if (/\b(?:product manager|product designer|design|solutions architect|solutions engineer|forward deployed|gtm|sales|account)\b/i.test(titleBlob)) {
+    return "AI Product & Solutions";
+  }
+  if (/\b(?:ai|ml|machine learning|deep learning|llm|nlp|computer vision|genai|generative)\b/i.test(fullBlob)) {
+    return "ML & AI Engineering";
+  }
+  if (/\b(?:software|backend|frontend|full[- ]?stack|systems|developer)\b/i.test(titleBlob)) {
+    return "Software Engineering";
+  }
+  return "Unknown";
+}
+
+export function detectJobRemoteEligibility(
+  location: string | null | undefined,
+  employmentType: string | null | undefined,
+  description: string | null | undefined,
+  metadata: Record<string, unknown> = {}
+): { remote_eligible: boolean | "Unknown"; evidence: string | null } {
+  if (metadata.remote === true || metadata.isRemote === true) {
+    return { remote_eligible: true, evidence: "source_metadata remote flag is true" };
+  }
+  if (metadata.remote === false || metadata.isRemote === false) {
+    return { remote_eligible: false, evidence: "source_metadata remote flag is false" };
+  }
+  const loc = (location ?? "").trim();
+  const emp = (employmentType ?? "").trim();
+  const combinedHead = `${loc} ${emp}`.trim();
+  if (/\b(?:remote|work from home|wfh|distributed|anywhere)\b/i.test(combinedHead)) {
+    return { remote_eligible: true, evidence: `Location/type states '${combinedHead}'` };
+  }
+  if (/\b(?:on[- ]?site|in[- ]?office|in[- ]?person)\b/i.test(combinedHead)) {
+    return { remote_eligible: false, evidence: `Location/type states '${combinedHead}'` };
+  }
+  const desc = (description ?? "").slice(0, 1200);
+  if (/\b(?:fully remote|remote[- ]first|100% remote|work from anywhere)\b/i.test(desc)) {
+    return { remote_eligible: true, evidence: "Description explicitly states remote eligibility" };
+  }
+  if (/\b(?:in-?person|on-?site|in-?office|hybrid)\b/i.test(desc)) {
+    return { remote_eligible: false, evidence: "Description states on-site, in-office, or hybrid attendance" };
+  }
+  return { remote_eligible: "Unknown", evidence: null };
+}
+
+export { LiveSourceVerifier, matchJsonItemText };
 
 function parseLinkNextUrl(linkHeader: string | null | undefined): string | null {
   if (!linkHeader) return null;
@@ -2569,6 +3004,23 @@ async function collectResearchPapers(
     }
   });
 
+  // Track metrics_updated_at even for repositories beyond the per-run GitHub enrichment cap
+  const enrichedSlugsSet = new Set(slugsToEnrich);
+  for (const [slug, recs] of slugToRecords.entries()) {
+    if (enrichedSlugsSet.has(slug)) continue;
+    for (const rec of recs) {
+      const meta = (rec.source_metadata as Record<string, unknown>) || {};
+      if (!meta.github_metrics) {
+        meta.github_metrics = {
+          stars: rec.github_stars ?? null,
+          metrics_status: "deferred_rate_budget",
+          metrics_updated_at: nowIso,
+        };
+        rec.source_metadata = meta;
+      }
+    }
+  }
+
   return { records: limited, errors, hasMore: limited.length >= limit };
 }
 
@@ -2609,18 +3061,30 @@ async function collectJobs(
           const cat = normalizeUnknownText(job.category);
           const tags = Array.isArray(job.tags) ? job.tags.map(String) : [];
           if (!isQualifyingAiJob("remotive", title, tags, cat, desc)) continue;
+          const locText = normalizeUnknownText(job.candidate_required_location || "Remote");
+          const empType = normalizeUnknownText(job.job_type);
+          const roleFamily = classifyJobRoleFamily(title, `${cat} ${tags.join(" ")}`, desc);
+          const remoteInfo = detectJobRemoteEligibility(locText, empType, desc, { remote: true });
           combined.push({
             title,
             company,
-            location: normalizeUnknownText(job.candidate_required_location || "Remote"),
-            employment_type: normalizeUnknownText(job.job_type),
+            location: locText,
+            employment_type: empType,
             description: desc,
             posted_at: postedAt.toISOString(),
             application_url: appUrl,
             source_name: "remotive",
             source_url: appUrl,
             collected_at: nowIso,
-            source_metadata: { board: "remotive", category: job.category ?? null, remotive_id: job.id ?? null, api_url: remUrl },
+            source_metadata: {
+              board: "remotive",
+              category: job.category ?? null,
+              remotive_id: job.id ?? null,
+              api_url: remUrl,
+              role_family: roleFamily,
+              remote_eligible: remoteInfo.remote_eligible,
+              remote_evidence: remoteInfo.evidence,
+            },
           });
         }
       } catch (err) {
@@ -2655,10 +3119,13 @@ async function collectJobs(
             if (!isQualifyingAiJob("arbeitnow", title, tags, "", desc)) continue;
             const jobTypes = Array.isArray(job.job_types) ? job.job_types : [];
             const empType = normalizeUnknownText(jobTypes[0] ?? (job.remote ? "Remote" : null));
+            const locText = normalizeUnknownText(job.location);
+            const roleFamily = classifyJobRoleFamily(title, tags.join(" "), desc);
+            const remoteInfo = detectJobRemoteEligibility(locText, empType, desc, { remote: job.remote });
             combined.push({
               title,
               company,
-              location: normalizeUnknownText(job.location),
+              location: locText,
               employment_type: empType,
               description: desc,
               posted_at: postedAt.toISOString(),
@@ -2666,7 +3133,15 @@ async function collectJobs(
               source_name: "arbeitnow",
               source_url: appUrl,
               collected_at: nowIso,
-              source_metadata: { board: "arbeitnow", tags: job.tags ?? [], remote: job.remote ?? null, api_url: arbUrl },
+              source_metadata: {
+                board: "arbeitnow",
+                tags: job.tags ?? [],
+                remote: job.remote ?? null,
+                api_url: arbUrl,
+                role_family: roleFamily,
+                remote_eligible: remoteInfo.remote_eligible,
+                remote_evidence: remoteInfo.evidence,
+              },
             });
           }
         } catch (err) {
@@ -3169,6 +3644,99 @@ function csvEscape(val: string | number): string {
   return s;
 }
 
+function parseCsvRecords(content: string): Array<Record<string, string>> {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < content.length; i++) {
+    const ch = content[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (content[i + 1] === '"') {
+          field += '"';
+          i += 1;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        field += ch;
+      }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ",") {
+      row.push(field);
+      field = "";
+    } else if (ch === "\n") {
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = "";
+    } else if (ch === "\r") {
+      if (content[i + 1] === "\n") i += 1;
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = "";
+    } else {
+      field += ch;
+    }
+  }
+  if (field.length > 0 || row.length > 0) {
+    row.push(field);
+    rows.push(row);
+  }
+  if (rows.length < 2) return [];
+  const header = rows[0].map((h) => h.trim());
+  const out: Array<Record<string, string>> = [];
+  for (let r = 1; r < rows.length; r++) {
+    const cells = rows[r];
+    if (cells.length === 1 && cells[0] === "") continue;
+    const obj: Record<string, string> = {};
+    for (let c = 0; c < header.length; c++) {
+      if (!header[c]) continue;
+      obj[header[c]] = cells[c] ?? "";
+    }
+    out.push(obj);
+  }
+  return out;
+}
+
+function parseSemiList(raw: string | undefined): string[] {
+  if (!raw || !raw.trim()) return [];
+  return raw
+    .split(";")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function parseJsonMeta(raw: string | undefined): Record<string, unknown> {
+  if (!raw || !raw.trim()) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function parseVerificationStatus(raw: string | undefined): VerificationStatus {
+  const s = (raw ?? "").trim();
+  if (
+    s === "Verified" ||
+    s === "Partially Verified" ||
+    s === "Unverified" ||
+    s === "Source Unavailable" ||
+    s === "Rejected"
+  ) {
+    return s;
+  }
+  return "Unverified";
+}
+
 // ---------- Main Backend Service ----------
 
 export class AtlasBackendService {
@@ -3182,6 +3750,7 @@ export class AtlasBackendService {
     this.config = loadAtlasConfig(atlasDir);
     this.db = new AtlasDatabase(this.config.dbPath);
     this.db.initializeSchema();
+    this.hydrateFromCsvExportsIfEmpty();
     this.http = new PoliteHttpClient({
       userAgent: this.config.userAgent,
       timeoutMs: this.config.requestTimeoutMs,
@@ -3200,6 +3769,231 @@ export class AtlasBackendService {
       },
       this.db
     );
+  }
+
+  private hydrateFromCsvExportsIfEmpty(): void {
+    const counts = this.db.countRecords();
+    const totalExisting = Object.values(counts).reduce((sum, n) => sum + n, 0);
+    if (totalExisting > 0 || !fs.existsSync(this.config.exportsDir)) {
+      return;
+    }
+
+    const readExport = (filename: string): Array<Record<string, string>> => {
+      const p = path.resolve(this.config.exportsDir, filename);
+      if (!fs.existsSync(p)) return [];
+      return parseCsvRecords(fs.readFileSync(p, "utf-8"));
+    };
+
+    const startupRows = readExport("startups.csv");
+    if (startupRows.length > 0) {
+      const inputs: StartupInput[] = startupRows
+        .filter((r) => r.startup_id && r.name && r.source_url)
+        .map((r) => ({
+          startup_id: r.startup_id,
+          name: r.name,
+          description: r.description || null,
+          website: r.website || null,
+          official_website: r.official_website || r.website || null,
+          industry: r.industry || "Unknown",
+          location: r.location || "Unknown",
+          founding_date: r.founding_date || null,
+          source_name: r.source_name || "unknown",
+          source_url: r.source_url,
+          source_title: r.source_title || null,
+          collected_at: r.collected_at || new Date().toISOString(),
+          last_checked_at: r.last_checked_at || null,
+          supported_fields: parseSemiList(r.supported_fields),
+          verification_status: parseVerificationStatus(r.verification_status),
+          rejection_reason: r.rejection_reason || null,
+          canonical_entity_id: r.canonical_entity_id || null,
+          source_metadata: parseJsonMeta(r.source_metadata_json),
+        }));
+      this.db.upsertStartups(inputs);
+    }
+
+    const productRows = readExport("products.csv");
+    if (productRows.length > 0) {
+      const inputs: ProductInput[] = productRows
+        .filter((r) => r.product_id && r.name && r.source_url)
+        .map((r) => ({
+          product_id: r.product_id,
+          name: r.name,
+          description: r.description || null,
+          website: r.website || null,
+          official_website: r.official_website || r.website || null,
+          category: r.category || "Unknown",
+          company_name: r.company_name || "Unknown",
+          source_name: r.source_name || "unknown",
+          source_url: r.source_url,
+          source_title: r.source_title || null,
+          collected_at: r.collected_at || new Date().toISOString(),
+          last_checked_at: r.last_checked_at || null,
+          supported_fields: parseSemiList(r.supported_fields),
+          verification_status: parseVerificationStatus(r.verification_status),
+          rejection_reason: r.rejection_reason || null,
+          canonical_entity_id: r.canonical_entity_id || null,
+          source_metadata: parseJsonMeta(r.source_metadata_json),
+        }));
+      this.db.upsertProducts(inputs);
+    }
+
+    const paperRows = readExport("research_papers.csv");
+    if (paperRows.length > 0) {
+      const inputs: ResearchPaperInput[] = paperRows
+        .filter((r) => r.paper_id && r.title && r.source_url)
+        .map((r) => {
+          const starsRaw = r.github_stars?.trim();
+          const starsParsed = starsRaw && /^\d+$/.test(starsRaw) ? Number(starsRaw) : null;
+          return {
+            paper_id: r.paper_id,
+            title: r.title,
+            abstract: r.abstract || null,
+            authors: parseSemiList(r.authors),
+            publication_date: r.publication_date || null,
+            doi: r.doi || null,
+            arxiv_id: r.arxiv_id || null,
+            github_repository: r.github_repository || null,
+            github_stars: starsParsed,
+            official_website: r.official_website || null,
+            source_name: r.source_name || "unknown",
+            source_url: r.source_url,
+            source_title: r.source_title || null,
+            collected_at: r.collected_at || new Date().toISOString(),
+            last_checked_at: r.last_checked_at || null,
+            supported_fields: parseSemiList(r.supported_fields),
+            verification_status: parseVerificationStatus(r.verification_status),
+            rejection_reason: r.rejection_reason || null,
+            source_metadata: parseJsonMeta(r.source_metadata_json),
+          };
+        });
+      this.db.upsertResearchPapers(inputs);
+    }
+
+    const jobRows = readExport("jobs.csv");
+    if (jobRows.length > 0) {
+      const inputs: JobInput[] = jobRows
+        .filter((r) => r.job_id && r.title && r.application_url && r.posted_at)
+        .map((r) => ({
+          job_id: r.job_id,
+          title: r.title,
+          company: r.company || "Unknown",
+          location: r.location || "Unknown",
+          employment_type: r.employment_type || "Unknown",
+          description: r.description || null,
+          posted_at: r.posted_at,
+          application_url: r.application_url,
+          official_website: r.official_website || null,
+          source_name: r.source_name || "unknown",
+          source_url: r.source_url || r.application_url,
+          source_title: r.source_title || null,
+          collected_at: r.collected_at || new Date().toISOString(),
+          last_checked_at: r.last_checked_at || null,
+          supported_fields: parseSemiList(r.supported_fields),
+          verification_status: parseVerificationStatus(r.verification_status),
+          rejection_reason: r.rejection_reason || null,
+          canonical_company_id: r.canonical_company_id || null,
+          source_metadata: parseJsonMeta(r.source_metadata_json),
+        }));
+      this.db.upsertJobs(inputs);
+    }
+
+    const newsRows = readExport("news.csv");
+    if (newsRows.length > 0) {
+      const inputs: NewsInput[] = newsRows
+        .filter((r) => r.news_id && r.headline && r.article_url && r.published_at)
+        .map((r) => ({
+          news_id: r.news_id,
+          headline: r.headline,
+          summary: r.summary || null,
+          publisher: r.publisher || "Unknown",
+          published_at: r.published_at,
+          article_url: r.article_url,
+          official_website: r.official_website || null,
+          category: r.category || "AI",
+          source_name: r.source_name || null,
+          source_url: r.source_url || r.article_url,
+          source_title: r.source_title || null,
+          collected_at: r.collected_at || new Date().toISOString(),
+          last_checked_at: r.last_checked_at || null,
+          supported_fields: parseSemiList(r.supported_fields),
+          verification_status: parseVerificationStatus(r.verification_status),
+          rejection_reason: r.rejection_reason || null,
+          source_metadata: parseJsonMeta(r.source_metadata_json),
+        }));
+      this.db.upsertNews(inputs);
+    }
+
+    const mappingRows = readExport("entity_mapping_log.csv");
+    if (mappingRows.length > 0) {
+      const canonicalMap = new Map<
+        string,
+        {
+          canonical_id: string;
+          canonical_name: string;
+          normalized_name: string;
+          entity_type: string;
+          aliases: Set<string>;
+          created_at: string;
+        }
+      >();
+      const mappingInputs: EntityMappingLogInput[] = mappingRows
+        .filter((r) => r.mapping_id && r.raw_name && r.canonical_id)
+        .map((r) => {
+          const conf = Number(r.confidence);
+          const ts = r.timestamp || new Date().toISOString();
+          const existing = canonicalMap.get(r.canonical_id);
+          if (!existing) {
+            canonicalMap.set(r.canonical_id, {
+              canonical_id: r.canonical_id,
+              canonical_name: r.canonical_name || r.raw_name,
+              normalized_name: r.normalized_name || normalizeEntityName(r.canonical_name || r.raw_name),
+              entity_type: r.entity_type || "company",
+              aliases: new Set([r.raw_name]),
+              created_at: ts,
+            });
+          } else {
+            existing.aliases.add(r.raw_name);
+          }
+          return {
+            mapping_id: r.mapping_id,
+            raw_name: r.raw_name,
+            normalized_name: r.normalized_name || normalizeEntityName(r.raw_name),
+            canonical_name: r.canonical_name || r.raw_name,
+            canonical_id: r.canonical_id,
+            source_url: r.source_url || "",
+            match_method: r.match_method || "imported_mapping",
+            confidence: Number.isFinite(conf) ? conf : 1.0,
+            decision: r.decision || "new_entity",
+            timestamp: ts,
+            entity_type: r.entity_type || "company",
+            match_reason: r.match_reason || null,
+          };
+        });
+      const domainByCanonical = new Map<string, string>();
+      for (const s of startupRows) {
+        if (s.canonical_entity_id && s.website) {
+          const d = extractDomain(s.website);
+          if (d && !GENERIC_HOST_DOMAINS.has(d)) domainByCanonical.set(s.canonical_entity_id, d);
+        }
+      }
+      for (const p of productRows) {
+        if (p.canonical_entity_id && p.website && !domainByCanonical.has(p.canonical_entity_id)) {
+          const d = extractDomain(p.website);
+          if (d && !GENERIC_HOST_DOMAINS.has(d)) domainByCanonical.set(p.canonical_entity_id, d);
+        }
+      }
+      const canonicalRows: CanonicalEntityRow[] = Array.from(canonicalMap.values()).map((c) => ({
+        canonical_id: c.canonical_id,
+        canonical_name: c.canonical_name,
+        normalized_name: c.normalized_name,
+        entity_type: c.entity_type,
+        primary_domain: domainByCanonical.get(c.canonical_id) ?? null,
+        aliases_json: JSON.stringify(Array.from(c.aliases)),
+        created_at: c.created_at,
+      }));
+      this.db.upsertCanonicalEntities(canonicalRows);
+      this.db.upsertEntityMappingLogs(mappingInputs);
+    }
   }
 
   public getStatus(): Record<string, unknown> {
@@ -3503,7 +4297,7 @@ export class AtlasBackendService {
         }
       }
 
-      const bulkSnapshotOnly = uniqueRecords.length > 100;
+      const bulkSnapshotOnly = cat === "news" ? uniqueRecords.length > 150 : uniqueRecords.length > 100;
       log(
         `[${cat}] Verifying ${uniqueRecords.length} records against live ${
           bulkSnapshotOnly ? "API/feed snapshots" : "source URLs & websites"
@@ -3643,19 +4437,7 @@ export class AtlasBackendService {
     this.db.upsertCanonicalEntities(resolver.getEntities());
     this.db.upsertEntityMappingLogs(resolver.getLogs());
 
-    const qualityReport = {
-      generated_at_utc: new Date().toISOString(),
-      categories: categoryQuality,
-      entity_resolution: resolver.getStats(),
-      verification_summary: overallVerSummary,
-      unavailable_sources: Array.from(new Set(unavailableSources)),
-    };
-    fs.mkdirSync(this.config.dataDir, { recursive: true });
-    fs.writeFileSync(
-      path.resolve(this.config.dataDir, "quality_report.json"),
-      JSON.stringify(qualityReport, null, 2),
-      "utf-8"
-    );
+    const qualityReport = this.writeSyncedQualityReport(categoryQuality, unavailableSources);
 
     const csvSummary = this.exportAllCsv();
     log("Refreshed CSV exports across all 6 datasets.");
@@ -3786,13 +4568,137 @@ export class AtlasBackendService {
         return rec;
       });
 
-      const verified = await mapConcurrent(parsedRows, this.config.maxConcurrency, (rec) =>
-        verifier.verifyRecord(
+      // Pre-seed unique authoritative API snapshots (api_url) concurrently when liveCheck is enabled
+      // so bulk audits verify against genuine live API responses without N-fold redundant list fetches.
+      if (opts.liveCheck) {
+        const apiUrls = new Set<string>();
+        if (cat === "startups" && parsedRows.some((r) => r.source_name === "yc_oss_directory")) {
+          apiUrls.add("https://yc-oss.github.io/api/companies/all.json");
+        }
+        for (const rec of parsedRows) {
+          const meta = (rec.source_metadata as Record<string, unknown>) || {};
+          if (typeof meta.api_url === "string" && isValidHttpUrl(meta.api_url)) {
+            apiUrls.add(meta.api_url);
+          }
+        }
+        const uniqueApiList = Array.from(apiUrls).slice(0, 40);
+        await mapConcurrent(uniqueApiList, 6, async (apiUrl) => {
+          const res = await this.http.fetch(apiUrl, { timeoutMs: Math.max(this.config.requestTimeoutMs, 25000), maxAttempts: 2 });
+          if (res.ok && res.content) {
+            verifier.seedSnapshot(apiUrl, res.status, res.content, res.contentType);
+          }
+        });
+      }
+
+      // Backfill GitHub star metrics_updated_at & stars for research_papers with github_repository
+      if (opts.liveCheck && cat === "research_papers") {
+        const ghHeaders: Record<string, string> = { Accept: "application/vnd.github+json" };
+        if (this.config.githubToken) ghHeaders.Authorization = `Bearer ${this.config.githubToken}`;
+        const slugToPapers = new Map<string, RawRecord[]>();
+        for (const rec of parsedRows) {
+          if (!rec.github_repository) continue;
+          const slug = extractGithubRepoSlug(String(rec.github_repository));
+          if (!slug) continue;
+          const meta = (rec.source_metadata as Record<string, unknown>) || {};
+          const existingGh = meta.github_metrics as Record<string, unknown> | undefined;
+          if (!existingGh?.metrics_updated_at || rec.github_stars === null || rec.github_stars === undefined) {
+            const list = slugToPapers.get(slug) ?? [];
+            list.push(rec);
+            slugToPapers.set(slug, list);
+          }
+        }
+        const maxBackfillSlugs = this.config.githubToken ? 120 : 40;
+        const slugsToQuery = Array.from(slugToPapers.keys()).slice(0, maxBackfillSlugs);
+        let rateLimited = false;
+        await mapConcurrent(slugsToQuery, 4, async (slug) => {
+          const ts = new Date().toISOString();
+          if (rateLimited) {
+            for (const rec of slugToPapers.get(slug) ?? []) {
+              const meta = (rec.source_metadata as Record<string, unknown>) || {};
+              meta.github_metrics = {
+                stars: rec.github_stars ?? null,
+                metrics_status: rec.github_stars !== null ? "cached_rate_limited" : "rate_limited",
+                metrics_updated_at: ts,
+              };
+              rec.source_metadata = meta;
+            }
+            return;
+          }
+          const ghRes = await this.http.fetch(`https://api.github.com/repos/${slug}`, {
+            headers: ghHeaders,
+            timeoutMs: 8000,
+            maxAttempts: 1,
+          });
+          if (ghRes.status === 403 || ghRes.status === 429) {
+            rateLimited = true;
+            for (const rec of slugToPapers.get(slug) ?? []) {
+              const meta = (rec.source_metadata as Record<string, unknown>) || {};
+              meta.github_metrics = {
+                stars: rec.github_stars ?? null,
+                metrics_status: rec.github_stars !== null ? `cached_hf_rate_limited_${ghRes.status}` : `rate_limited_http_${ghRes.status}`,
+                metrics_updated_at: ts,
+              };
+              rec.source_metadata = meta;
+            }
+            return;
+          }
+          if (ghRes.ok) {
+            try {
+              const ghJson = JSON.parse(ghRes.content) as Record<string, unknown>;
+              const stars = typeof ghJson.stargazers_count === "number" ? ghJson.stargazers_count : null;
+              const metrics = {
+                stars,
+                forks: typeof ghJson.forks_count === "number" ? ghJson.forks_count : null,
+                open_issues: typeof ghJson.open_issues_count === "number" ? ghJson.open_issues_count : null,
+                watchers: typeof ghJson.subscribers_count === "number" ? ghJson.subscribers_count : null,
+                language: ghJson.language ?? null,
+                updated_at: ghJson.updated_at ?? null,
+                metrics_updated_at: ts,
+                metrics_status: "verified_github_api",
+              };
+              for (const rec of slugToPapers.get(slug) ?? []) {
+                if (stars !== null && stars >= 0) rec.github_stars = stars;
+                const meta = (rec.source_metadata as Record<string, unknown>) || {};
+                meta.github_metrics = metrics;
+                rec.source_metadata = meta;
+              }
+            } catch {
+              // Ignore parse failure
+            }
+          }
+        });
+        const queriedSet = new Set(slugsToQuery);
+        for (const [slug, recs] of slugToPapers.entries()) {
+          if (queriedSet.has(slug)) continue;
+          for (const rec of recs) {
+            const meta = (rec.source_metadata as Record<string, unknown>) || {};
+            if (!meta.github_metrics) {
+              meta.github_metrics = {
+                stars: rec.github_stars ?? null,
+                source: rec.source_name ?? "unknown",
+                metrics_status: rec.github_stars !== null ? "cached_source_budget_cap" : "deferred_rate_budget",
+                metrics_updated_at: checkedAtIso,
+              };
+              rec.source_metadata = meta;
+            }
+          }
+        }
+      }
+
+      const verified = await mapConcurrent(parsedRows, this.config.maxConcurrency, (rec) => {
+        const currentStatus = String(rec.verification_status ?? "Unverified");
+        const meta = (rec.source_metadata as Record<string, unknown>) || {};
+        const hasSeededApi =
+          (typeof meta.api_url === "string" && isValidHttpUrl(meta.api_url)) ||
+          (cat === "startups" && rec.source_name === "yc_oss_directory");
+        const useBulkSnapshot =
+          parsedRows.length > 200 && (hasSeededApi || currentStatus === "Verified");
+        return verifier.verifyRecord(
           cat as "startups" | "products" | "research_papers" | "jobs" | "news",
           rec,
-          { liveCheck: opts.liveCheck, bulkSnapshotOnly: parsedRows.length > 200, checkedAtIso }
-        )
-      );
+          { liveCheck: opts.liveCheck, bulkSnapshotOnly: useBulkSnapshot, checkedAtIso }
+        );
+      });
 
       if (cat === "startups") this.db.upsertStartups(verified as unknown as StartupInput[]);
       else if (cat === "products") this.db.upsertProducts(verified as unknown as ProductInput[]);
@@ -3844,6 +4750,10 @@ export class AtlasBackendService {
     if (auditEntries.length > 0) {
       this.db.recordAuditEntries(auditEntries);
     }
+
+    // Refresh quality_report.json summary counts from persisted SQLite tables
+    this.writeSyncedQualityReport();
+
     this.exportAllCsv();
 
     return {
@@ -3853,5 +4763,82 @@ export class AtlasBackendService {
       databaseCounts: this.db.countRecords(),
       verificationCounts: this.db.getVerificationCounts(),
     };
+  }
+
+  public writeSyncedQualityReport(
+    categoryOverrides: Record<string, unknown> = {},
+    unavailableSourcesOverride?: string[]
+  ): Record<string, unknown> {
+    const qualityReportPath = path.resolve(this.config.dataDir, "quality_report.json");
+    let prevReport: {
+      categories?: Record<string, Record<string, unknown>>;
+      unavailable_sources?: string[];
+    } = {};
+    if (fs.existsSync(qualityReportPath)) {
+      try {
+        prevReport = JSON.parse(fs.readFileSync(qualityReportPath, "utf-8")) as {
+          categories?: Record<string, Record<string, unknown>>;
+          unavailable_sources?: string[];
+        };
+      } catch {
+        prevReport = {};
+      }
+    }
+
+    const latestVer = this.db.getVerificationCounts();
+    const counts = this.db.countRecords();
+    const targets: Record<string, number | null> = {
+      startups: this.config.targetStartups,
+      products: this.config.targetProducts,
+      research_papers: this.config.targetResearchPapers,
+      jobs: null,
+      news: null,
+    };
+
+    const categories: Record<string, Record<string, unknown>> = {};
+    for (const catName of ["startups", "products", "research_papers", "jobs", "news"]) {
+      const existing =
+        (prevReport.categories && typeof prevReport.categories[catName] === "object"
+          ? { ...prevReport.categories[catName] }
+          : {}) as Record<string, unknown>;
+      const rawOverride = categoryOverrides[catName];
+      const override =
+        rawOverride && typeof rawOverride === "object"
+          ? { ...(rawOverride as Record<string, unknown>) }
+          : {};
+      const persistedTotal = counts[catName] ?? 0;
+      const targetMin = targets[catName] ?? null;
+      categories[catName] = {
+        ...existing,
+        ...override,
+        persisted_total: persistedTotal,
+        target_minimum: targetMin,
+        target_met: targetMin !== null ? persistedTotal >= targetMin : null,
+        verification_breakdown: latestVer.byCategory[catName] ?? {},
+      };
+    }
+
+    const emlRows = this.db.fetchDataset("entity_mapping_log");
+    const entityResolution = {
+      total_logged: emlRows.length,
+      exact_match: emlRows.filter((r) => r.decision === "exact_match").length,
+      auto_merge: emlRows.filter((r) => r.decision === "auto_merge").length,
+      manual_review: emlRows.filter((r) => r.decision === "manual_review").length,
+      new_entity: emlRows.filter((r) => r.decision === "new_entity").length,
+      rejected: emlRows.filter((r) => r.decision === "rejected").length,
+    };
+
+    const qualityReport = {
+      generated_at_utc: new Date().toISOString(),
+      categories,
+      entity_resolution: entityResolution,
+      verification_summary: latestVer.totals,
+      unavailable_sources: Array.from(
+        new Set(unavailableSourcesOverride ?? prevReport.unavailable_sources ?? [])
+      ),
+    };
+    fs.mkdirSync(this.config.dataDir, { recursive: true });
+    fs.writeFileSync(qualityReportPath, JSON.stringify(qualityReport, null, 2), "utf-8");
+    return qualityReport;
   }
 }

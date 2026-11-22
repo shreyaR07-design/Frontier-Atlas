@@ -187,7 +187,7 @@ class LLMRouter:
                     provider_name="deepseek",
                     api_key=settings.deepseek_api_key,
                     model=settings.deepseek_model,
-                    endpoint_url="https://api.deepseek.com/chat/completions",
+                    endpoint_url="https://api.deepseek.com/v1/chat/completions",
                     timeout_seconds=max(20, settings.request_timeout_seconds),
                 )
             )

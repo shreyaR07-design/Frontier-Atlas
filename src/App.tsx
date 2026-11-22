@@ -122,7 +122,7 @@ export default function App() {
     setDatasetLoading(true);
     setDatasetError(null);
     try {
-      const resp = await fetch(`/api/atlas/datasets/${category}?limit=500`);
+      const resp = await fetch(`/api/atlas/datasets/${category}?limit=1500`);
       const data = await resp.json();
       if (seq !== datasetRequestSeqRef.current) return;
       if (!resp.ok) {
@@ -545,6 +545,7 @@ export default function App() {
               hasCsvExport={Boolean(
                 status?.csvExports.includes(DATASET_CSV_NAMES[activeSection])
               )}
+              onSelectCategory={handleSelectSection}
               onRetry={() => loadDataset(activeSection)}
               onOpenRunModal={() => setRunModalOpen(true)}
             />
