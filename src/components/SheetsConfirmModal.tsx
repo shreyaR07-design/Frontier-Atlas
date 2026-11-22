@@ -7,7 +7,7 @@ interface SheetsConfirmModalProps {
   exportScope: ExportScope;
   spreadsheetId: string;
   status: AtlasStatusResponse | null;
-  googleEmail: string | null;
+  serviceAccountEmail: string | null;
   onCancel: () => void;
   onConfirm: () => void;
 }
@@ -26,7 +26,7 @@ export function SheetsConfirmModal({
   exportScope,
   spreadsheetId,
   status,
-  googleEmail,
+  serviceAccountEmail,
   onCancel,
   onConfirm,
 }: SheetsConfirmModalProps) {
@@ -107,7 +107,9 @@ export function SheetsConfirmModal({
               <span className="font-mono text-amber-100">
                 {spreadsheetId.trim() ? spreadsheetId.trim() : "Create new spreadsheet in Google Drive"}
               </span>
-              {googleEmail ? ` (as ${googleEmail})` : " (using backend Service Account)"}
+              {serviceAccountEmail
+                ? ` (Service Account: ${serviceAccountEmail})`
+                : " (using backend Service Account)"}
             </p>
           </div>
         </div>

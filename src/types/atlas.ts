@@ -243,7 +243,7 @@ export interface SheetsStatusPayload {
   status: "Connected" | "Not Connected" | "Sync Failed";
   configured: boolean;
   authRequired?: boolean;
-  credentialSource: "oauth" | "path" | "json_env" | null;
+  credentialSource: "oauth" | "path" | "json_env" | "saved_config" | null;
   verifiedAccountEmail?: string | null;
   grantedScopes?: string[];
   tokenExpiresInSeconds?: number | null;

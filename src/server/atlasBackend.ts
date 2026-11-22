@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import {
@@ -166,7 +167,10 @@ export function loadAtlasConfig(atlasDir: string): AtlasConfig {
       process.env.GOOGLE_SHEETS_CREDENTIALS_PATH?.trim() ||
       process.env.GOOGLE_APPLICATION_CREDENTIALS?.trim() ||
       null,
-    googleSheetsCredentialsJson: process.env.GOOGLE_SHEETS_CREDENTIALS_JSON?.trim() || null,
+    googleSheetsCredentialsJson:
+      process.env.GOOGLE_SHEETS_CREDENTIALS_JSON?.trim() ||
+      process.env.GOOGLE_SERVICE_ACCOUNT_JSON?.trim() ||
+      null,
     googleSheetsSpreadsheetId: process.env.GOOGLE_SHEETS_SPREADSHEET_ID?.trim() || null,
     googleSheetsSpreadsheetName:
       process.env.GOOGLE_SHEETS_SPREADSHEET_NAME?.trim() ||
@@ -4660,12 +4664,17 @@ export class AtlasBackendService {
         rootDir: this.config.rootDir,
         credentialsPath: this.config.googleSheetsCredentialsPath,
         credentialsJson: this.config.googleSheetsCredentialsJson,
+        savedCredentialsPath: this.getSavedCredentialsFilePath(),
         spreadsheetId: this.config.googleSheetsSpreadsheetId,
         spreadsheetName: this.config.googleSheetsSpreadsheetName,
         freshnessWindowHours: this.config.freshnessWindowHours,
       },
       this.db
     );
+  }
+
+  public getSavedCredentialsFilePath(): string {
+    return path.resolve(this.config.dataDir, ".service_account_credentials.json");
   }
 
   private ensureSchedulerInitialized(): SchedulerStateRecord {
@@ -5127,12 +5136,12 @@ export class AtlasBackendService {
       },
       {
         id: "google_sheets",
-        label: "Google Sheets & Drive OAuth",
-        envKey: "Workspace OAuth (drive.file, spreadsheets)",
+        label: "Google Sheets & Drive Service Account",
+        envKey: "GOOGLE_SHEETS_CREDENTIALS_JSON (spreadsheets, drive)",
         status: "Not Configured",
         detail: this.sheets.isConfigured()
           ? "Service Account configured — awaiting live API test before marking Configured."
-          : "Sign in with Google to authorize Drive (drive.file) & Sheets spreadsheet creation/sync.",
+          : "Google Service Account JSON not configured yet. Paste Service Account credentials in the Setup Panel or set GOOGLE_SHEETS_CREDENTIALS_JSON.",
         error: null,
         latencyMs: null,
         checkedAt: null,
@@ -5265,8 +5274,8 @@ export class AtlasBackendService {
         githubProbe,
         {
           id: "google_sheets",
-          label: "Google Sheets & Drive OAuth",
-          envKey: "Workspace OAuth (drive.file, spreadsheets)",
+          label: "Google Sheets & Drive Service Account",
+          envKey: "GOOGLE_SHEETS_CREDENTIALS_JSON (spreadsheets, drive)",
           status: sheetsProbe.status,
           detail: sheetsProbe.detail,
           error: sheetsProbe.error,
@@ -5678,7 +5687,7 @@ export class AtlasBackendService {
 
   private syncSheetsHealthFromStatus(st: {
     status: "Connected" | "Not Connected" | "Sync Failed";
-    credentialSource: "oauth" | "path" | "json_env" | null;
+    credentialSource: "oauth" | "path" | "json_env" | "saved_config" | null;
     verifiedAccountEmail?: string | null;
     spreadsheetId: string | null;
     lastError: string | null;
@@ -5695,15 +5704,15 @@ export class AtlasBackendService {
       mappedStatus === "Configured"
         ? st.spreadsheetId
           ? `Verified live ${srcLabel}${st.verifiedAccountEmail ? ` (${st.verifiedAccountEmail})` : ""} access to spreadsheet ${st.spreadsheetId}.`
-          : `Verified live ${srcLabel}${st.verifiedAccountEmail ? ` (${st.verifiedAccountEmail})` : ""} Drive (drive.file) & Sheets readiness.`
+          : `Verified live ${srcLabel}${st.verifiedAccountEmail ? ` (${st.verifiedAccountEmail})` : ""} Drive & Sheets readiness.`
         : mappedStatus === "Connection Failed"
         ? st.lastError || "Google Workspace verification failed."
-        : "No active Google OAuth token or Service Account credentials. Click 'Sign in with Google' to authorize Drive (drive.file) & Sheets.";
+        : "Google Service Account JSON not configured yet. Paste Service Account credentials in the Setup Panel or set GOOGLE_SHEETS_CREDENTIALS_JSON.";
     const checkedAt = new Date().toISOString();
     const updatedItem: IntegrationHealthItem = {
       id: "google_sheets",
-      label: "Google Sheets & Drive OAuth",
-      envKey: "Workspace OAuth (drive.file, spreadsheets)",
+      label: "Google Sheets & Drive Service Account",
+      envKey: "GOOGLE_SHEETS_CREDENTIALS_JSON (spreadsheets, drive)",
       status: mappedStatus,
       detail,
       error: mappedStatus === "Connection Failed" ? st.lastError || detail : null,
@@ -5715,6 +5724,126 @@ export class AtlasBackendService {
       checkedAt: this.latestHealth.checkedAt ?? checkedAt,
       items: this.latestHealth.items.map((item) => (item.id === "google_sheets" ? updatedItem : item)),
       byId: { ...this.latestHealth.byId, google_sheets: updatedItem },
+    };
+  }
+
+  public async saveGoogleServiceAccountCredentials(rawJsonInput: string): Promise<{
+    saved: boolean;
+    configured: boolean;
+    verified: boolean;
+    credentialSource: "path" | "json_env" | "saved_config" | null;
+    clientEmail: string;
+    projectId: string | null;
+    sheetsStatus: SheetsConnectionStatus;
+    error: string | null;
+  }> {
+    const trimmed = typeof rawJsonInput === "string" ? rawJsonInput.trim() : "";
+    if (!trimmed) {
+      throw new Error("Service Account JSON is required.");
+    }
+    let decodedText = trimmed;
+    if (!trimmed.startsWith("{")) {
+      try {
+        decodedText = Buffer.from(trimmed, "base64").toString("utf-8").trim();
+      } catch {
+        throw new Error("Service Account credentials must be valid JSON.");
+      }
+    }
+    let parsed: Record<string, unknown>;
+    try {
+      const candidate = JSON.parse(decodedText) as unknown;
+      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+        throw new Error("Expected a JSON object.");
+      }
+      parsed = candidate as Record<string, unknown>;
+    } catch (err) {
+      throw new Error(
+        `Invalid Service Account JSON format: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+
+    if (parsed.type !== "service_account") {
+      throw new Error(
+        'Invalid credentials JSON: expected `"type": "service_account"` from a Google Cloud Service Account key.'
+      );
+    }
+    const clientEmail = typeof parsed.client_email === "string" ? parsed.client_email.trim() : "";
+    if (!clientEmail || !clientEmail.includes("@")) {
+      throw new Error("Service Account JSON is missing a valid `client_email` field.");
+    }
+    const rawPrivateKey = typeof parsed.private_key === "string" ? parsed.private_key : "";
+    const normalizedPrivateKey = rawPrivateKey.replace(/\\n/g, "\n").trim();
+    if (!normalizedPrivateKey.includes("BEGIN ") || !normalizedPrivateKey.includes("PRIVATE KEY")) {
+      throw new Error("Service Account JSON is missing a valid PEM `private_key`.");
+    }
+    try {
+      const keyObj = crypto.createPrivateKey(normalizedPrivateKey);
+      if (keyObj.type !== "private") {
+        throw new Error("Key is not a private key.");
+      }
+    } catch (err) {
+      throw new Error(
+        `Invalid Service Account private_key (${err instanceof Error ? err.message : String(err)}).`
+      );
+    }
+
+    const sanitizedPayload = {
+      type: "service_account",
+      project_id: typeof parsed.project_id === "string" ? parsed.project_id.trim() : "",
+      private_key_id: typeof parsed.private_key_id === "string" ? parsed.private_key_id.trim() : "",
+      private_key: normalizedPrivateKey,
+      client_email: clientEmail,
+      client_id: typeof parsed.client_id === "string" ? parsed.client_id.trim() : "",
+      auth_uri:
+        typeof parsed.auth_uri === "string"
+          ? parsed.auth_uri.trim()
+          : "https://accounts.google.com/o/oauth2/auth",
+      token_uri:
+        typeof parsed.token_uri === "string"
+          ? parsed.token_uri.trim()
+          : "https://oauth2.googleapis.com/token",
+    };
+
+    fs.mkdirSync(this.config.dataDir, { recursive: true });
+    const targetPath = this.getSavedCredentialsFilePath();
+    if (!targetPath.startsWith(this.config.dataDir + path.sep)) {
+      throw new Error("Invalid Service Account credential storage path.");
+    }
+    const tmpPath = `${targetPath}.tmp.${process.pid}`;
+    fs.writeFileSync(tmpPath, JSON.stringify(sanitizedPayload, null, 2), {
+      encoding: "utf-8",
+      mode: 0o600,
+    });
+    fs.chmodSync(tmpPath, 0o600);
+    fs.renameSync(tmpPath, targetPath);
+
+    this.sheets.clearCachedAuth();
+    const sheetsStatus = await this.verifyGoogleSheetsConnection();
+
+    return {
+      saved: true,
+      configured: this.sheets.isConfigured(),
+      verified: sheetsStatus.status === "Connected",
+      credentialSource: this.sheets.getCredentialSource(),
+      clientEmail,
+      projectId: sanitizedPayload.project_id || null,
+      sheetsStatus,
+      error: sheetsStatus.status === "Connected" ? null : sheetsStatus.lastError,
+    };
+  }
+
+  public async removeGoogleServiceAccountCredentials(): Promise<Record<string, unknown>> {
+    const targetPath = this.getSavedCredentialsFilePath();
+    if (targetPath.startsWith(this.config.dataDir + path.sep) && fs.existsSync(targetPath)) {
+      fs.unlinkSync(targetPath);
+    }
+    this.sheets.clearCachedAuth();
+    const sheetsStatus = await this.verifyGoogleSheetsConnection();
+    return {
+      removed: true,
+      configured: this.sheets.isConfigured(),
+      sheetsStatus,
+      status: this.getStatus(),
     };
   }
 
@@ -6257,6 +6386,7 @@ export class AtlasBackendService {
         if (!opts.skipAutoSheetsSync && this.sheets.isConfigured()) {
           log("Synchronizing collected records to Google Sheets (incremental mode)...");
           sheetsSync = await this.sheets.exportOrSync("incremental");
+          this.syncSheetsHealthFromStatus(this.sheets.getStatus());
           if (sheetsSync.success) {
             log(
               `Google Sheets synced (+${sheetsSync.rowsAdded} added, ${sheetsSync.rowsUpdated} updated, ${sheetsSync.rowsUnchanged} unchanged).`

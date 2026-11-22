@@ -52,7 +52,7 @@ const ALLOWED_CSV_FILES = new Set([
 async function startServer(): Promise<void> {
   const atlas = new AtlasBackendService(ATLAS_DIR);
   const app = express();
-  app.use(express.json());
+  app.use(express.json({ limit: "1mb" }));
 
   // Kick off non-blocking initial live health probes on startup and start configurable daily UTC scheduler
   void atlas.ensureInitialHealthChecked().catch(() => {});
@@ -354,6 +354,39 @@ async function startServer(): Promise<void> {
         status: "Sync Failed",
         authRequired: false,
         lastError: redactSecrets(err instanceof Error ? err.message : String(err)),
+      });
+    }
+  });
+
+  app.post("/api/atlas/sheets/credentials", async (req, res) => {
+    try {
+      let rawJson = "";
+      if (typeof req.body?.credentialsJson === "string") {
+        rawJson = req.body.credentialsJson;
+      } else if (req.body?.credentials && typeof req.body.credentials === "object") {
+        rawJson = JSON.stringify(req.body.credentials);
+      }
+      const saved = await atlas.saveGoogleServiceAccountCredentials(rawJson);
+      res.status(200).json({
+        ...saved,
+        status: atlas.getStatus(),
+      });
+    } catch (err) {
+      res.status(400).json({
+        saved: false,
+        error: redactSecrets(err instanceof Error ? err.message : String(err)),
+      });
+    }
+  });
+
+  app.delete("/api/atlas/sheets/credentials", async (_req, res) => {
+    try {
+      const result = await atlas.removeGoogleServiceAccountCredentials();
+      res.status(200).json(result);
+    } catch (err) {
+      res.status(500).json({
+        removed: false,
+        error: redactSecrets(err instanceof Error ? err.message : String(err)),
       });
     }
   });

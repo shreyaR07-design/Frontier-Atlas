@@ -10,17 +10,6 @@ import { OverviewPanel } from "./components/OverviewPanel";
 import { RunCollectionModal } from "./components/RunCollectionModal";
 import { SheetsConfirmModal } from "./components/SheetsConfirmModal";
 import { Sidebar } from "./components/Sidebar";
-import {
-  clearGoogleAccessToken,
-  formatGoogleAuthError,
-  getGoogleAccessToken,
-  googleSignIn,
-  googleSignOut,
-  initGoogleAuth,
-  isGoogleOAuthBlockedMessage,
-  isGoogleTokenValid,
-  updateGoogleTokenExpiry,
-} from "./lib/googleWorkspaceAuth";
 import type {
   AnyDatasetRow,
   AtlasStatusResponse,
@@ -104,11 +93,9 @@ export default function App() {
   const [sheetsExportScope, setSheetsExportScope] = useState<ExportScope>("all");
   const [targetSpreadsheetId, setTargetSpreadsheetId] = useState("");
   const hasInitializedSheetIdRef = useRef(false);
-  const [googleSigningIn, setGoogleSigningIn] = useState(false);
+  const [savingServiceAccount, setSavingServiceAccount] = useState(false);
   const [testingIntegrations, setTestingIntegrations] = useState(false);
   const [testingGoogleConnection, setTestingGoogleConnection] = useState(false);
-  const [googleUserEmail, setGoogleUserEmail] = useState<string | null>(null);
-  const [googleHasToken, setGoogleHasToken] = useState(false);
   const [sheetsFeedback, setSheetsFeedback] = useState<SheetsFeedbackState | null>(null);
 
   const loadStatus = useCallback(async () => {
@@ -192,20 +179,6 @@ export default function App() {
     void loadStatus();
     void loadFailures();
   }, [loadStatus, loadFailures]);
-
-  useEffect(() => {
-    const unsubscribe = initGoogleAuth(
-      (user, hasToken) => {
-        setGoogleUserEmail(user.email || user.displayName || "Google Account");
-        setGoogleHasToken(hasToken);
-      },
-      () => {
-        setGoogleUserEmail(null);
-        setGoogleHasToken(false);
-      }
-    );
-    return () => unsubscribe();
-  }, []);
 
   useEffect(() => {
     if (!hasInitializedSheetIdRef.current && status?.sheetsStatus?.spreadsheetId) {
@@ -370,20 +343,12 @@ export default function App() {
     }
   };
 
-  const handleTestIntegrations = useCallback(async (overrideToken?: string | null) => {
+  const handleTestIntegrations = useCallback(async () => {
     setTestingIntegrations(true);
     try {
-      const token = overrideToken !== undefined ? overrideToken : getGoogleAccessToken();
-      if (overrideToken === undefined && !token) {
-        setGoogleHasToken(false);
-      }
-      const headers: Record<string, string> = { "Content-Type": "application/json" };
-      if (token) {
-        headers.Authorization = `Bearer ${token}`;
-      }
       const resp = await fetch("/api/atlas/integrations/test", {
         method: "POST",
-        headers,
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           spreadsheetId: targetSpreadsheetId.trim() || undefined,
         }),
@@ -396,77 +361,59 @@ export default function App() {
     }
   }, [loadStatus, targetSpreadsheetId]);
 
-  const handleTestGoogleConnection = useCallback(
-    async (overrideToken?: string | null): Promise<boolean> => {
-      setTestingGoogleConnection(true);
-      setSheetsFeedback(null);
-      try {
-        const token = overrideToken !== undefined ? overrideToken : getGoogleAccessToken();
-        if (overrideToken === undefined && !token) {
-          setGoogleHasToken(false);
-        }
-        const headers: Record<string, string> = { "Content-Type": "application/json" };
-        if (token) {
-          headers.Authorization = `Bearer ${token}`;
-        }
-        const resp = await fetch("/api/atlas/sheets/verify", {
-          method: "POST",
-          headers,
-          body: JSON.stringify({
-            spreadsheetId: targetSpreadsheetId.trim() || undefined,
-            createNew: targetSpreadsheetId.trim() === "",
-          }),
-        });
-        const data = await readJsonSafe<Record<string, unknown>>(resp);
-        await loadStatus();
+  const handleTestGoogleConnection = useCallback(async (): Promise<boolean> => {
+    setTestingGoogleConnection(true);
+    setSheetsFeedback(null);
+    try {
+      const resp = await fetch("/api/atlas/sheets/verify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          spreadsheetId: targetSpreadsheetId.trim() || undefined,
+          createNew: targetSpreadsheetId.trim() === "",
+        }),
+      });
+      const data = await readJsonSafe<Record<string, unknown>>(resp);
+      await loadStatus();
 
-        if (data.status === "Connected") {
-          if (typeof data.tokenExpiresInSeconds === "number") {
-            updateGoogleTokenExpiry(data.tokenExpiresInSeconds);
-          }
-          if (data.verifiedAccountEmail) {
-            setGoogleUserEmail(String(data.verifiedAccountEmail));
-          }
-          setSheetsFeedback({
-            success: true,
-            message: data.spreadsheetId
-              ? `Google Workspace connection verified (${String(data.verifiedAccountEmail || googleUserEmail || "OAuth")} — Drive & Spreadsheet ${String(data.spreadsheetId)} accessible).`
-              : `Google Workspace connection verified (${String(data.verifiedAccountEmail || googleUserEmail || "OAuth")} — Drive & Sheets permissions confirmed).`,
-            url: null,
-          });
-          return true;
-        }
-
-        const needsReauth = Boolean(data.authRequired) || resp.status === 401;
-        if (needsReauth) {
-          clearGoogleAccessToken();
-          setGoogleHasToken(false);
-        }
+      if (data.status === "Connected") {
+        const verifiedUrl =
+          typeof data.spreadsheetUrl === "string" && data.spreadsheetUrl
+            ? data.spreadsheetUrl
+            : null;
         setSheetsFeedback({
-          success: false,
-          message:
-            String(
-              data.lastError ||
-                data.error ||
-                "Google Sheets is not connected. Click 'Sign in with Google' to authorize Drive & Sheets."
-            ),
-          url: null,
-          needsReauth,
+          success: true,
+          message: data.spreadsheetId
+            ? `Google Service Account verified (${String(data.verifiedAccountEmail || "Service Account")} — Spreadsheet ${String(data.spreadsheetId)} accessible).`
+            : `Google Service Account verified (${String(data.verifiedAccountEmail || "Service Account")} — Drive & Sheets APIs ready).`,
+          url: verifiedUrl,
         });
-        return false;
-      } catch (err) {
-        setSheetsFeedback({
-          success: false,
-          message: err instanceof Error ? err.message : String(err),
-          url: null,
-        });
-        return false;
-      } finally {
-        setTestingGoogleConnection(false);
+        return true;
       }
-    },
-    [googleUserEmail, loadStatus, targetSpreadsheetId]
-  );
+
+      const needsReauth = Boolean(data.authRequired) || resp.status === 401;
+      setSheetsFeedback({
+        success: false,
+        message: String(
+          data.lastError ||
+            data.error ||
+            "Google Service Account credentials are not configured. Paste a Service Account JSON key in the Setup Panel below."
+        ),
+        url: null,
+        needsReauth,
+      });
+      return false;
+    } catch (err) {
+      setSheetsFeedback({
+        success: false,
+        message: err instanceof Error ? err.message : String(err),
+        url: null,
+      });
+      return false;
+    } finally {
+      setTestingGoogleConnection(false);
+    }
+  }, [loadStatus, targetSpreadsheetId]);
 
   const prepareFallbackSummary = useCallback(
     async (reason: string, scope: ExportScope): Promise<SheetsFallbackExportSummary | null> => {
@@ -513,43 +460,88 @@ export default function App() {
     []
   );
 
-  const handleGoogleSignIn = async (selectAccount = false) => {
-    setGoogleSigningIn(true);
+  const handleSaveServiceAccount = async (rawJson: string): Promise<boolean> => {
+    setSavingServiceAccount(true);
     setSheetsFeedback(null);
     try {
-      const { user, accessToken } = await googleSignIn({ selectAccount });
-      setGoogleUserEmail(user.email || user.displayName || "Google Account");
-      setGoogleHasToken(true);
-      await handleTestGoogleConnection(accessToken);
-    } catch (err) {
-      setGoogleHasToken(isGoogleTokenValid());
-      const formatted = formatGoogleAuthError(err);
-      const blocked = isGoogleOAuthBlockedMessage(formatted);
-      const fallbackExport = blocked
-        ? await prepareFallbackSummary(formatted, sheetsExportScope)
-        : null;
+      const resp = await fetch("/api/atlas/sheets/credentials", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ credentialsJson: rawJson }),
+      });
+      const data = await readJsonSafe<{
+        saved?: boolean;
+        verified?: boolean;
+        clientEmail?: string;
+        sheetsStatus?: { spreadsheetUrl?: string | null; lastError?: string | null };
+        error?: string;
+      }>(resp);
+      await loadStatus();
+
+      if (!resp.ok || !data.saved) {
+        setSheetsFeedback({
+          success: false,
+          message: data.error || `Failed to save Service Account credentials (HTTP ${resp.status}).`,
+          url: null,
+          needsReauth: true,
+        });
+        return false;
+      }
+
+      if (data.verified) {
+        setSheetsFeedback({
+          success: true,
+          message: `Google Service Account saved and verified (${data.clientEmail || "Service Account"}). Click Export Google Sheets or Sync Google Sheets to publish all 6 tabs.`,
+          url: data.sheetsStatus?.spreadsheetUrl ?? null,
+        });
+        return true;
+      }
+
       setSheetsFeedback({
         success: false,
-        message: formatted,
+        message:
+          data.error ||
+          data.sheetsStatus?.lastError ||
+          "Service Account JSON saved on server, but Google API verification failed. Confirm Sheets & Drive APIs are enabled.",
         url: null,
-        needsReauth: !blocked,
-        fallbackExport,
       });
+      return false;
+    } catch (err) {
+      setSheetsFeedback({
+        success: false,
+        message: err instanceof Error ? err.message : String(err),
+        url: null,
+      });
+      return false;
     } finally {
-      setGoogleSigningIn(false);
+      setSavingServiceAccount(false);
     }
   };
 
-  const handleGoogleSignOut = async () => {
-    await googleSignOut();
-    setGoogleUserEmail(null);
-    setGoogleHasToken(false);
-    await handleTestIntegrations(null);
-    setSheetsFeedback({
-      success: true,
-      message: "Signed out of Google Workspace session.",
-      url: null,
-    });
+  const handleRemoveServiceAccount = async () => {
+    setSavingServiceAccount(true);
+    setSheetsFeedback(null);
+    try {
+      const resp = await fetch("/api/atlas/sheets/credentials", { method: "DELETE" });
+      const data = await readJsonSafe<{ error?: string }>(resp);
+      await loadStatus();
+      if (!resp.ok) {
+        throw new Error(data.error || `HTTP ${resp.status}`);
+      }
+      setSheetsFeedback({
+        success: true,
+        message: "Removed saved Service Account key from server config.",
+        url: null,
+      });
+    } catch (err) {
+      setSheetsFeedback({
+        success: false,
+        message: err instanceof Error ? err.message : String(err),
+        url: null,
+      });
+    } finally {
+      setSavingServiceAccount(false);
+    }
   };
 
   const executeSheetsAction = async (mode: "full" | "incremental") => {
@@ -560,14 +552,9 @@ export default function App() {
     setSheetsFeedback(null);
 
     try {
-      const token = getGoogleAccessToken();
-      const headers: Record<string, string> = { "Content-Type": "application/json" };
-      if (token) {
-        headers.Authorization = `Bearer ${token}`;
-      }
       const resp = await fetch(isFull ? "/api/atlas/export/sheets" : "/api/atlas/sync/sheets", {
         method: "POST",
-        headers,
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           spreadsheetId: targetSpreadsheetId.trim() || undefined,
           createNew: targetSpreadsheetId.trim() === "",
@@ -615,7 +602,7 @@ export default function App() {
         const sharingNote = publicViewerVerified
           ? " Public link verified ('Anyone with the link — Viewer')."
           : publicAccessStatus === "policy_blocked"
-          ? " Spreadsheet saved, but public link sharing is blocked by Workspace policy (download CSV/ZIP fallback below if needed for external reviewers)."
+          ? " Spreadsheet saved, but public link sharing is blocked by Drive policy (download CSV/ZIP fallback below if needed for external reviewers)."
           : " Public sharing not confirmed.";
         if (isFull) {
           const verifiedTotal = Object.values(verifiedMap).reduce(
@@ -656,10 +643,6 @@ export default function App() {
               : "Google Sheets operation failed.")
         );
         const needsReauth = Boolean(data.authRequired) || resp.status === 401 || errMsg.includes("401");
-        if (needsReauth) {
-          clearGoogleAccessToken();
-          setGoogleHasToken(false);
-        }
         const resolvedFallback =
           fallbackExport ?? (await prepareFallbackSummary(errMsg, sheetsExportScope));
         setSheetsFeedback({
@@ -696,44 +679,34 @@ export default function App() {
     // use non-destructive incremental merge whenever updating an existing spreadsheetId.
     const effectiveMode: "full" | "incremental" =
       mode === "full" && targetSpreadsheetId.trim() !== "" ? "incremental" : mode;
-    const token = getGoogleAccessToken();
-    const serviceAccountReady = Boolean(status?.credentials.googleSheetsConfigured);
-    if (!token && !serviceAccountReady) {
-      setGoogleHasToken(false);
-      setGoogleSigningIn(true);
-      try {
-        const { user, accessToken } = await googleSignIn();
-        setGoogleUserEmail(user.email || user.displayName || "Google Account");
-        setGoogleHasToken(true);
-        const verified = await handleTestGoogleConnection(accessToken);
-        if (verified) {
-          setSheetsConfirmMode(effectiveMode);
-        }
-      } catch (err) {
-        const formatted = formatGoogleAuthError(err);
-        const blocked = isGoogleOAuthBlockedMessage(err) || isGoogleOAuthBlockedMessage(formatted);
-        const fallbackExport = await prepareFallbackSummary(formatted, sheetsExportScope);
-        setSheetsFeedback({
-          success: false,
-          message: blocked
-            ? formatted
-            : `Google sign-in is required to create or write spreadsheets: ${formatted}`,
-          url: null,
-          needsReauth: !blocked,
-          fallbackExport,
-          steps: [
-            {
-              step: 1,
-              key: "auth",
-              label: "Connect or configure Google access",
-              status: blocked ? "blocked" : "failed",
-              detail: formatted,
-            },
-          ],
-        });
-      } finally {
-        setGoogleSigningIn(false);
-      }
+    const serviceAccountReady = Boolean(
+      status?.sheetsStatus?.configured || status?.credentials.googleSheetsConfigured
+    );
+    if (!serviceAccountReady) {
+      const msg =
+        "Google Service Account credentials are not configured yet. Paste your Service Account JSON key in the Setup Panel below (or set GOOGLE_SHEETS_CREDENTIALS_JSON in server config) — no browser OAuth popup needed.";
+      const fallbackExport = await prepareFallbackSummary(msg, sheetsExportScope);
+      setSheetsFeedback({
+        success: false,
+        message: msg,
+        url: null,
+        needsReauth: true,
+        fallbackExport,
+        steps: [
+          {
+            step: 1,
+            key: "auth",
+            label: "Configure Google Service Account",
+            status: "failed",
+            detail: msg,
+          },
+        ],
+      });
+      window.setTimeout(() => {
+        document
+          .getElementById("service-account-setup-panel")
+          ?.scrollIntoView({ behavior: "smooth", block: "center" });
+      }, 60);
       return;
     }
     setSheetsConfirmMode(effectiveMode);
@@ -889,9 +862,7 @@ export default function App() {
               sheetsExportScope={sheetsExportScope}
               onSheetsExportScopeChange={setSheetsExportScope}
               sheetsFeedback={sheetsFeedback}
-              googleUserEmail={googleUserEmail}
-              googleHasToken={googleHasToken}
-              googleSigningIn={googleSigningIn}
+              savingServiceAccount={savingServiceAccount}
               targetSpreadsheetId={targetSpreadsheetId}
               onTargetSpreadsheetIdChange={(val) => {
                 hasInitializedSheetIdRef.current = true;
@@ -902,13 +873,10 @@ export default function App() {
                 setTargetSpreadsheetId("");
                 setSheetsFeedback(null);
               }}
-              onGoogleSignIn={() => {
-                void handleGoogleSignIn(false);
+              onSaveServiceAccount={handleSaveServiceAccount}
+              onRemoveServiceAccount={() => {
+                void handleRemoveServiceAccount();
               }}
-              onGoogleSwitchAccount={() => {
-                void handleGoogleSignIn(true);
-              }}
-              onGoogleSignOut={handleGoogleSignOut}
               testingIntegrations={testingIntegrations}
               testingGoogleConnection={testingGoogleConnection}
               onTestIntegrations={() => {
@@ -964,7 +932,7 @@ export default function App() {
         exportScope={sheetsExportScope}
         spreadsheetId={targetSpreadsheetId}
         status={status}
-        googleEmail={googleHasToken ? googleUserEmail : null}
+        serviceAccountEmail={status?.sheetsStatus?.verifiedAccountEmail ?? null}
         onCancel={() => setSheetsConfirmMode(null)}
         onConfirm={() => {
           if (sheetsConfirmMode) void executeSheetsAction(sheetsConfirmMode);

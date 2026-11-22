@@ -13,16 +13,14 @@ import {
   ExternalLink,
   FileSpreadsheet,
   Globe,
+  KeyRound,
   Lock,
   Play,
   RefreshCw,
   ShieldCheck,
+  Trash2,
   XCircle,
 } from "lucide-react";
-import {
-  getOAuthSetupDiagnostics,
-  isGoogleOAuthBlockedMessage,
-} from "../lib/googleWorkspaceAuth";
 import type {
   AtlasStatusResponse,
   DatasetCategory,
@@ -51,15 +49,12 @@ interface OverviewPanelProps {
   testingIntegrations: boolean;
   testingGoogleConnection: boolean;
   sheetsFeedback: SheetsFeedbackState | null;
-  googleUserEmail: string | null;
-  googleHasToken: boolean;
-  googleSigningIn: boolean;
+  savingServiceAccount: boolean;
   targetSpreadsheetId: string;
   onTargetSpreadsheetIdChange: (value: string) => void;
   onClearTargetSpreadsheetId: () => void;
-  onGoogleSignIn: () => void;
-  onGoogleSwitchAccount: () => void;
-  onGoogleSignOut: () => void;
+  onSaveServiceAccount: (rawJson: string) => Promise<boolean>;
+  onRemoveServiceAccount: () => void;
   onTestIntegrations: () => void;
   onTestGoogleConnection: () => void;
   onSelectSection: (section: SectionId) => void;
@@ -180,15 +175,12 @@ export function OverviewPanel({
   testingIntegrations,
   testingGoogleConnection,
   sheetsFeedback,
-  googleUserEmail,
-  googleHasToken,
-  googleSigningIn,
+  savingServiceAccount,
   targetSpreadsheetId,
   onTargetSpreadsheetIdChange,
   onClearTargetSpreadsheetId,
-  onGoogleSignIn,
-  onGoogleSwitchAccount,
-  onGoogleSignOut,
+  onSaveServiceAccount,
+  onRemoveServiceAccount,
   onTestIntegrations,
   onTestGoogleConnection,
   onSelectSection,
@@ -209,6 +201,18 @@ export function OverviewPanel({
     status?.scheduler?.enabled ?? true
   );
   const [copiedUrl, setCopiedUrl] = useState(false);
+  const [saJsonInput, setSaJsonInput] = useState("");
+  const [showSaForm, setShowSaForm] = useState(false);
+
+  const handleSubmitServiceAccount = async () => {
+    const trimmed = saJsonInput.trim();
+    if (!trimmed) return;
+    const ok = await onSaveServiceAccount(trimmed);
+    if (ok) {
+      setSaJsonInput("");
+      setShowSaForm(false);
+    }
+  };
 
   const handleCopySpreadsheetUrl = async (urlToCopy: string) => {
     try {
@@ -424,6 +428,26 @@ export function OverviewPanel({
               <span>{sheetsSyncing ? "Syncing..." : "Sync Google Sheets"}</span>
             </button>
 
+            {(() => {
+              const verifiedOpenUrl =
+                (sheetsFeedback?.success && sheetsFeedback.url) ||
+                (sheetsStatus.status === "Connected" && sheetsStatus.spreadsheetUrl
+                  ? sheetsStatus.spreadsheetUrl
+                  : null);
+              if (!verifiedOpenUrl) return null;
+              return (
+                <a
+                  href={verifiedOpenUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-white text-sm font-medium transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
+                >
+                  <ExternalLink className="w-4 h-4" />
+                  <span>Open Google Sheet</span>
+                </a>
+              );
+            })()}
+
             <button
               type="button"
               onClick={onRefresh24h}
@@ -577,11 +601,16 @@ export function OverviewPanel({
                 {sheetsFeedback.needsReauth && (
                   <button
                     type="button"
-                    onClick={onGoogleSignIn}
-                    disabled={googleSigningIn}
-                    className="px-2.5 py-1 rounded bg-white hover:bg-slate-100 disabled:opacity-60 text-slate-900 font-medium transition-colors"
+                    onClick={() => {
+                      setShowSaForm(true);
+                      document
+                        .getElementById("service-account-setup-panel")
+                        ?.scrollIntoView({ behavior: "smooth", block: "center" });
+                    }}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-sky-600 hover:bg-sky-500 text-white font-medium transition-colors"
                   >
-                    {googleSigningIn ? "Signing in..." : "Sign in with Google"}
+                    <KeyRound className="w-3 h-3" />
+                    <span>Setup Service Account</span>
                   </button>
                 )}
                 {sheetsFeedback.success && sheetsFeedback.url && (
@@ -598,9 +627,9 @@ export function OverviewPanel({
                       href={sheetsFeedback.url}
                       target="_blank"
                       rel="noopener noreferrer"
-                      className="inline-flex items-center gap-1 font-medium underline shrink-0"
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-emerald-700 hover:bg-emerald-600 text-white font-medium transition-colors shrink-0"
                     >
-                      <span>Open Spreadsheet</span>
+                      <span>Open Google Sheet</span>
                       <ExternalLink className="w-3.5 h-3.5" />
                     </a>
                   </>
@@ -933,7 +962,7 @@ export function OverviewPanel({
                 <button
                   type="button"
                   onClick={onTestGoogleConnection}
-                  disabled={testingGoogleConnection || googleSigningIn}
+                  disabled={testingGoogleConnection || savingServiceAccount}
                   className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-800 hover:bg-slate-700 disabled:opacity-60 text-slate-200 text-xs font-medium transition-colors"
                 >
                   <RefreshCw className={`w-3 h-3 ${testingGoogleConnection ? "animate-spin" : ""}`} />
@@ -963,85 +992,132 @@ export function OverviewPanel({
                       : "Not Connected"}
                   </span>
                 </span>
-                {sheetsStatus.status === "Connected" &&
-                  Boolean(sheetsStatus.lastSyncAt) &&
-                  Boolean(sheetsStatus.spreadsheetUrl) && (
-                    <a
-                      href={sheetsStatus.spreadsheetUrl!}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-flex items-center gap-1 text-xs text-sky-400 hover:underline"
-                    >
-                      <span>Open Sheet</span>
-                      <ExternalLink className="w-3 h-3" />
-                    </a>
-                  )}
+                {sheetsStatus.status === "Connected" && Boolean(sheetsStatus.spreadsheetUrl) && (
+                  <a
+                    href={sheetsStatus.spreadsheetUrl!}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-sky-600 hover:bg-sky-500 text-white text-xs font-medium transition-colors"
+                  >
+                    <span>Open Google Sheet</span>
+                    <ExternalLink className="w-3 h-3" />
+                  </a>
+                )}
               </div>
             </div>
 
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 rounded-lg bg-[#070D1A] border border-slate-800/80 p-3">
-              {googleHasToken ? (
-                <>
-                  <div className="text-xs text-slate-300">
-                    Signed in as <span className="font-mono text-emerald-300">{googleUserEmail}</span>
+            <div
+              id="service-account-setup-panel"
+              className={`rounded-lg border p-3 space-y-2.5 ${
+                !sheetsStatus.configured
+                  ? "bg-amber-950/20 border-amber-700/50"
+                  : "bg-[#070D1A] border-slate-800/80"
+              }`}
+            >
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div className="space-y-0.5 text-xs">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <KeyRound
+                      className={`w-3.5 h-3.5 shrink-0 ${
+                        sheetsStatus.configured ? "text-emerald-400" : "text-amber-400"
+                      }`}
+                    />
+                    <span className="font-medium text-slate-100">
+                      {sheetsStatus.configured
+                        ? "Google Service Account Configured"
+                        : "Google Service Account Setup Required"}
+                    </span>
+                    {sheetsStatus.credentialSource && (
+                      <span className="font-mono text-[11px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300">
+                        {sheetsStatus.credentialSource === "saved_config"
+                          ? "Saved Server Key"
+                          : sheetsStatus.credentialSource === "json_env"
+                          ? "GOOGLE_SHEETS_CREDENTIALS_JSON"
+                          : sheetsStatus.credentialSource === "path"
+                          ? "Credentials File"
+                          : "OAuth"}
+                      </span>
+                    )}
                   </div>
-                  <div className="flex items-center gap-2 shrink-0">
+                  <p className="text-slate-400 leading-relaxed">
+                    {sheetsStatus.verifiedAccountEmail ? (
+                      <>
+                        Authenticating as{" "}
+                        <span className="font-mono text-emerald-300">
+                          {sheetsStatus.verifiedAccountEmail}
+                        </span>{" "}
+                        with <code className="text-slate-300">spreadsheets</code> &amp;{" "}
+                        <code className="text-slate-300">drive</code> scopes (auto-sets Anyone with the link — Viewer).
+                      </>
+                    ) : sheetsStatus.configured ? (
+                      "Service Account credentials present on server. Click Test Google Connection or Export Google Sheets to verify live Drive & Sheets API access."
+                    ) : (
+                      "Authenticates on the backend via Google Service Account (spreadsheets + drive scopes) — no browser OAuth popups required. Paste your Service Account JSON key below to enable automated 6-tab export and public link creation."
+                    )}
+                  </p>
+                </div>
+                {sheetsStatus.configured && (
+                  <div className="flex flex-wrap items-center gap-2 shrink-0">
                     <button
                       type="button"
-                      onClick={onGoogleSwitchAccount}
-                      disabled={googleSigningIn}
-                      className="px-3 py-1.5 rounded-md bg-slate-800 hover:bg-slate-700 disabled:opacity-60 text-slate-200 text-xs font-medium transition-colors"
+                      onClick={() => setShowSaForm((v) => !v)}
+                      className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium transition-colors"
                     >
-                      {googleSigningIn ? "Authorizing..." : "Re-authorize"}
+                      {showSaForm ? "Cancel" : "Replace Key"}
                     </button>
+                    {sheetsStatus.credentialSource === "saved_config" && (
+                      <button
+                        type="button"
+                        onClick={onRemoveServiceAccount}
+                        disabled={savingServiceAccount}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-rose-950/60 hover:bg-rose-900/70 border border-rose-800/60 disabled:opacity-60 text-rose-200 text-xs font-medium transition-colors"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                        <span>Remove Key</span>
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {(!sheetsStatus.configured || showSaForm) && (
+                <div className="space-y-2 pt-2 border-t border-slate-800/80 text-xs">
+                  <ol className="list-decimal list-inside space-y-0.5 text-slate-400">
+                    <li>
+                      Enable <strong className="text-slate-200">Google Sheets API</strong> &amp;{" "}
+                      <strong className="text-slate-200">Google Drive API</strong> in Google Cloud Console.
+                    </li>
+                    <li>
+                      Create a <strong className="text-slate-200">Service Account</strong> and download its JSON key file.
+                    </li>
+                    <li>
+                      Paste the JSON key below (saved strictly in server storage <code className="text-slate-300">0600</code>, never in browser storage) or set <code className="text-slate-300">GOOGLE_SHEETS_CREDENTIALS_JSON</code>.
+                    </li>
+                  </ol>
+                  <textarea
+                    rows={4}
+                    value={saJsonInput}
+                    onChange={(e) => setSaJsonInput(e.target.value)}
+                    placeholder='{"type":"service_account","project_id":"...","client_email":"...@....iam.gserviceaccount.com","private_key":"-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"}'
+                    className="w-full px-3 py-2 rounded-lg bg-[#070D1A] border border-slate-700 text-[11px] font-mono text-slate-200 placeholder:text-slate-600 focus:outline-none focus:ring-2 focus:ring-sky-500"
+                  />
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-[11px] text-slate-500">
+                      Private keys are never returned to the browser or written to CSV/ZIP exports.
+                    </span>
                     <button
                       type="button"
-                      onClick={onGoogleSignOut}
-                      className="px-3 py-1.5 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium transition-colors"
+                      onClick={() => void handleSubmitServiceAccount()}
+                      disabled={savingServiceAccount || !saJsonInput.trim()}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-sky-600 hover:bg-sky-500 disabled:opacity-50 text-white text-xs font-medium transition-colors"
                     >
-                      Sign out
+                      <KeyRound className="w-3.5 h-3.5" />
+                      <span>
+                        {savingServiceAccount ? "Verifying & Saving..." : "Save Service Account JSON"}
+                      </span>
                     </button>
                   </div>
-                </>
-              ) : (
-                <>
-                  <div className="text-xs text-slate-400">
-                    Sign in with Google to authorize Google Drive &amp; Sheets creation, full 6-tab export, and duplicate-free incremental sync.
-                  </div>
-                  <button
-                    type="button"
-                    onClick={onGoogleSignIn}
-                    disabled={googleSigningIn}
-                    className="inline-flex items-center gap-2 px-3.5 py-2 rounded-md bg-white hover:bg-slate-100 disabled:opacity-60 text-slate-800 text-xs font-medium shadow-xs transition-colors shrink-0"
-                  >
-                    <svg
-                      version="1.1"
-                      xmlns="http://www.w3.org/2000/svg"
-                      viewBox="0 0 48 48"
-                      className="w-4 h-4 shrink-0"
-                      aria-hidden="true"
-                    >
-                      <path
-                        fill="#EA4335"
-                        d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"
-                      />
-                      <path
-                        fill="#4285F4"
-                        d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"
-                      />
-                      <path
-                        fill="#FBBC05"
-                        d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"
-                      />
-                      <path
-                        fill="#34A853"
-                        d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"
-                      />
-                      <path fill="none" d="M0 0h48v48H0z" />
-                    </svg>
-                    <span>{googleSigningIn ? "Signing in..." : "Sign in with Google"}</span>
-                  </button>
-                </>
+                </div>
               )}
             </div>
 
@@ -1144,7 +1220,7 @@ export function OverviewPanel({
                     rel="noopener noreferrer"
                     className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-sky-600 hover:bg-sky-500 text-white font-medium transition-colors"
                   >
-                    <span>Open</span>
+                    <span>Open Google Sheet</span>
                     <ExternalLink className="w-3 h-3" />
                   </a>
                 </div>
@@ -1212,8 +1288,8 @@ export function OverviewPanel({
                   {
                     step: 1,
                     key: "auth",
-                    label: "1. Connect or configure Google access",
-                    done: Boolean(sheetsStatus.configured || googleHasToken),
+                    label: "1. Configure Google Service Account",
+                    done: Boolean(sheetsStatus.configured),
                   },
                   {
                     step: 2,
@@ -1332,75 +1408,15 @@ export function OverviewPanel({
               </p>
             )}
 
-            <details className="rounded-lg bg-[#070D1A] border border-slate-800/80 p-3 text-xs">
-              <summary className="cursor-pointer font-medium text-slate-200 select-none">
-                Service Account Setup Guide (Recommended if OAuth returns Error 403)
-              </summary>
-              <ol className="list-decimal list-inside space-y-1 text-slate-400 mt-2 leading-relaxed">
-                <li>
-                  Enable <strong className="text-slate-200">Google Sheets API</strong> and <strong className="text-slate-200">Google Drive API</strong> in Google Cloud Console.
-                </li>
-                <li>
-                  Create a Service Account JSON key and configure <code className="text-slate-200">GOOGLE_SHEETS_CREDENTIALS_PATH</code> (or <code className="text-slate-200">GOOGLE_SHEETS_CREDENTIALS_JSON</code>) strictly in server environment variables (never in browser code).
-                </li>
-                <li>
-                  Leave <code className="text-slate-200">GOOGLE_SHEETS_SPREADSHEET_ID</code> blank to auto-create one workbook, or share an existing sheet with the Service Account email as <strong className="text-slate-200">Editor</strong>.
-                </li>
-              </ol>
-            </details>
-
-            {(() => {
-              const oauthDiag = getOAuthSetupDiagnostics();
-              return (
-                <details className="rounded-lg bg-[#070D1A] border border-slate-800/80 p-3 text-xs">
-                  <summary className="cursor-pointer font-medium text-slate-200 select-none">
-                    Firebase &amp; GCP OAuth Domain Settings (Fix auth/unauthorized-domain)
-                  </summary>
-                  <div className="space-y-1.5 text-slate-400 mt-2 leading-relaxed">
-                    <p>
-                      Current origin: <code className="text-sky-300">{oauthDiag.currentOrigin}</code>
-                    </p>
-                    <p>
-                      Add these hostnames to <strong className="text-slate-200">Firebase Console ({oauthDiag.firebaseProjectId}) &rarr; Authentication &rarr; Settings &rarr; Authorized domains</strong> and to <strong className="text-slate-200">GCP OAuth Client Authorized JavaScript origins</strong>:
-                    </p>
-                    <ul className="list-disc list-inside font-mono text-[11px] text-slate-300 space-y-0.5">
-                      {oauthDiag.previewHostnames.map((host) => (
-                        <li key={host}>{host}</li>
-                      ))}
-                    </ul>
-                    <p>
-                      Authorized redirect URI: <code className="text-slate-200">{oauthDiag.firebaseRedirectUri}</code>
-                    </p>
-                    {oauthDiag.oauthClientId && (
-                      <p>
-                        OAuth Client ID: <code className="text-slate-200">{oauthDiag.oauthClientId}</code>
-                      </p>
-                    )}
-                  </div>
-                </details>
-              );
-            })()}
-
-            {/* Honest OAuth Restriction Notice & Reliable CSV/ZIP Alternative Workflow */}
             <div className="mt-4 pt-4 border-t border-slate-800/80 space-y-3">
-              <div
-                className={`rounded-lg border p-3 text-xs flex items-start gap-2.5 ${
-                  (sheetsFeedback && !sheetsFeedback.success && isGoogleOAuthBlockedMessage(sheetsFeedback.message)) ||
-                  (sheetsStatus.lastError && isGoogleOAuthBlockedMessage(sheetsStatus.lastError))
-                    ? "bg-amber-950/35 border-amber-700/60 text-amber-200"
-                    : "bg-[#070D1A] border-slate-800/80 text-slate-300"
-                }`}
-              >
-                <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+              <div className="rounded-lg border bg-[#070D1A] border-slate-800/80 text-slate-300 p-3 text-xs flex items-start gap-2.5">
+                <ShieldCheck className="w-4 h-4 text-sky-400 shrink-0 mt-0.5" />
                 <div className="space-y-1">
-                  <div className="font-medium text-amber-300">
-                    {(sheetsFeedback && !sheetsFeedback.success && isGoogleOAuthBlockedMessage(sheetsFeedback.message)) ||
-                    (sheetsStatus.lastError && isGoogleOAuthBlockedMessage(sheetsStatus.lastError))
-                      ? "Google OAuth Blocked (Error 403: access_denied)"
-                      : "Google OAuth & Reliable CSV / ZIP Export Delivery"}
+                  <div className="font-medium text-slate-200">
+                    Service Account Sync &amp; Local CSV / ZIP Export Delivery
                   </div>
-                  <p className="text-slate-300 leading-relaxed">
-                    Google OAuth may return <code className="text-amber-200">Error 403: access_denied</code> while the OAuth app has not completed Google verification. Direct Google Sheets API sync remains available for verified sessions, and you can export all <span className="font-mono text-slate-100">{totalRecords.toLocaleString()}</span> live SQLite records below as valid CSVs or a single ZIP archive with full timestamps, source URLs, verification statuses, canonical entity names, and GitHub metrics.
+                  <p className="text-slate-400 leading-relaxed">
+                    Google Sheets exports authenticate directly on the backend using your Service Account (<code className="text-slate-300">spreadsheets</code> + <code className="text-slate-300">drive</code> scopes), persist the target spreadsheet ID for automated syncs, and grant <strong className="text-slate-200">Anyone with the link — Viewer</strong> access automatically. You can also download all <span className="font-mono text-slate-100">{totalRecords.toLocaleString()}</span> live SQLite records below as valid CSVs or a single ZIP archive anytime.
                   </p>
                 </div>
               </div>
