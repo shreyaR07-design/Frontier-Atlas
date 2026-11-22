@@ -4,9 +4,11 @@
  * and source-evidence verification.
  *
  * Provider chain:
- *   1. Google Gemini (@google/genai) - primary
+ *   1. Google Gemini Flash (@google/genai) - primary when GEMINI_API_KEY is configured
  *   2. Groq (OpenAI-compatible REST) - fallback when GROQ_API_KEY is configured
- *   3. DeepSeek (OpenAI-compatible REST) - fallback when DEEPSEEK_API_KEY is configured
+ *   3. Llama 3 (OpenAI-compatible REST) - fallback when LLAMA3_API_KEY is configured
+ *   4. DeepSeek (OpenAI-compatible REST) - fallback when DEEPSEEK_API_KEY is configured
+ *   + Honest heuristic demo fallback when zero API keys are configured (marked Unverified)
  */
 
 import { GoogleGenAI } from "@google/genai";
@@ -278,16 +280,29 @@ export class GeminiLLMProvider implements LLMProvider {
     if (!this.isConfigured()) {
       throw new FatalProviderError("GEMINI_API_KEY is not configured");
     }
-    const ai = new GoogleGenAI({ apiKey: this.apiKey! });
+    const ai = new GoogleGenAI({
+      apiKey: this.apiKey!,
+      httpOptions: {
+        headers: {
+          "User-Agent": "aistudio-build",
+        },
+      },
+    });
+    const isGemini4Series = this.model.startsWith("gemini-4-");
     try {
       const response = await ai.models.generateContent({
         model: this.model,
         contents: prompt,
-        config: {
-          systemInstruction,
-          responseMimeType: "application/json",
-          temperature: 0,
-        },
+        config: isGemini4Series
+          ? {
+              systemInstruction,
+              responseMimeType: "application/json",
+            }
+          : {
+              systemInstruction,
+              responseMimeType: "application/json",
+              temperature: 0,
+            },
       });
       return parseJsonResponse(response.text ?? "");
     } catch (err) {
@@ -429,13 +444,123 @@ export function verifyExtractionAgainstSource(
   };
 }
 
+export function extractWithHeuristicDemo(
+  category: string,
+  sourceUrl: string,
+  sourceName: string,
+  sourceText: string
+): Array<Record<string, unknown>> {
+  const cleaned = (sourceText || "").replace(/\s+/g, " ").trim();
+  if (!cleaned) return [];
+  const sentences = cleaned.split(/(?<=[.!?])\s+/).filter((s) => s.trim().length >= 12);
+  const firstSentence = sentences[0] ?? cleaned.slice(0, 260);
+  const urlMatch = cleaned.match(/https?:\/\/[^\s"'<>]+/i)?.[0] ?? null;
+  const ghMatch = cleaned.match(/https?:\/\/(?:www\.)?github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+/i)?.[0] ?? null;
+  const isoDateMatch = cleaned.match(/\b\d{4}-\d{2}-\d{2}\b/)?.[0] ?? null;
+  const titleCandidate = firstSentence.split(/\s+(?:is|builds|announced|launches|released|raised)\b/i)[0]?.trim() || firstSentence.slice(0, 80);
+
+  const baseMeta = {
+    llm_provider: null,
+    llm_configured: false,
+    extraction_mode: "heuristic_demo_fallback",
+  };
+
+  if (category === "startups") {
+    return [
+      {
+        name: titleCandidate.slice(0, 120),
+        description: firstSentence.slice(0, 400),
+        website: urlMatch,
+        industry: "AI & Software",
+        location: "Unknown",
+        founding_date: isoDateMatch,
+        source_url: sourceUrl,
+        source_name: sourceName,
+        verification_status: "Unverified",
+        supported_fields: [],
+        source_metadata: baseMeta,
+      },
+    ];
+  }
+  if (category === "products") {
+    return [
+      {
+        name: titleCandidate.slice(0, 120),
+        description: firstSentence.slice(0, 400),
+        website: urlMatch || ghMatch,
+        category: "AI Tool",
+        company_name: "Unknown",
+        source_url: sourceUrl,
+        source_name: sourceName,
+        verification_status: "Unverified",
+        supported_fields: [],
+        source_metadata: baseMeta,
+      },
+    ];
+  }
+  if (category === "research_papers") {
+    return [
+      {
+        title: titleCandidate.slice(0, 160),
+        abstract: cleaned.slice(0, 600),
+        authors: [],
+        publication_date: isoDateMatch,
+        doi: null,
+        arxiv_id: null,
+        github_repository: ghMatch,
+        source_url: sourceUrl,
+        source_name: sourceName,
+        verification_status: "Unverified",
+        supported_fields: [],
+        source_metadata: baseMeta,
+      },
+    ];
+  }
+  if (category === "jobs") {
+    return [
+      {
+        title: titleCandidate.slice(0, 140),
+        company: "Unknown",
+        location: "Unknown",
+        employment_type: "Unknown",
+        description: cleaned.slice(0, 600),
+        posted_at: isoDateMatch,
+        application_url: urlMatch || sourceUrl,
+        source_url: sourceUrl,
+        source_name: sourceName,
+        verification_status: "Unverified",
+        supported_fields: [],
+        source_metadata: baseMeta,
+      },
+    ];
+  }
+  return [
+    {
+      headline: titleCandidate.slice(0, 180),
+      summary: firstSentence.slice(0, 500),
+      publisher: "Unknown",
+      published_at: isoDateMatch,
+      article_url: urlMatch || sourceUrl,
+      category: "AI",
+      source_url: sourceUrl,
+      source_name: sourceName,
+      verification_status: "Unverified",
+      supported_fields: [],
+      source_metadata: baseMeta,
+    },
+  ];
+}
+
 export interface LLMExtractionResult {
   category: string;
   sourceUrl: string;
   records: Array<Record<string, unknown>>;
   providerUsed: string | null;
+  mode: "live_llm" | "heuristic_demo_fallback" | "error";
+  llmConnected: boolean;
   chunksProcessed: number;
   subChunksSplit: number;
+  attemptedProviders: string[];
   errors: string[];
 }
 
@@ -455,21 +580,31 @@ export class LLMRouter {
     return this.providers.filter((p) => p.isConfigured()).map((p) => p.providerName);
   }
 
+  public allProviderNames(): string[] {
+    return this.providers.map((p) => p.providerName);
+  }
+
   public isConfigured(): boolean {
     return this.providers.some((p) => p.isConfigured());
   }
 
-  private async callProviders(prompt: string): Promise<{ payload: Record<string, unknown>; providerName: string }> {
+  private async callProviders(
+    prompt: string
+  ): Promise<{ payload: Record<string, unknown>; providerName: string; attemptedProviders: string[] }> {
     const configured = this.providers.filter((p) => p.isConfigured());
     if (configured.length === 0) {
-      throw new FatalProviderError("No LLM provider configured (set GEMINI_API_KEY, GROQ_API_KEY, or DEEPSEEK_API_KEY).");
+      throw new FatalProviderError(
+        "No LLM provider configured (set GEMINI_API_KEY, GROQ_API_KEY, LLAMA3_API_KEY, or DEEPSEEK_API_KEY)."
+      );
     }
 
     const errors: string[] = [];
+    const attemptedProviders: string[] = [];
     for (const provider of configured) {
+      attemptedProviders.push(provider.providerName);
       try {
         const payload = await runWithRetry(() => provider.generateJson(prompt), 3);
-        return { payload, providerName: provider.providerName };
+        return { payload, providerName: provider.providerName, attemptedProviders };
       } catch (err) {
         if (err instanceof PayloadTooLargeError) {
           throw err;
@@ -489,16 +624,17 @@ export class LLMRouter {
   ): Promise<{
     rawRecords: Array<Record<string, unknown>>;
     providerUsed: string | null;
+    attemptedProviders: string[];
     subSplits: number;
     errors: string[];
   }> {
     const prompt = buildExtractionPrompt(category, sourceUrl, text);
     try {
-      const { payload, providerName } = await this.callProviders(prompt);
+      const { payload, providerName, attemptedProviders } = await this.callProviders(prompt);
       const recs = Array.isArray(payload.records)
         ? payload.records.filter((r): r is Record<string, unknown> => Boolean(r && typeof r === "object"))
         : [];
-      return { rawRecords: recs, providerUsed: providerName, subSplits: 0, errors: [] };
+      return { rawRecords: recs, providerUsed: providerName, attemptedProviders, subSplits: 0, errors: [] };
     } catch (err) {
       if (err instanceof PayloadTooLargeError && depth < 3 && tokenBudget > 600) {
         const nextBudget = Math.max(600, Math.floor(tokenBudget / 2));
@@ -508,20 +644,29 @@ export class LLMRouter {
         });
         const merged: Array<Record<string, unknown>> = [];
         const subErrors: string[] = [];
+        const attemptedSet = new Set<string>();
         let lastProvider: string | null = null;
         let totalSplits = 1;
         for (const sub of subChunks) {
           const res = await this.extractChunkRecursive(category, sourceUrl, sub.text, nextBudget, depth + 1);
           merged.push(...res.rawRecords);
           subErrors.push(...res.errors);
+          for (const p of res.attemptedProviders) attemptedSet.add(p);
           totalSplits += res.subSplits;
           if (res.providerUsed) lastProvider = res.providerUsed;
         }
-        return { rawRecords: merged, providerUsed: lastProvider, subSplits: totalSplits, errors: subErrors };
+        return {
+          rawRecords: merged,
+          providerUsed: lastProvider,
+          attemptedProviders: Array.from(attemptedSet),
+          subSplits: totalSplits,
+          errors: subErrors,
+        };
       }
       return {
         rawRecords: [],
         providerUsed: null,
+        attemptedProviders: [],
         subSplits: 0,
         errors: [err instanceof Error ? err.message : String(err)],
       };
@@ -533,19 +678,44 @@ export class LLMRouter {
     sourceUrl: string;
     sourceName: string;
     sourceText: string;
+    allowHeuristicFallback?: boolean;
   }): Promise<LLMExtractionResult> {
     const result: LLMExtractionResult = {
       category: opts.category,
       sourceUrl: opts.sourceUrl,
       records: [],
       providerUsed: null,
+      mode: "error",
+      llmConnected: false,
       chunksProcessed: 0,
       subChunksSplit: 0,
+      attemptedProviders: [],
       errors: [],
     };
 
     if (!opts.sourceText || !opts.sourceText.trim()) {
       result.errors.push("Empty source text");
+      return result;
+    }
+
+    if (!this.isConfigured()) {
+      const msg =
+        "No LLM provider configured (GEMINI_API_KEY, GROQ_API_KEY, LLAMA3_API_KEY, DEEPSEEK_API_KEY).";
+      if (opts.allowHeuristicFallback) {
+        result.mode = "heuristic_demo_fallback";
+        result.llmConnected = false;
+        result.errors.push(`${msg} Executed deterministic heuristic fallback (records marked Unverified).`);
+        result.chunksProcessed = 1;
+        result.records = extractWithHeuristicDemo(
+          opts.category,
+          opts.sourceUrl,
+          opts.sourceName,
+          opts.sourceText
+        );
+        return result;
+      }
+      result.mode = "error";
+      result.errors.push(msg);
       return result;
     }
 
@@ -555,6 +725,7 @@ export class LLMRouter {
     });
 
     const seenKeys = new Set<string>();
+    const attemptedSet = new Set<string>();
     for (const chunk of chunks) {
       result.chunksProcessed += 1;
       const chunkRes = await this.extractChunkRecursive(
@@ -563,7 +734,12 @@ export class LLMRouter {
         chunk.text,
         this.maxInputTokens
       );
-      if (chunkRes.providerUsed) result.providerUsed = chunkRes.providerUsed;
+      if (chunkRes.providerUsed) {
+        result.providerUsed = chunkRes.providerUsed;
+        result.mode = "live_llm";
+        result.llmConnected = true;
+      }
+      for (const p of chunkRes.attemptedProviders) attemptedSet.add(p);
       result.subChunksSplit += chunkRes.subSplits;
       result.errors.push(...chunkRes.errors);
 
@@ -589,6 +765,7 @@ export class LLMRouter {
         result.records.push(copy);
       }
     }
+    result.attemptedProviders = Array.from(attemptedSet);
 
     return result;
   }

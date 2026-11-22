@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Optional, Union
+
+_RELATIVE_TIME_RE = re.compile(
+    r"^(?:about\s+|approx\.?\s+|~)?(?:(an|a|\d+(?:\.\d+)?)\s*"
+    r"(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|wks?|w))\s+ago$",
+    re.IGNORECASE,
+)
 
 
 def utc_now() -> datetime:
@@ -19,8 +26,12 @@ def ensure_utc(dt: datetime) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
-def parse_utc_datetime(value: Union[str, int, float, datetime, None]) -> Optional[datetime]:
-    """Safely parse ISO-8601, RFC-2822 (RSS), or epoch timestamps into UTC datetime."""
+def parse_utc_datetime(
+    value: Union[str, int, float, datetime, None],
+    *,
+    reference_time: Optional[datetime] = None,
+) -> Optional[datetime]:
+    """Safely parse ISO-8601, RFC-2822 (RSS), epoch, or explicit relative timestamps into UTC datetime."""
     if value is None:
         return None
     if isinstance(value, datetime):
@@ -38,6 +49,25 @@ def parse_utc_datetime(value: Union[str, int, float, datetime, None]) -> Optiona
     raw = value.strip()
     if not raw:
         return None
+
+    ref = ensure_utc(reference_time or utc_now())
+    if raw.lower() in {"just now", "moment ago", "moments ago"}:
+        return ref
+    rel_match = _RELATIVE_TIME_RE.match(raw)
+    if rel_match:
+        qty_raw = rel_match.group(1).lower()
+        qty = 1.0 if qty_raw in {"a", "an"} else float(qty_raw)
+        unit = rel_match.group(2).lower()
+        if unit.startswith("s"):
+            return ref - timedelta(seconds=qty)
+        if unit.startswith("m"):
+            return ref - timedelta(minutes=qty)
+        if unit.startswith("h"):
+            return ref - timedelta(hours=qty)
+        if unit.startswith("d"):
+            return ref - timedelta(days=qty)
+        if unit.startswith("w"):
+            return ref - timedelta(weeks=qty)
 
     # ISO-8601 (handles 'Z' suffix cleanly in Python 3.11+)
     try:

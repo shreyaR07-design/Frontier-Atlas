@@ -7,6 +7,7 @@
 export interface FetchOptions {
   headers?: Record<string, string>;
   timeoutMs?: number;
+  maxCrawlDelayMs?: number;
   userAgent?: string;
   checkRobots?: boolean;
   maxAttempts?: number;
@@ -149,14 +150,15 @@ export class RobotsPolicyManager {
     private readonly timeoutMs = 8000
   ) {}
 
-  private async loadRules(origin: string): Promise<RobotsRule | null> {
+  private async loadRules(origin: string, timeoutOverrideMs?: number): Promise<RobotsRule | null> {
     if (this.cache.has(origin)) return this.cache.get(origin) ?? null;
     const pending = this.inflight.get(origin);
     if (pending) return pending;
 
     const task = (async (): Promise<RobotsRule | null> => {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+      const effectiveTimeout = Math.min(this.timeoutMs, timeoutOverrideMs ?? this.timeoutMs);
+      const timer = setTimeout(() => controller.abort(), effectiveTimeout);
       try {
         const resp = await fetch(`${origin}/robots.txt`, {
           method: "GET",
@@ -189,14 +191,17 @@ export class RobotsPolicyManager {
     return task;
   }
 
-  public async canFetch(url: string): Promise<{ allowed: boolean; crawlDelayMs: number | null; reason: string }> {
+  public async canFetch(
+    url: string,
+    timeoutOverrideMs?: number
+  ): Promise<{ allowed: boolean; crawlDelayMs: number | null; reason: string }> {
     if (!this.respectRobotsTxt) {
       return { allowed: true, crawlDelayMs: null, reason: "robots_check_disabled" };
     }
     try {
       const u = new URL(url);
       const origin = `${u.protocol.toLowerCase()}//${u.host.toLowerCase()}`;
-      const rule = await this.loadRules(origin);
+      const rule = await this.loadRules(origin, timeoutOverrideMs);
       if (!rule) return { allowed: true, crawlDelayMs: null, reason: "no_robots_txt" };
       const pathWithQuery = `${u.pathname}${u.search}`;
       const allowed = isPathAllowedByRobots(pathWithQuery, rule);
@@ -220,15 +225,19 @@ export class DomainRateLimiter {
     this.minIntervalMs = Math.round(1000 / Math.max(0.2, requestsPerSecond));
   }
 
-  public async wait(domain: string, overrideIntervalMs?: number | null): Promise<void> {
+  public async wait(domain: string, overrideIntervalMs?: number | null, maxWaitMs?: number): Promise<boolean> {
     const interval = Math.max(this.minIntervalMs, overrideIntervalMs ?? 0);
     const now = Date.now();
     const scheduled = Math.max(now, this.nextAllowedAt.get(domain) ?? now);
-    this.nextAllowedAt.set(domain, scheduled + interval);
     const delay = scheduled - now;
+    if (maxWaitMs !== undefined && delay > maxWaitMs) {
+      return false;
+    }
+    this.nextAllowedAt.set(domain, scheduled + interval);
     if (delay > 0) {
       await sleep(delay);
     }
+    return true;
   }
 
   public penalize(domain: string, backoffMs: number): void {
@@ -304,9 +313,10 @@ export class PoliteHttpClient {
     }
 
     const domain = parsed.hostname.toLowerCase();
+    const timeoutMs = options.timeoutMs ?? this.opts.timeoutMs;
     let crawlDelayMs: number | null = null;
     if (options.checkRobots !== false) {
-      const decision = await this.robots.canFetch(canonical);
+      const decision = await this.robots.canFetch(canonical, Math.min(4500, timeoutMs));
       if (!decision.allowed) {
         return {
           url: canonical,
@@ -322,15 +332,46 @@ export class PoliteHttpClient {
         };
       }
       crawlDelayMs = decision.crawlDelayMs;
+      if (
+        options.maxCrawlDelayMs !== undefined &&
+        crawlDelayMs !== null &&
+        crawlDelayMs > options.maxCrawlDelayMs
+      ) {
+        return {
+          url: canonical,
+          status: 0,
+          ok: false,
+          content: "",
+          contentType: "",
+          headers: {},
+          error: "crawl_delay_exceeds_budget",
+          blockedByRobots: true,
+          skippedDuplicate: false,
+          attempts: 0,
+        };
+      }
     }
 
     const maxAttempts = Math.max(1, options.maxAttempts ?? this.opts.defaultMaxAttempts ?? 3);
-    const timeoutMs = options.timeoutMs ?? this.opts.timeoutMs;
     const ua = options.userAgent || this.opts.userAgent;
 
     let lastResult: FetchResult | null = null;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      await this.rateLimiter.wait(domain, crawlDelayMs);
+      const slotAcquired = await this.rateLimiter.wait(domain, crawlDelayMs, options.maxCrawlDelayMs);
+      if (!slotAcquired) {
+        return {
+          url: canonical,
+          status: 0,
+          ok: false,
+          content: "",
+          contentType: "",
+          headers: {},
+          error: "rate_budget_exceeded",
+          blockedByRobots: false,
+          skippedDuplicate: false,
+          attempts: attempt - 1,
+        };
+      }
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {

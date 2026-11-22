@@ -48,6 +48,12 @@ DEFAULT_RSS_SOURCES: tuple[RSSSource, ...] = (
         publisher="TechCrunch",
         category="Startups & AI",
     ),
+    RSSSource(
+        name="devto_ai",
+        url="https://dev.to/feed/tag/ai",
+        publisher="DEV Community",
+        category="AI Engineering",
+    ),
 )
 
 
@@ -75,11 +81,13 @@ class NewsCollector(BaseCollector):
                 link = (item.findtext("link") or "").strip()
                 pub_raw = item.findtext("pubDate") or item.findtext("{http://purl.org/dc/elements/1.1/}date")
                 pub_dt = parse_utc_datetime(pub_raw)
+                content_raw = (item.findtext("{http://purl.org/rss/1.0/modules/content/}encoded") or "").strip()
                 desc_raw = (item.findtext("description") or "").strip()
-                if desc_raw and ("<" in desc_raw and ">" in desc_raw):
-                    summary = BeautifulSoup(desc_raw, "html.parser").get_text(" ", strip=True) or None
+                best_raw = content_raw if len(content_raw) > len(desc_raw) else desc_raw
+                if best_raw and ("<" in best_raw and ">" in best_raw):
+                    summary = BeautifulSoup(best_raw, "html.parser").get_text(" ", strip=True) or None
                 else:
-                    summary = desc_raw or None
+                    summary = best_raw or None
                 if not title or not link or pub_dt is None:
                     continue
                 records.append(

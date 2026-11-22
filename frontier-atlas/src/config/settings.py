@@ -58,6 +58,9 @@ class Settings:
     gemini_model: str = "gemini-4-hydrogen"
     groq_api_key: Optional[str] = None
     groq_model: str = "llama-3.3-70b-versatile"
+    llama3_api_key: Optional[str] = None
+    llama3_model: str = "meta-llama/Llama-3.3-70B-Instruct"
+    llama3_endpoint_url: str = "https://api.together.xyz/v1/chat/completions"
     deepseek_api_key: Optional[str] = None
     deepseek_model: str = "deepseek-chat"
     llm_max_input_tokens: int = 12000
@@ -139,6 +142,9 @@ class Settings:
             gemini_model=os.getenv("GEMINI_MODEL", "gemini-4-hydrogen"),
             groq_api_key=os.getenv("GROQ_API_KEY") or None,
             groq_model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+            llama3_api_key=os.getenv("LLAMA3_API_KEY") or None,
+            llama3_model=os.getenv("LLAMA3_MODEL", "meta-llama/Llama-3.3-70B-Instruct"),
+            llama3_endpoint_url=os.getenv("LLAMA3_ENDPOINT_URL", "https://api.together.xyz/v1/chat/completions"),
             deepseek_api_key=os.getenv("DEEPSEEK_API_KEY") or None,
             deepseek_model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
             llm_max_input_tokens=_parse_int(os.getenv("LLM_MAX_INPUT_TOKENS"), 12000),

@@ -51,10 +51,10 @@ Live Public APIs, Feeds & Permitted Pages
 
 Key server modules in `src/server/`:
 - `atlasDb.ts` — SQLite schema, transactional batch upserts, verification status aggregation, audit trail, failure logs, checkpoints, and `sheets_sync_state`.
-- `httpClient.ts` — `RobotsPolicyManager`, `DomainRateLimiter`, and `PoliteHttpClient` with bounded retries, exponential backoff, `Retry-After` compliance, and non-bypass enforcement for HTTP `401`/`403`/`451` and CAPTCHA challenges.
-- `llmRouter.ts` — `LLMRouter` orchestrating **Gemini** (`@google/genai`) -> **Groq** -> **DeepSeek**, token-aware overlap chunking, recursive half-size sub-chunking on `413` / context-limit errors, and evidence verification.
-- `googleSheets.ts` — Google Sheets API v4 integration with Service Account JWT auth, quota retries (`429`/`5xx`), 6-tab creation & header formatting, paginated 500-row PUT batches, duplicate-free incremental sync via Column A stable IDs, read-back verification, and persistent connection status (`Connected`, `Not Connected`, `Sync Failed`).
-- `atlasBackend.ts` — Collectors, UTC freshness enforcement, deterministic entity resolution (`EntityResolver`), `LiveSourceVerifier`, CSV export, and pipeline orchestration.
+- `httpClient.ts` — `RobotsPolicyManager`, `DomainRateLimiter`, and `PoliteHttpClient` with bounded retries, exponential backoff, `Retry-After` compliance, bounded crawl-delay budgets, and non-bypass enforcement for HTTP `401`/`403`/`451` and CAPTCHA challenges.
+- `llmRouter.ts` — `LLMRouter` orchestrating **1. Gemini Flash** (`@google/genai`) -> **2. Groq** -> **3. Llama 3** -> **4. DeepSeek**, token-aware overlap chunking, recursive half-size sub-chunking on `413` / context-limit errors, 429 exponential backoff, evidence verification, and explicit `heuristic_demo_fallback` (`Unverified`) when zero LLM API keys are configured.
+- `googleSheets.ts` — Google Sheets API v4 integration with dual auth (Workspace OAuth Bearer token or Service Account JWT), quota retries (`429`/`5xx`), 6-tab creation & header formatting, payload-bounded `values:batchUpdate` batches, duplicate-free incremental sync via Column A stable IDs, Column A read-back verification, per-tab status tracking, and persistent connection status (`Connected`, `Not Connected`, `Sync Failed`).
+- `atlasBackend.ts` — Concurrent collectors, UTC & relative timestamp normalization (`parseUtcDatetimeWithMeta`), deterministic entity resolution (`EntityResolver`), `LiveSourceVerifier`, CSV export, and pipeline orchestration.
 
 ---
 
@@ -73,10 +73,11 @@ Start the Express + Vite dashboard server on port `3000`:
 npm run dev
 ```
 
-Build for production:
+Build and type-check for production:
 
 ```bash
 npm run build
+npm run lint
 ```
 
 ---
@@ -91,11 +92,14 @@ Set variables in `.env` (or `frontier-atlas/.env`; never commit credentials to g
 | `GOOGLE_SHEETS_CREDENTIALS_JSON` | Inline JSON or base64-encoded Service Account JSON (alternative to file path) | *(empty)* |
 | `GOOGLE_SHEETS_SPREADSHEET_ID` | Existing Google Spreadsheet ID (leave blank to auto-create) | *(empty)* |
 | `GOOGLE_SHEETS_SPREADSHEET_NAME` | Title used when creating a new spreadsheet | `FrontierAtlas Intelligence` |
-| `GEMINI_API_KEY` | Primary LLM provider API key (`@google/genai`) | *(empty)* |
-| `GEMINI_MODEL` | Gemini model ID | `gemini-2.5-flash` |
+| `GEMINI_API_KEY` | Tier-1 primary LLM API key (`@google/genai`, injected via AI Studio Secrets) | *(empty)* |
+| `GEMINI_MODEL` | Gemini Flash model ID | `gemini-4-hydrogen` |
 | `GROQ_API_KEY` | Tier-2 LLM fallback key (OpenAI-compatible) | *(empty)* |
 | `GROQ_MODEL` | Groq model ID | `llama-3.3-70b-versatile` |
-| `DEEPSEEK_API_KEY` | Tier-3 LLM fallback key (OpenAI-compatible) | *(empty)* |
+| `LLAMA3_API_KEY` | Tier-3 Llama 3 fallback key (OpenAI-compatible) | *(empty)* |
+| `LLAMA3_MODEL` | Llama 3 model ID | `meta-llama/Llama-3.3-70B-Instruct` |
+| `LLAMA3_ENDPOINT_URL` | Llama 3 chat completions endpoint URL | `https://api.together.xyz/v1/chat/completions` |
+| `DEEPSEEK_API_KEY` | Tier-4 LLM fallback key (OpenAI-compatible) | *(empty)* |
 | `DEEPSEEK_MODEL` | DeepSeek model ID | `deepseek-chat` |
 | `GITHUB_TOKEN` | GitHub PAT raising REST rate limit from 60 to 5,000 req/hr | *(empty)* |
 | `DATABASE_URL` | SQLite path (`sqlite:///data/frontier_atlas.db`) | `sqlite:///data/frontier_atlas.db` |
@@ -128,9 +132,9 @@ FrontierAtlas supports **two** authentication methods for writing to Google Shee
 ### Sheet Synchronization Behavior
 
 - **Six Exact Tabs**: `Startups`, `Products`, `Research Papers`, `Jobs`, `News`, `Entity Mapping Log`.
-- **Full Export (`POST /api/atlas/export/sheets` / "Export Google Sheets" button)**: Ensures all 6 tabs exist with styled frozen headers, clears data ranges cleanly, and writes database records in paginated 500-row batches, then verifies row counts by reading back Column A.
-- **Incremental Sync (`POST /api/atlas/sync/sheets` / "Sync Google Sheets" button & auto-sync after runs)**: Reads existing Column A record IDs + row values from each tab, updates modified rows in place via `values:batchUpdate`, appends only unseen stable IDs (`startup_id`, `product_id`, `paper_id`, `job_id`, `news_id`, `mapping_id`), and repairs duplicate IDs if any existed on the sheet.
-- **Connection Status (`Connected` / `Not Connected` / `Sync Failed`)**: Tracked in `sheets_sync_state` and displayed in the Overview dashboard along with last sync timestamp, sync delta (`+added / ~updated / =unchanged`), and per-tab exported row counts. Credentials remain strictly server-side and are never exposed to the browser.
+- **Full Export (`POST /api/atlas/export/sheets` / "Export Google Sheets" button)**: Ensures all 6 tabs exist with styled frozen headers, clears data ranges cleanly, writes database records in payload-bounded `values:batchUpdate` batches, and verifies row counts by reading back Row 1 headers + Column A record IDs.
+- **Incremental Sync (`POST /api/atlas/sync/sheets` / "Sync Google Sheets" button & auto-sync after runs)**: Reads existing Column A record IDs + row values from each tab, updates modified rows in place, appends only unseen stable IDs (`startup_id`, `product_id`, `paper_id`, `job_id`, `news_id`, `mapping_id`), and repairs duplicate IDs if any existed on the sheet.
+- **Connection Status (`Connected` / `Not Connected` / `Sync Failed`)**: Tracked in `sheets_sync_state` and displayed in the Overview dashboard along with last sync timestamp, sync delta (`+added / ~updated / =unchanged`), and per-tab verification statuses. Never claims `Connected` unless all 6 tabs pass write + Column A read-back verification.
 
 ---
 
@@ -148,12 +152,31 @@ FrontierAtlas supports **two** authentication methods for writing to Google Shee
 
 ---
 
-## Companion Python CLI (`frontier-atlas/`)
+## Testing Instructions
 
-The original Python 3.11+ package under `frontier-atlas/` also includes collectors, exporters, and pytest tests:
+Run the Node.js/TypeScript backend & integration verification suite (covers 4-tier LLM fallback, 429 backoff, 413 sub-chunking, heuristic demo mode, UTC/relative date freshness, deterministic entity resolution, robots/anti-bot compliance, SQLite persistence, and 6-tab Google Sheets batching + Column A verification):
+
+```bash
+npm run test:ts
+npm run lint
+npm run build
+```
+
+Run the companion Python test suite (requires Python 3.11+ with `frontier-atlas/requirements.txt` installed):
 
 ```bash
 cd frontier-atlas
+pip install -r requirements.txt
 pytest -v
 python -m src.pipeline.orchestrator --categories all --limit 25 --export-csv
 ```
+
+---
+
+## Known Limitations
+
+- **Live Google Sheets Write**: Interactive browser Google Sign-In or a backend Service Account (`GOOGLE_SHEETS_CREDENTIALS_PATH` / `GOOGLE_SHEETS_CREDENTIALS_JSON`) is required to authorize real writes against `sheets.googleapis.com`; without credentials, Sheets status accurately reports `Not Connected`.
+- **LLM API Keys**: Without `GEMINI_API_KEY`, `GROQ_API_KEY`, `LLAMA3_API_KEY`, or `DEEPSEEK_API_KEY`, unstructured text extraction runs in explicit `heuristic_demo_fallback` mode and marks extracted rows `Unverified` (never fabricating live LLM responses).
+- **External Rate Limits & Anti-Bot Rules**: Unauthenticated GitHub REST API lookups are capped at 60 req/hr without `GITHUB_TOKEN`, and sources returning `401`/`403`/`429`/CAPTCHA or disallowing paths in `robots.txt` (e.g., Remotive, Ashby, MarkTechPost, The Decoder) are skipped and logged in `failure_logs` without bypassing access controls.
+- **Python Environment in Node Container**: The Node.js runtime container ships Python 3.11 stdlib without `pip` packages (`pytest`, `pydantic`, `reportlab`, `playwright`); install `frontier-atlas/requirements.txt` in a Python virtualenv to execute `pytest` and Playwright-rendered crawls.
+

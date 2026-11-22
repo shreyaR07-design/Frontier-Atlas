@@ -171,6 +171,16 @@ class LLMRouter:
                     timeout_seconds=max(20, settings.request_timeout_seconds),
                 )
             )
+        if settings.llama3_api_key:
+            providers.append(
+                OpenAICompatibleProvider(
+                    provider_name="llama3",
+                    api_key=settings.llama3_api_key,
+                    model=settings.llama3_model,
+                    endpoint_url=settings.llama3_endpoint_url,
+                    timeout_seconds=max(20, settings.request_timeout_seconds),
+                )
+            )
         if settings.deepseek_api_key:
             providers.append(
                 OpenAICompatibleProvider(
@@ -194,7 +204,7 @@ class LLMRouter:
         configured = [p for p in self.providers if p.is_configured()]
         if not configured:
             raise FatalProviderError(
-                "No LLM provider configured (set GEMINI_API_KEY or optional fallback keys)."
+                "No LLM provider configured (set GEMINI_API_KEY, GROQ_API_KEY, LLAMA3_API_KEY, or DEEPSEEK_API_KEY)."
             )
 
         errors: list[str] = []
@@ -215,6 +225,52 @@ class LLMRouter:
                     extra={"ctx": {"provider": provider.provider_name, "error": str(exc)}},
                 )
         raise LLMError("All configured LLM providers failed: " + "; ".join(errors))
+
+    async def _extract_chunk_recursive(
+        self,
+        *,
+        category: str,
+        source_url: str,
+        text: str,
+        token_budget: int,
+        chunk_label: str,
+        depth: int = 0,
+    ) -> tuple[list[dict[str, Any]], Optional[str], list[str]]:
+        prompt = build_extraction_prompt(category, source_url, text)
+        try:
+            payload, provider_used = await self._call_providers(prompt)
+            recs = payload.get("records")
+            if isinstance(recs, list):
+                return [r for r in recs if isinstance(r, dict)], provider_used, []
+            return [], provider_used, [f"{chunk_label}: missing 'records' list in response"]
+        except PayloadTooLargeError as exc:
+            if depth >= 3 or token_budget <= 600:
+                return [], None, [f"{chunk_label}: {exc}"]
+            next_budget = max(600, token_budget // 2)
+            sub_chunks = chunk_text(
+                text,
+                max_tokens=next_budget,
+                overlap_tokens=min(100, self.overlap_tokens),
+            )
+            merged: list[dict[str, Any]] = []
+            errs: list[str] = []
+            last_provider: Optional[str] = None
+            for sub in sub_chunks:
+                sub_recs, sub_prov, sub_errs = await self._extract_chunk_recursive(
+                    category=category,
+                    source_url=source_url,
+                    text=sub.text,
+                    token_budget=next_budget,
+                    chunk_label=f"{chunk_label}_{sub.index}",
+                    depth=depth + 1,
+                )
+                merged.extend(sub_recs)
+                errs.extend(sub_errs)
+                if sub_prov:
+                    last_provider = sub_prov
+            return merged, last_provider, errs
+        except LLMError as exc:
+            return [], None, [f"{chunk_label}: {exc}"]
 
     async def extract_structured(
         self,
@@ -241,37 +297,20 @@ class LLMRouter:
             overlap_tokens=self.overlap_tokens,
         )
 
-        # Retry with smaller chunks if provider returns 413 PayloadTooLargeError
+        # Retry with recursive sub-chunks if provider returns 413 PayloadTooLargeError
         raw_extracted: list[dict[str, Any]] = []
         for chunk in chunks:
-            prompt = build_extraction_prompt(category, source_url, chunk.text)
-            try:
-                payload, provider_used = await self._call_providers(prompt)
+            recs, provider_used, chunk_errs = await self._extract_chunk_recursive(
+                category=category,
+                source_url=source_url,
+                text=chunk.text,
+                token_budget=token_budget,
+                chunk_label=f"chunk_{chunk.index}",
+            )
+            if provider_used:
                 result.provider_used = provider_used
-            except PayloadTooLargeError:
-                sub_chunks = chunk_text(
-                    chunk.text,
-                    max_tokens=max(800, token_budget // 2),
-                    overlap_tokens=min(100, self.overlap_tokens),
-                )
-                for sub in sub_chunks:
-                    sub_prompt = build_extraction_prompt(category, source_url, sub.text)
-                    try:
-                        sub_payload, provider_used = await self._call_providers(sub_prompt)
-                        result.provider_used = provider_used
-                        raw_extracted.extend(sub_payload.get("records") or [])
-                    except LLMError as sub_exc:
-                        result.errors.append(f"chunk_{chunk.index}_{sub.index}: {sub_exc}")
-                continue
-            except LLMError as exc:
-                result.errors.append(f"chunk_{chunk.index}: {exc}")
-                continue
-
-            recs = payload.get("records")
-            if isinstance(recs, list):
-                raw_extracted.extend(r for r in recs if isinstance(r, dict))
-            else:
-                result.errors.append(f"chunk_{chunk.index}: missing 'records' list in response")
+            raw_extracted.extend(recs)
+            result.errors.extend(chunk_errs)
 
         schema_cls = CATEGORY_MODEL_MAP[category]
         for raw_rec in raw_extracted:

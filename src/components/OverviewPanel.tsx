@@ -570,12 +570,18 @@ export function OverviewPanel({
               detail="Primary provider in LLMRouter for unstructured HTML extraction with token-aware chunking and 413 sub-chunking."
             />
             <CredentialRow
-              label="Multi-Tier LLM Fallbacks (Groq / DeepSeek)"
-              envKey="GROQ_API_KEY / DEEPSEEK_API_KEY"
+              label="Multi-Tier LLM Fallbacks (Groq / Llama 3 / DeepSeek)"
+              envKey="GROQ_API_KEY / LLAMA3_API_KEY / DEEPSEEK_API_KEY"
               configured={Boolean(
-                status?.credentials.groqConfigured || status?.credentials.deepseekConfigured
+                status?.credentials.groqConfigured ||
+                  status?.credentials.llama3Configured ||
+                  status?.credentials.deepseekConfigured
               )}
-              detail="Fallback chain executes Gemini -> Groq -> DeepSeek when keys are configured; errors fail cleanly without fabricating records."
+              detail={
+                status?.credentials.llmDemoFallbackActive
+                  ? "Chain: Gemini Flash -> Groq -> Llama 3 -> DeepSeek. No LLM API keys active; extraction uses deterministic heuristic demo fallback (Unverified) without fabricating data."
+                  : "4-tier fallback chain executes Gemini Flash -> Groq -> Llama 3 -> DeepSeek with 429 exponential backoff and 413 recursive sub-chunking."
+              }
             />
             <CredentialRow
               label="Google Sheets & Drive OAuth"

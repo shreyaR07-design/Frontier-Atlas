@@ -178,7 +178,10 @@ export interface AtlasStatusResponse {
     geminiConfigured: boolean;
     geminiModel: string;
     groqConfigured: boolean;
+    llama3Configured?: boolean;
     deepseekConfigured: boolean;
+    llmChain?: string[];
+    llmDemoFallbackActive?: boolean;
     githubTokenConfigured: boolean;
     googleSheetsConfigured: boolean;
     googleSheetsSpreadsheetId: boolean;

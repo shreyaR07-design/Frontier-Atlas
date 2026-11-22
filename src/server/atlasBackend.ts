@@ -46,6 +46,9 @@ export interface AtlasConfig {
   geminiModel: string;
   groqApiKey: string | null;
   groqModel: string;
+  llama3ApiKey: string | null;
+  llama3Model: string;
+  llama3EndpointUrl: string;
   deepseekApiKey: string | null;
   deepseekModel: string;
   githubToken: string | null;
@@ -93,9 +96,13 @@ export function loadAtlasConfig(atlasDir: string): AtlasConfig {
     rateLimitPerSecond: Math.min(20, Math.max(0.5, parseFloatEnv(process.env.RATE_LIMIT_PER_SECOND, 4))),
     respectRobotsTxt: parseBoolEnv(process.env.RESPECT_ROBOTS_TXT, true),
     geminiApiKey: process.env.GEMINI_API_KEY?.trim() || null,
-    geminiModel: process.env.GEMINI_MODEL?.trim() || "gemini-2.5-flash",
+    geminiModel: process.env.GEMINI_MODEL?.trim() || "gemini-4-hydrogen",
     groqApiKey: process.env.GROQ_API_KEY?.trim() || null,
     groqModel: process.env.GROQ_MODEL?.trim() || "llama-3.3-70b-versatile",
+    llama3ApiKey: process.env.LLAMA3_API_KEY?.trim() || null,
+    llama3Model: process.env.LLAMA3_MODEL?.trim() || "meta-llama/Llama-3.3-70B-Instruct",
+    llama3EndpointUrl:
+      process.env.LLAMA3_ENDPOINT_URL?.trim() || "https://api.together.xyz/v1/chat/completions",
     deepseekApiKey: process.env.DEEPSEEK_API_KEY?.trim() || null,
     deepseekModel: process.env.DEEPSEEK_MODEL?.trim() || "deepseek-chat",
     githubToken: process.env.GITHUB_TOKEN?.trim() || null,
@@ -193,43 +200,74 @@ function findFirstGithubRepo(...texts: Array<string | null | undefined>): string
   return null;
 }
 
-export function parseUtcDatetime(raw: unknown): Date | null {
-  if (raw === null || raw === undefined) return null;
+export type TimestampPrecision = "verified_exact" | "relative_estimated" | "unverified";
+
+const RELATIVE_TIME_RE =
+  /^(?:about\s+|approx\.?\s+|~)?(?:(an|a|\d+(?:\.\d+)?)\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|wks?|w))\s+ago$/i;
+
+export function parseUtcDatetimeWithMeta(
+  raw: unknown,
+  refNow: Date = new Date()
+): { date: Date | null; precision: TimestampPrecision } {
+  if (raw === null || raw === undefined) return { date: null, precision: "unverified" };
   if (raw instanceof Date) {
-    if (Number.isNaN(raw.getTime())) return null;
+    if (Number.isNaN(raw.getTime())) return { date: null, precision: "unverified" };
     const yr = raw.getUTCFullYear();
-    return yr >= 1970 && yr <= 2100 ? raw : null;
+    return yr >= 1970 && yr <= 2100 ? { date: raw, precision: "verified_exact" } : { date: null, precision: "unverified" };
   }
   if (typeof raw === "number" && Number.isFinite(raw)) {
-    if (raw < 10_000_000) return null; // Reject small non-epoch numbers like "2025"
+    if (raw < 10_000_000) return { date: null, precision: "unverified" }; // Reject small non-epoch numbers like "2025"
     const ms = raw > 1e12 ? raw : raw * 1000;
     const d = new Date(ms);
-    if (Number.isNaN(d.getTime())) return null;
+    if (Number.isNaN(d.getTime())) return { date: null, precision: "unverified" };
     const yr = d.getUTCFullYear();
-    return yr >= 1970 && yr <= 2100 ? d : null;
+    return yr >= 1970 && yr <= 2100 ? { date: d, precision: "verified_exact" } : { date: null, precision: "unverified" };
   }
   const s = String(raw).trim();
-  if (!s || UNKNOWN_PLACEHOLDERS.has(s.toLowerCase())) return null;
-  // Reject vague relative or bare-year strings cleanly
-  if (/\b(?:ago|today|yesterday|recent|soon|just now)\b/i.test(s) || /^\d{4}$/.test(s)) {
-    return null;
+  if (!s || UNKNOWN_PLACEHOLDERS.has(s.toLowerCase()) || /^\d{4}$/.test(s)) {
+    return { date: null, precision: "unverified" };
+  }
+  if (/^(?:just\s+now|moments?\s+ago)$/i.test(s)) {
+    return { date: new Date(refNow.getTime()), precision: "relative_estimated" };
+  }
+  const relMatch = s.match(RELATIVE_TIME_RE);
+  if (relMatch) {
+    const qtyRaw = relMatch[1].toLowerCase();
+    const qty = qtyRaw === "a" || qtyRaw === "an" ? 1 : Number(qtyRaw);
+    const unit = relMatch[2].toLowerCase();
+    let unitMs = 0;
+    if (unit.startsWith("s")) unitMs = 1000;
+    else if (unit.startsWith("m")) unitMs = 60_000;
+    else if (unit.startsWith("h")) unitMs = 3600_000;
+    else if (unit.startsWith("d")) unitMs = 86400_000;
+    else if (unit.startsWith("w")) unitMs = 7 * 86400_000;
+    if (Number.isFinite(qty) && qty >= 0 && unitMs > 0) {
+      return {
+        date: new Date(refNow.getTime() - Math.round(qty * unitMs)),
+        precision: "relative_estimated",
+      };
+    }
+  }
+  // Reject vague undated words ("today", "yesterday", "recent", "soon") cleanly
+  if (/\b(?:ago|today|yesterday|recent|soon|just now)\b/i.test(s)) {
+    return { date: null, precision: "unverified" };
   }
   if (/^\d+(\.\d+)?$/.test(s)) {
     const n = Number(s);
-    if (n < 10_000_000) return null;
+    if (n < 10_000_000) return { date: null, precision: "unverified" };
     const ms = n > 1e12 ? n : n * 1000;
     const d = new Date(ms);
-    if (Number.isNaN(d.getTime())) return null;
+    if (Number.isNaN(d.getTime())) return { date: null, precision: "unverified" };
     const yr = d.getUTCFullYear();
-    return yr >= 1970 && yr <= 2100 ? d : null;
+    return yr >= 1970 && yr <= 2100 ? { date: d, precision: "verified_exact" } : { date: null, precision: "unverified" };
   }
   if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
     const d = new Date(`${s}T00:00:00.000Z`);
-    return Number.isNaN(d.getTime()) ? null : d;
+    return Number.isNaN(d.getTime()) ? { date: null, precision: "unverified" } : { date: d, precision: "verified_exact" };
   }
   if (/^\d{4}-\d{2}$/.test(s)) {
     const d = new Date(`${s}-01T00:00:00.000Z`);
-    return Number.isNaN(d.getTime()) ? null : d;
+    return Number.isNaN(d.getTime()) ? { date: null, precision: "unverified" } : { date: d, precision: "verified_exact" };
   }
   // If ISO datetime omits timezone offset/Z, treat explicitly as UTC rather than host local time
   const normalizedIso =
@@ -237,10 +275,14 @@ export function parseUtcDatetime(raw: unknown): Date | null {
       ? `${s.replace(" ", "T")}Z`
       : s;
   const parsed = Date.parse(normalizedIso);
-  if (Number.isNaN(parsed)) return null;
+  if (Number.isNaN(parsed)) return { date: null, precision: "unverified" };
   const d = new Date(parsed);
   const yr = d.getUTCFullYear();
-  return yr >= 1970 && yr <= 2100 ? d : null;
+  return yr >= 1970 && yr <= 2100 ? { date: d, precision: "verified_exact" } : { date: null, precision: "unverified" };
+}
+
+export function parseUtcDatetime(raw: unknown, refNow: Date = new Date()): Date | null {
+  return parseUtcDatetimeWithMeta(raw, refNow).date;
 }
 
 export function isWithinFreshnessWindow(
@@ -339,6 +381,13 @@ function createLLMRouter(config: AtlasConfig): LLMRouter {
       timeoutMs: config.requestTimeoutMs,
     }),
     new OpenAICompatibleLLMProvider({
+      providerName: "llama3",
+      apiKey: config.llama3ApiKey,
+      model: config.llama3Model,
+      endpointUrl: config.llama3EndpointUrl,
+      timeoutMs: config.requestTimeoutMs,
+    }),
+    new OpenAICompatibleLLMProvider({
       providerName: "deepseek",
       apiKey: config.deepseekApiKey,
       model: config.deepseekModel,
@@ -367,7 +416,7 @@ async function mapConcurrent<T, R>(
   return results;
 }
 
-// Multi-tier LLM extraction helper with token-aware chunking and Gemini -> Groq -> DeepSeek fallback
+// Multi-tier LLM extraction helper: Gemini Flash -> Groq -> Llama 3 -> DeepSeek (+ heuristic demo fallback)
 export async function extractStructuredWithGemini(
   config: AtlasConfig,
   rawText: string,
@@ -375,12 +424,12 @@ export async function extractStructuredWithGemini(
   sourceUrl = "https://unknown.invalid"
 ): Promise<Array<Record<string, unknown>>> {
   const router = createLLMRouter(config);
-  if (!router.isConfigured()) return [];
   const res = await router.extractStructured({
     category,
     sourceUrl,
     sourceName: "llm_extraction",
     sourceText: rawText,
+    allowHeuristicFallback: true,
   });
   return res.records;
 }
@@ -775,7 +824,10 @@ class LiveSourceVerifier {
     return /\.(?:example|test|invalid|localhost)$/.test(dom);
   }
 
-  private async fetchSnapshot(url: string, opts: { maxAttempts?: number; timeoutMs?: number } = {}): Promise<SourceSnapshot> {
+  private async fetchSnapshot(
+    url: string,
+    opts: { maxAttempts?: number; timeoutMs?: number; maxCrawlDelayMs?: number } = {}
+  ): Promise<SourceSnapshot> {
     if (!isValidHttpUrl(url)) {
       return { url, status: 0, accessible: false, title: null, text: "", jsonPayload: null, xmlItems: null, error: "invalid_url" };
     }
@@ -785,6 +837,7 @@ class LiveSourceVerifier {
     const res = await this.http.fetch(url, {
       timeoutMs: opts.timeoutMs ?? Math.min(this.config.requestTimeoutMs, 10000),
       maxAttempts: opts.maxAttempts ?? 2,
+      maxCrawlDelayMs: opts.maxCrawlDelayMs,
       headers:
         this.config.githubToken && url.includes("api.github.com")
           ? { Authorization: `Bearer ${this.config.githubToken}` }
@@ -967,7 +1020,11 @@ class LiveSourceVerifier {
 
     const secondarySnap =
       secondaryUrl && isValidHttpUrl(secondaryUrl)
-        ? await this.fetchSnapshot(secondaryUrl, { maxAttempts: 1, timeoutMs: 5500 })
+        ? await this.fetchSnapshot(secondaryUrl, {
+            maxAttempts: 1,
+            timeoutMs: category === "news" || category === "jobs" ? 4000 : 5500,
+            maxCrawlDelayMs: category === "news" || category === "jobs" ? 1500 : 3000,
+          })
         : null;
 
     meta.source_http_status = primarySnap.status;
@@ -976,6 +1033,12 @@ class LiveSourceVerifier {
       meta.secondary_url_checked = secondarySnap.url;
       meta.secondary_http_status = secondarySnap.status;
       meta.secondary_accessible = secondarySnap.accessible;
+      if (category === "news" && secondarySnap.accessible && secondarySnap.text) {
+        meta.full_text_excerpt = secondarySnap.text.slice(0, 2000);
+        if ((!rec.summary || String(rec.summary).length < 180) && secondarySnap.text.length > 80) {
+          out.summary = secondarySnap.text.slice(0, 1500);
+        }
+      }
     }
 
     if (!primarySnap.accessible) {
@@ -1453,7 +1516,7 @@ const GENERIC_HOST_DOMAINS = new Set([
   "docs.google.com",
 ]);
 
-function normalizeEntityName(rawName: string): string {
+export function normalizeEntityName(rawName: string): string {
   if (!rawName || !rawName.trim()) return "";
   let text = rawName.normalize("NFKC").toLowerCase().trim();
   text = text.replace(/[_-]+/g, " ").replace(/[^\p{L}\p{N}\s]+/gu, " ");
@@ -1515,7 +1578,7 @@ function computeNameSimilarity(normA: string, normB: string): number {
   return Number((0.65 * seqRatio + 0.35 * jaccard).toFixed(4));
 }
 
-class EntityResolver {
+export class EntityResolver {
   private readonly entities: CanonicalEntityRow[] = [];
   private readonly logs: EntityMappingLogInput[] = [];
   private readonly stats: Record<string, number> = {
@@ -2201,7 +2264,9 @@ async function collectResearchPapers(
             api_url: url,
             upvotes: paper.upvotes ?? null,
             ai_keywords: Array.isArray(paper.ai_keywords) ? paper.ai_keywords : [],
-            github_metrics: ghRepo ? { stars: ghStars, source: "huggingface_daily_papers" } : null,
+            github_metrics: ghRepo
+              ? { stars: ghStars, source: "huggingface_daily_papers", metrics_updated_at: nowIso }
+              : null,
           },
         });
       }
@@ -2431,7 +2496,21 @@ async function collectResearchPapers(
   const slugsToEnrich = Array.from(slugToRecords.keys()).slice(0, maxSlugsToEnrich);
   let ghRateLimited = false;
   await mapConcurrent(slugsToEnrich, 4, async (slug) => {
-    if (ghRateLimited) return;
+    const metricsCheckedAt = new Date().toISOString();
+    if (ghRateLimited) {
+      for (const rec of slugToRecords.get(slug) ?? []) {
+        const meta = (rec.source_metadata as Record<string, unknown>) || {};
+        if (!meta.github_metrics) {
+          meta.github_metrics = {
+            stars: rec.github_stars ?? null,
+            metrics_status: "rate_limited",
+            metrics_updated_at: metricsCheckedAt,
+          };
+          rec.source_metadata = meta;
+        }
+      }
+      return;
+    }
     const headers: Record<string, string> = { Accept: "application/vnd.github+json" };
     if (config.githubToken) headers.Authorization = `Bearer ${config.githubToken}`;
     const ghRes = await http.fetch(`https://api.github.com/repos/${slug}`, {
@@ -2441,9 +2520,31 @@ async function collectResearchPapers(
     });
     if (ghRes.status === 403 || ghRes.status === 429) {
       ghRateLimited = true;
+      for (const rec of slugToRecords.get(slug) ?? []) {
+        const meta = (rec.source_metadata as Record<string, unknown>) || {};
+        meta.github_metrics = {
+          ...(typeof meta.github_metrics === "object" && meta.github_metrics ? meta.github_metrics : {}),
+          stars: rec.github_stars ?? null,
+          metrics_status: `rate_limited_http_${ghRes.status}`,
+          metrics_updated_at: metricsCheckedAt,
+        };
+        rec.source_metadata = meta;
+      }
       return;
     }
-    if (!ghRes.ok) return;
+    if (!ghRes.ok) {
+      for (const rec of slugToRecords.get(slug) ?? []) {
+        const meta = (rec.source_metadata as Record<string, unknown>) || {};
+        meta.github_metrics = {
+          ...(typeof meta.github_metrics === "object" && meta.github_metrics ? meta.github_metrics : {}),
+          stars: rec.github_stars ?? null,
+          metrics_status: ghRes.error || `http_${ghRes.status || 0}`,
+          metrics_updated_at: metricsCheckedAt,
+        };
+        rec.source_metadata = meta;
+      }
+      return;
+    }
     try {
       const ghJson = JSON.parse(ghRes.content) as Record<string, unknown>;
       const stars = typeof ghJson.stargazers_count === "number" ? ghJson.stargazers_count : null;
@@ -2454,6 +2555,8 @@ async function collectResearchPapers(
         watchers: typeof ghJson.subscribers_count === "number" ? ghJson.subscribers_count : null,
         language: ghJson.language ?? null,
         updated_at: ghJson.updated_at ?? null,
+        metrics_updated_at: metricsCheckedAt,
+        metrics_status: "verified_github_api",
       };
       for (const rec of slugToRecords.get(slug) ?? []) {
         if (stars !== null && stars >= 0) rec.github_stars = stars;
@@ -2923,12 +3026,13 @@ async function collectNews(
     { name: "google_blog", url: "https://blog.google/technology/ai/rss/", publisher: "Google AI Blog", category: "AI" },
     { name: "openai_news", url: "https://openai.com/news/rss.xml", publisher: "OpenAI News", category: "AI" },
     { name: "arstechnica_tech", url: "https://feeds.arstechnica.com/arstechnica/technology-lab", publisher: "Ars Technica", category: "AI & Technology" },
+    { name: "devto_ai", url: "https://dev.to/feed/tag/ai", publisher: "DEV Community", category: "AI Engineering" },
   ];
 
   const feedTasks =
     safePage === 1
       ? rssSources.map(async (src) => {
-          const res = await http.fetch(src.url, { timeoutMs: config.requestTimeoutMs });
+          const res = await http.fetch(src.url, { timeoutMs: Math.min(config.requestTimeoutMs, 10000), maxAttempts: 1 });
           if (!res.ok) {
             errors.push({ source: src.name, url: src.url, error: res.error || "fetch_failed" });
             return;
@@ -2939,9 +3043,14 @@ async function collectNews(
             for (const item of items) {
               const title = (extractXmlTag(item, "title") ?? "").trim();
               const link = validateOptionalUrl(extractXmlTag(item, "link"));
-              const pubDt = parseUtcDatetime(extractXmlTag(item, "pubDate") || extractXmlTag(item, "dc:date"));
+              const pubMeta = parseUtcDatetimeWithMeta(
+                extractXmlTag(item, "pubDate") || extractXmlTag(item, "dc:date")
+              );
+              const pubDt = pubMeta.date;
+              const contentRaw = (extractXmlTag(item, "content:encoded") ?? "").trim();
               const descRaw = (extractXmlTag(item, "description") ?? "").trim();
-              const summary = descRaw ? stripHtmlToText(descRaw).slice(0, 2000) || null : null;
+              const bestBody = contentRaw.length > descRaw.length ? contentRaw : descRaw;
+              const summary = bestBody ? stripHtmlToText(bestBody).slice(0, 3000) || null : null;
               if (!title || !link || !pubDt) continue;
               if (!isQualifyingAiNews(src.name, title, summary)) continue;
               records.push({
@@ -2954,7 +3063,11 @@ async function collectNews(
                 source_name: src.name,
                 source_url: src.url,
                 collected_at: nowIso,
-                source_metadata: { feed_type: "rss", api_url: src.url },
+                source_metadata: {
+                  feed_type: "rss",
+                  api_url: src.url,
+                  timestamp_precision: pubMeta.precision,
+                },
               });
             }
           } else {
@@ -2963,9 +3076,14 @@ async function collectNews(
               const title = (extractXmlTag(entry, "title") ?? "").trim();
               const linkMatch = entry.match(/<link[^>]+href=["']([^"']+)["']/i);
               const link = validateOptionalUrl(linkMatch?.[1] ?? extractXmlTag(entry, "link"));
-              const pubDt = parseUtcDatetime(extractXmlTag(entry, "published") || extractXmlTag(entry, "updated"));
-              const sumRaw = extractXmlTag(entry, "summary") || extractXmlTag(entry, "content");
-              const summary = sumRaw ? stripHtmlToText(sumRaw).slice(0, 2000) || null : null;
+              const pubMeta = parseUtcDatetimeWithMeta(
+                extractXmlTag(entry, "published") || extractXmlTag(entry, "updated")
+              );
+              const pubDt = pubMeta.date;
+              const contentRaw = extractXmlTag(entry, "content") || "";
+              const sumTag = extractXmlTag(entry, "summary") || "";
+              const sumRaw = contentRaw.length > sumTag.length ? contentRaw : sumTag;
+              const summary = sumRaw ? stripHtmlToText(sumRaw).slice(0, 3000) || null : null;
               if (!title || !link || !pubDt) continue;
               if (!isQualifyingAiNews(src.name, title, summary)) continue;
               records.push({
@@ -2978,7 +3096,11 @@ async function collectNews(
                 source_name: src.name,
                 source_url: src.url,
                 collected_at: nowIso,
-                source_metadata: { feed_type: "atom", api_url: src.url },
+                source_metadata: {
+                  feed_type: "atom",
+                  api_url: src.url,
+                  timestamp_precision: pubMeta.precision,
+                },
               });
             }
           }
@@ -3121,7 +3243,10 @@ export class AtlasBackendService {
         geminiConfigured: Boolean(this.config.geminiApiKey),
         geminiModel: this.config.geminiModel,
         groqConfigured: Boolean(this.config.groqApiKey),
+        llama3Configured: Boolean(this.config.llama3ApiKey),
         deepseekConfigured: Boolean(this.config.deepseekApiKey),
+        llmChain: this.llmRouter.allProviderNames(),
+        llmDemoFallbackActive: !this.llmRouter.isConfigured(),
         githubTokenConfigured: Boolean(this.config.githubToken),
         googleSheetsConfigured: this.sheets.isConfigured(),
         googleSheetsSpreadsheetId: Boolean(this.config.googleSheetsSpreadsheetId || sheetsStatus.spreadsheetId),

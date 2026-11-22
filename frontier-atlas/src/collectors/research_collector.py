@@ -146,6 +146,7 @@ class ResearchCollector(BaseCollector):
                     if openalex_id_url and "openalex.org/" in openalex_id_url
                     else None
                 )
+                collected_ts = utc_now()
                 records.append(
                     {
                         "title": title,
@@ -159,12 +160,18 @@ class ResearchCollector(BaseCollector):
                         "official_website": openalex_id_url,
                         "source_name": "openalex",
                         "source_url": landing_url,
-                        "collected_at": utc_now(),
+                        "collected_at": collected_ts,
                         "source_metadata": {
                             "openalex_id": openalex_id_url,
                             "openalex_api_url": openalex_api_url,
                             "cited_by_count": work.get("cited_by_count"),
                             "type": work.get("type"),
+                            "github_metrics": {
+                                "stars": stars,
+                                "metrics_updated_at": collected_ts.isoformat(),
+                            }
+                            if github_repo
+                            else None,
                         },
                     }
                 )
