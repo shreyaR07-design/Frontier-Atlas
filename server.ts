@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import { AtlasBackendService } from "./src/server/atlasBackend.ts";
+import { redactSecrets } from "./src/server/llmRouter.ts";
 
 const PORT = 3000;
 const ROOT_DIR = process.cwd();
@@ -40,56 +41,69 @@ const ALLOWED_AUDIT_CATEGORIES = new Set([
   "entity_mapping_log",
 ]);
 
-interface RunJobState {
-  id: string;
-  status: "idle" | "running" | "completed" | "failed";
-  categories: string[];
-  limit: number;
-  page: number;
-  startedAt: string | null;
-  finishedAt: string | null;
-  logs: string[];
-  result: unknown | null;
-  error: string | null;
-}
-
-let currentRun: RunJobState = {
-  id: "none",
-  status: "idle",
-  categories: [],
-  limit: 20,
-  page: 1,
-  startedAt: null,
-  finishedAt: null,
-  logs: [],
-  result: null,
-  error: null,
-};
-
 async function startServer(): Promise<void> {
   const atlas = new AtlasBackendService(ATLAS_DIR);
   const app = express();
   app.use(express.json());
 
-  app.get("/api/atlas/status", (_req, res) => {
+  // Kick off non-blocking initial live health probes on startup and start configurable daily UTC scheduler
+  void atlas.ensureInitialHealthChecked().catch(() => {});
+  atlas.startScheduler();
+
+  const extractBearerToken = (req: express.Request): string | null => {
+    const authHeader = req.headers.authorization;
+    return typeof authHeader === "string" && authHeader.toLowerCase().startsWith("bearer ")
+      ? authHeader.slice(7).trim() || null
+      : null;
+  };
+
+  app.get("/api/atlas/status", async (_req, res) => {
     try {
+      if (!atlas.getIntegrationHealthSummary().checkedAt) {
+        await atlas.ensureInitialHealthChecked();
+      }
       const statusPayload = atlas.getStatus();
-      res.json({
-        ...statusPayload,
-        activeRun: {
-          id: currentRun.id,
-          status: currentRun.status,
-          startedAt: currentRun.startedAt,
-          finishedAt: currentRun.finishedAt,
-          categories: currentRun.categories,
-          limit: currentRun.limit,
-          page: currentRun.page,
-        },
-      });
+      res.json(statusPayload);
     } catch (err) {
       res.status(500).json({
         error: "Unable to query FrontierAtlas backend.",
-        details: err instanceof Error ? err.message : String(err),
+        details: redactSecrets(err instanceof Error ? err.message : String(err)),
+      });
+    }
+  });
+
+  app.get("/api/atlas/integrations/health", async (req, res) => {
+    try {
+      const refresh = req.query.refresh === "true" || req.query.refresh === "1";
+      const oauthAccessToken = extractBearerToken(req);
+      const spreadsheetId =
+        typeof req.query.spreadsheetId === "string" ? req.query.spreadsheetId.trim() || null : null;
+      const summary = refresh
+        ? await atlas.runIntegrationHealthChecks({ oauthAccessToken, spreadsheetId })
+        : await atlas.ensureInitialHealthChecked();
+      res.json(summary);
+    } catch (err) {
+      res.status(500).json({
+        error: "Integration health check failed.",
+        details: redactSecrets(err instanceof Error ? err.message : String(err)),
+      });
+    }
+  });
+
+  app.post("/api/atlas/integrations/test", async (req, res) => {
+    try {
+      const oauthAccessToken = extractBearerToken(req);
+      const rawSheetId =
+        typeof req.body?.spreadsheetId === "string" ? req.body.spreadsheetId.trim() : "";
+      const summary = await atlas.runIntegrationHealthChecks({
+        oauthAccessToken,
+        spreadsheetId: rawSheetId || null,
+      });
+      res.json(summary);
+    } catch (err) {
+      res.status(500).json({
+        error: "Integration connection test failed.",
+        details: redactSecrets(err instanceof Error ? err.message : String(err)),
       });
     }
   });
@@ -102,9 +116,11 @@ async function startServer(): Promise<void> {
     }
     const rawLimit = Number(req.query.limit ?? 500);
     const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(1, Math.floor(rawLimit)), 2000) : 500;
+    const rawWindow = String(req.query.window ?? "all").trim().toLowerCase();
+    const windowMode: "all" | "24h" = rawWindow === "24h" ? "24h" : "all";
 
     try {
-      res.json(atlas.getDataset(category, limit));
+      res.json(atlas.getDataset(category, limit, windowMode));
     } catch (err) {
       res.status(500).json({
         error: `Failed to query dataset '${category}'.`,
@@ -114,10 +130,10 @@ async function startServer(): Promise<void> {
   });
 
   app.post("/api/atlas/run", (req, res) => {
-    if (currentRun.status === "running") {
+    if (atlas.isRunInProgress()) {
       res.status(409).json({
         error: "A pipeline collection run is already in progress.",
-        run: currentRun,
+        run: atlas.getActiveRunState(),
       });
       return;
     }
@@ -137,55 +153,79 @@ async function startServer(): Promise<void> {
     const rawPage = Number(req.body?.page ?? 1);
     const page = Number.isFinite(rawPage) ? Math.min(Math.max(1, Math.floor(rawPage)), 100) : 1;
 
-    const runId = `run_${Date.now()}`;
-    currentRun = {
-      id: runId,
-      status: "running",
+    const launch = atlas.startBackgroundRun({
+      triggerType: "manual",
+      mode: "full",
       categories,
       limit,
       page,
-      startedAt: new Date().toISOString(),
-      finishedAt: null,
-      logs: [`Starting collection for: ${categories.join(", ")} (limit=${limit} per category, page=${page})`],
-      result: null,
-      error: null,
-    };
-
-    void atlas
-      .runPipeline({
-        categories,
-        limit,
-        page,
-        onLog: (line) => {
-          currentRun.logs = [...currentRun.logs, line].slice(-80);
-        },
-      })
-      .then((result) => {
-        currentRun.finishedAt = new Date().toISOString();
-        currentRun.result = result;
-        currentRun.status = "completed";
-        const syncNote =
-          result && typeof result === "object" && "sheetsSync" in result && result.sheetsSync
-            ? (result.sheetsSync as { success?: boolean; error?: string | null }).success
-              ? " Google Sheets incremental sync succeeded."
-              : ` Google Sheets sync failed: ${(result.sheetsSync as { error?: string | null }).error ?? "unknown error"}`
-            : "";
-        currentRun.logs = [
-          ...currentRun.logs,
-          `Pipeline run completed and persisted to SQLite + CSV.${syncNote}`,
-        ].slice(-80);
-      })
-      .catch((err) => {
-        currentRun.finishedAt = new Date().toISOString();
-        currentRun.status = "failed";
-        currentRun.error = err instanceof Error ? err.message : String(err);
+      includeAllFresh24h: Boolean(req.body?.includeAllFresh24h),
+    });
+    if (launch.conflict) {
+      res.status(409).json({
+        error: "A pipeline collection run is already in progress.",
+        run: launch.run,
       });
+      return;
+    }
+    res.status(202).json({ run: launch.run });
+  });
 
-    res.status(202).json({ run: currentRun });
+  app.post("/api/atlas/refresh-24h", (_req, res) => {
+    const launch = atlas.startBackgroundRun({
+      triggerType: "daily_24h",
+      mode: "daily_24h",
+      categories: ["jobs", "news", "research_papers"],
+      limit: 1000,
+      page: 1,
+      includeAllFresh24h: true,
+    });
+    if (launch.conflict) {
+      res.status(409).json({
+        error: "A pipeline collection run is already in progress.",
+        run: launch.run,
+      });
+      return;
+    }
+    res.status(202).json({ run: launch.run });
   });
 
   app.get("/api/atlas/run-status", (_req, res) => {
-    res.json({ run: currentRun });
+    res.json({ run: atlas.getActiveRunState() });
+  });
+
+  app.get("/api/atlas/runs", (_req, res) => {
+    const st = atlas.getStatus();
+    res.json({
+      runs: st.pipelineRuns ?? [],
+      activeRun: atlas.getActiveRunState(),
+      lastSuccessfulRunAt: st.lastSuccessfulRunAt ?? null,
+      lastCollectionAt: st.lastCollectionAt ?? null,
+    });
+  });
+
+  app.get("/api/atlas/scheduler", (_req, res) => {
+    res.json({ scheduler: atlas.getSchedulerStatus() });
+  });
+
+  app.put("/api/atlas/scheduler", (req, res) => {
+    const rawUtc = req.body?.utcTime;
+    if (rawUtc !== undefined) {
+      if (typeof rawUtc !== "string" || !/^\d{1,2}:\d{2}$/.test(rawUtc.trim())) {
+        res.status(400).json({ error: "utcTime must be formatted as HH:MM (UTC 24-hour)." });
+        return;
+      }
+      const [hh, mm] = rawUtc.trim().split(":").map(Number);
+      if (hh < 0 || hh > 23 || mm < 0 || mm > 59) {
+        res.status(400).json({ error: "utcTime hours must be 00-23 and minutes 00-59." });
+        return;
+      }
+    }
+    const scheduler = atlas.updateSchedulerConfig({
+      enabled: typeof req.body?.enabled === "boolean" ? req.body.enabled : undefined,
+      utcTime: typeof rawUtc === "string" ? rawUtc : undefined,
+    });
+    res.json({ scheduler });
   });
 
   app.get("/api/atlas/audit-trail", (req, res) => {
@@ -211,7 +251,7 @@ async function startServer(): Promise<void> {
   });
 
   app.post("/api/atlas/audit", async (req, res) => {
-    if (currentRun.status === "running") {
+    if (atlas.isRunInProgress()) {
       res.status(409).json({
         error: "Cannot audit records while a pipeline collection run is in progress.",
       });
@@ -315,9 +355,22 @@ async function startServer(): Promise<void> {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  const server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`FrontierAtlas dashboard server listening on http://0.0.0.0:${PORT}`);
   });
+
+  const shutdown = () => {
+    try {
+      atlas.close();
+    } catch {
+      // Ignore shutdown close errors
+    }
+    server.close(() => {
+      process.exit(0);
+    });
+  };
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
 }
 
 startServer().catch((err) => {

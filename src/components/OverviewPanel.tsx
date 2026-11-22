@@ -1,6 +1,8 @@
+import { useEffect, useState } from "react";
 import {
   AlertTriangle,
   ArrowRight,
+  CalendarClock,
   CheckCircle2,
   Clock,
   Database,
@@ -16,6 +18,8 @@ import type {
   AtlasStatusResponse,
   DatasetCategory,
   FailureLogRow,
+  IntegrationConnectionStatus,
+  IntegrationHealthItem,
   RunJobState,
   SectionId,
 } from "../types/atlas";
@@ -27,8 +31,10 @@ interface OverviewPanelProps {
   failures: FailureLogRow[];
   runState: RunJobState;
   auditing: boolean;
+  schedulerUpdating: boolean;
   sheetsExporting: boolean;
   sheetsSyncing: boolean;
+  testingIntegrations: boolean;
   sheetsFeedback: {
     success: boolean;
     message: string;
@@ -41,8 +47,11 @@ interface OverviewPanelProps {
   onTargetSpreadsheetIdChange: (value: string) => void;
   onGoogleSignIn: () => void;
   onGoogleSignOut: () => void;
+  onTestIntegrations: () => void;
   onSelectSection: (section: SectionId) => void;
   onOpenRunModal: () => void;
+  onRefresh24h: () => void;
+  onUpdateScheduler: (opts: { enabled?: boolean; utcTime?: string }) => void;
   onAuditRecords: () => void;
   onExportSheets: () => void;
   onSyncSheets: () => void;
@@ -75,31 +84,46 @@ const SHEETS_TABS_ORDER = [
   "Entity Mapping Log",
 ];
 
-function CredentialRow({
-  label,
-  envKey,
-  configured,
-  detail,
+function IntegrationStatusRow({
+  item,
 }: {
-  label: string;
-  envKey: string;
-  configured: boolean;
-  detail: string;
+  item: {
+    label: string;
+    envKey: string;
+    status: IntegrationConnectionStatus;
+    detail: string;
+    error?: string | null;
+    latencyMs?: number | null;
+  };
 }) {
   return (
-    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 py-3 border-b border-slate-800/70 last:border-b-0">
+    <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-2 py-3 border-b border-slate-800/70 last:border-b-0">
       <div className="min-w-0">
-        <div className="flex items-center gap-2">
-          <span className="text-sm font-medium text-slate-100">{label}</span>
-          <span className="text-xs font-mono text-slate-400">{envKey}</span>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-sm font-medium text-slate-100">{item.label}</span>
+          <span className="text-xs font-mono text-slate-400">{item.envKey}</span>
+          {typeof item.latencyMs === "number" && item.status === "Configured" && (
+            <span className="text-[11px] font-mono text-slate-500 tabular-nums">{item.latencyMs}ms</span>
+          )}
         </div>
-        <p className="text-xs text-slate-400 mt-0.5">{detail}</p>
+        <p
+          className={`text-xs mt-0.5 ${
+            item.status === "Connection Failed" ? "text-rose-300" : "text-slate-400"
+          }`}
+        >
+          {item.status === "Connection Failed" ? item.error || item.detail : item.detail}
+        </p>
       </div>
-      <div className="flex items-center gap-1.5 shrink-0">
-        {configured ? (
+      <div className="flex items-center gap-1.5 shrink-0 pt-0.5">
+        {item.status === "Configured" ? (
           <>
             <CheckCircle2 className="w-4 h-4 text-emerald-400" />
             <span className="text-xs font-medium text-emerald-400 whitespace-nowrap">Configured</span>
+          </>
+        ) : item.status === "Connection Failed" ? (
+          <>
+            <AlertTriangle className="w-4 h-4 text-rose-400" />
+            <span className="text-xs font-medium text-rose-400 whitespace-nowrap">Connection Failed</span>
           </>
         ) : (
           <>
@@ -119,8 +143,10 @@ export function OverviewPanel({
   failures,
   runState,
   auditing,
+  schedulerUpdating,
   sheetsExporting,
   sheetsSyncing,
+  testingIntegrations,
   sheetsFeedback,
   googleUserEmail,
   googleHasToken,
@@ -129,14 +155,30 @@ export function OverviewPanel({
   onTargetSpreadsheetIdChange,
   onGoogleSignIn,
   onGoogleSignOut,
+  onTestIntegrations,
   onSelectSection,
   onOpenRunModal,
+  onRefresh24h,
+  onUpdateScheduler,
   onAuditRecords,
   onExportSheets,
   onSyncSheets,
   onExportCsv,
   onRetryStatus,
 }: OverviewPanelProps) {
+  const [scheduleUtcInput, setScheduleUtcInput] = useState(
+    status?.scheduler?.utc_time ?? "02:00"
+  );
+  const [scheduleEnabledInput, setScheduleEnabledInput] = useState(
+    status?.scheduler?.enabled ?? true
+  );
+
+  useEffect(() => {
+    if (status?.scheduler) {
+      setScheduleUtcInput(status.scheduler.utc_time);
+      setScheduleEnabledInput(status.scheduler.enabled);
+    }
+  }, [status?.scheduler]);
   if (loading && !status) {
     return (
       <div className="space-y-6">
@@ -199,9 +241,15 @@ export function OverviewPanel({
     rowsUnchanged: 0,
     lastError: null,
   };
+  const healthItems: IntegrationHealthItem[] = status?.integrationHealth?.items ?? [];
+  const failedIntegrations = healthItems.filter((item) => item.status === "Connection Failed");
   const missingCredsList: string[] = [];
-  if (status && !status.credentials.geminiConfigured) missingCredsList.push("GEMINI_API_KEY");
-  if (status && !status.credentials.githubTokenConfigured) missingCredsList.push("GITHUB_TOKEN");
+  if (status && status.integrationHealth?.byId?.gemini?.status === "Not Configured") {
+    missingCredsList.push("GEMINI_API_KEY");
+  }
+  if (status && status.integrationHealth?.byId?.github?.status === "Not Configured") {
+    missingCredsList.push("GITHUB_TOKEN");
+  }
 
   const assessedTotal =
     verificationTotals.Verified +
@@ -217,6 +265,12 @@ export function OverviewPanel({
       : "0.0";
   const jobsFresh = report?.categories?.jobs?.freshness ?? null;
   const newsFresh = report?.categories?.news?.freshness ?? null;
+  const freshCounts24h = status?.freshCounts24h ?? { jobs: 0, news: 0, research_papers: 0 };
+  const pipelineRuns = status?.pipelineRuns ?? [];
+  const lastSourceOutcomes = status?.lastSourceOutcomes ?? [];
+  const failedSources = lastSourceOutcomes.filter((s) => s.status === "failed");
+  const emptySources = lastSourceOutcomes.filter((s) => s.status === "empty");
+  const okSources = lastSourceOutcomes.filter((s) => s.status === "ok");
 
   return (
     <div className="space-y-8">
@@ -224,14 +278,31 @@ export function OverviewPanel({
       <section className="rounded-xl bg-[#0E172B] border border-slate-800/80 p-5 sm:p-6">
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
           <div className="space-y-1">
-            <h1 className="font-display text-xl sm:text-2xl font-semibold text-slate-100">
-              Data Intelligence Pipeline Overview
-            </h1>
+            <div className="flex flex-wrap items-center gap-2.5">
+              <h1 className="font-display text-xl sm:text-2xl font-semibold text-slate-100">
+                Data Intelligence Pipeline Overview
+              </h1>
+              {status?.latestRunStatus && (
+                <span
+                  className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium border ${
+                    status.latestRunStatus === "completed"
+                      ? "bg-emerald-950/50 border-emerald-700/60 text-emerald-300"
+                      : status.latestRunStatus === "partial"
+                      ? "bg-amber-950/50 border-amber-700/60 text-amber-300"
+                      : "bg-rose-950/50 border-rose-700/60 text-rose-300"
+                  }`}
+                >
+                  Latest Run: {status.latestRunStatus}
+                </span>
+              )}
+            </div>
             <p className="text-sm text-slate-400">
               {totalRecords === 0
                 ? "Database initialized with 0 records. Run a live collection to populate source-verified datasets."
-                : `${totalRecords.toLocaleString()} persisted rows across 6 datasets in ${status?.storage.backend ?? "sqlite"}.`}
-              {report?.generated_at_utc
+                : `${totalRecords.toLocaleString()} historical rows across 6 datasets in ${status?.storage.backend ?? "sqlite"}${status?.storage.integrityCheck === "ok" ? " (integrity verified)" : ""}.`}
+              {status?.lastSuccessfulRunAt
+                ? ` · Last successful collection ${new Date(status.lastSuccessfulRunAt).toLocaleString()}`
+                : report?.generated_at_utc
                 ? ` · Last audit ${new Date(report.generated_at_utc).toLocaleString()}`
                 : ""}
             </p>
@@ -275,6 +346,16 @@ export function OverviewPanel({
             >
               <RefreshCw className={`w-4 h-4 ${sheetsSyncing ? "animate-spin" : ""}`} />
               <span>{sheetsSyncing ? "Syncing..." : "Sync Google Sheets"}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={onRefresh24h}
+              disabled={runState.status === "running"}
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-700 hover:bg-emerald-600 disabled:opacity-60 text-white text-sm font-medium transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
+            >
+              <RefreshCw className={`w-4 h-4 ${runState.status === "running" && runState.mode === "daily_24h" ? "animate-spin" : ""}`} />
+              <span>Refresh 24h Feeds</span>
             </button>
 
             <button
@@ -337,14 +418,14 @@ export function OverviewPanel({
           </div>
 
           <div className="space-y-0.5">
-            <div className="text-xs text-slate-400">24h UTC Freshness</div>
-            <div className="font-mono text-sm font-semibold text-slate-100 tabular-nums pt-0.5">
-              {(status?.counts.jobs ?? 0).toLocaleString()} Jobs · {(status?.counts.news ?? 0).toLocaleString()} News
+            <div className="text-xs text-slate-400">Rolling 24h UTC Fresh</div>
+            <div className="font-mono text-sm font-semibold text-emerald-300 tabular-nums pt-0.5">
+              {freshCounts24h.jobs.toLocaleString()} Jobs · {freshCounts24h.news.toLocaleString()} News · {freshCounts24h.research_papers.toLocaleString()} Papers
             </div>
             <div className="text-[11px] text-slate-500 tabular-nums">
               {jobsFresh || newsFresh
-                ? `Window: ${status?.freshnessWindowHours ?? 24}h (${jobsFresh?.accepted ?? 0}J / ${newsFresh?.accepted ?? 0}N accepted)`
-                : `Strict ${status?.freshnessWindowHours ?? 24}h UTC filter`}
+                ? `Last run: ${jobsFresh?.accepted ?? 0}J / ${newsFresh?.accepted ?? 0}N within ${status?.freshnessWindowHours ?? 24}h UTC`
+                : `Separate from historical archive (${(status?.counts.research_papers ?? 0).toLocaleString()} papers)`}
             </div>
           </div>
         </div>
@@ -354,7 +435,14 @@ export function OverviewPanel({
           <div className="mt-5 pt-4 border-t border-slate-800/80 space-y-2">
             <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
               <span className="font-medium text-slate-200">
-                Pipeline Execution: {runState.status === "running" ? "In Progress" : runState.status === "completed" ? "Completed" : "Failed"}
+                Pipeline Execution:{" "}
+                {runState.status === "running"
+                  ? "In Progress"
+                  : runState.status === "completed"
+                  ? "Completed"
+                  : runState.status === "partial"
+                  ? "Completed with Source Failures (Partial)"
+                  : "Failed"}
                 {runState.categories.length > 0 ? ` · Categories: ${runState.categories.join(", ")}` : ""}
                 {` · Limit ${runState.limit}/category · Page ${runState.page ?? 1}`}
               </span>
@@ -399,7 +487,7 @@ export function OverviewPanel({
             )}
           </div>
         )}
-        {(unavailableSources.length > 0 || missingCredsList.length > 0) && (
+        {(unavailableSources.length > 0 || missingCredsList.length > 0 || failedIntegrations.length > 0) && (
           <div className="mt-4 rounded-lg bg-amber-950/25 border border-amber-700/50 p-3.5 text-xs text-amber-200 space-y-1.5">
             {unavailableSources.length > 0 && (
               <div className="flex items-start gap-2">
@@ -413,14 +501,25 @@ export function OverviewPanel({
                 </div>
               </div>
             )}
+            {failedIntegrations.length > 0 && (
+              <div className="flex items-start gap-2">
+                <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                <div className="text-rose-200">
+                  <span className="font-medium text-rose-300">Integration Connection Failed: </span>
+                  <span>
+                    {failedIntegrations.map((i) => `${i.label}: ${i.error || i.detail}`).join(" · ")}
+                  </span>
+                </div>
+              </div>
+            )}
             {missingCredsList.length > 0 && (
               <div className="flex items-start gap-2">
                 <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
                 <div>
                   <span className="font-medium text-amber-300">Unconfigured API Credentials: </span>
                   <span>
-                    <code className="text-amber-100">{missingCredsList.join(", ")}</code> not set in{" "}
-                    <code className="text-amber-100">frontier-atlas/.env</code> (public unauthenticated endpoints continue normally; optional AI extraction fallback and higher GitHub rate limits require keys).
+                    <code className="text-amber-100">{missingCredsList.join(", ")}</code> not set in server environment
+                    (public unauthenticated endpoints continue normally; optional AI extraction fallback and higher GitHub rate limits require keys).
                   </span>
                 </div>
               </div>
@@ -460,13 +559,25 @@ export function OverviewPanel({
                   <span className="font-mono text-2xl font-semibold text-slate-100 tabular-nums">
                     {count.toLocaleString()}
                   </span>
-                  {target !== null ? (
+                  {meta.key === "research_papers" ? (
+                    <span className="font-mono text-xs text-emerald-300 tabular-nums">
+                      24h Fresh: {freshCounts24h.research_papers.toLocaleString()} · Target {target?.toLocaleString()} ({pct}%)
+                    </span>
+                  ) : meta.key === "jobs" ? (
+                    <span className="font-mono text-xs text-emerald-300 tabular-nums">
+                      24h Fresh: {freshCounts24h.jobs.toLocaleString()} · Archive {count.toLocaleString()}
+                    </span>
+                  ) : meta.key === "news" ? (
+                    <span className="font-mono text-xs text-emerald-300 tabular-nums">
+                      24h Fresh: {freshCounts24h.news.toLocaleString()} · Archive {count.toLocaleString()}
+                    </span>
+                  ) : target !== null ? (
                     <span className="font-mono text-xs text-slate-400 tabular-nums">
                       Target {target.toLocaleString()} ({pct}%)
                     </span>
                   ) : (
                     <span className="font-mono text-xs text-slate-400">
-                      {meta.key === "entity_mapping_log" ? "Audit entries" : "24h UTC window"}
+                      Audit entries
                     </span>
                   )}
                 </div>
@@ -619,59 +730,38 @@ export function OverviewPanel({
 
         {/* Credentials & Integration Status */}
         <div className="rounded-xl bg-[#0E172B] border border-slate-800/80 p-5 sm:p-6">
-          <div className="flex items-center justify-between gap-2 mb-2">
-            <h2 className="font-display text-base font-semibold text-slate-100">
-              Integration &amp; Credential Status
-            </h2>
-            <Database className="w-4 h-4 text-slate-400 shrink-0" />
+          <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+            <div className="flex items-center gap-2">
+              <Database className="w-4 h-4 text-slate-400 shrink-0" />
+              <h2 className="font-display text-base font-semibold text-slate-100">
+                Integration &amp; Credential Status
+              </h2>
+            </div>
+            <button
+              type="button"
+              onClick={onTestIntegrations}
+              disabled={testingIntegrations}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-800 hover:bg-slate-700 disabled:opacity-60 text-slate-200 text-xs font-medium transition-colors"
+            >
+              <RefreshCw className={`w-3 h-3 ${testingIntegrations ? "animate-spin" : ""}`} />
+              <span>{testingIntegrations ? "Testing..." : "Test Connections"}</span>
+            </button>
           </div>
           <p className="text-xs text-slate-400 mb-3">
-            Live environment state read from <code className="text-slate-300">frontier-atlas/.env</code> and runtime secrets.
+            Statuses reflect live backend health checks only (
+            <span className="text-emerald-400">Configured</span> only after a real API probe succeeds
+            {status?.integrationHealth?.checkedAt
+              ? ` · Last checked ${new Date(status.integrationHealth.checkedAt).toLocaleTimeString()}`
+              : ""}
+            ).
           </p>
 
           <div>
-            <CredentialRow
-              label={`Google Gemini (${status?.credentials.geminiModel ?? "gemini-4-hydrogen"})`}
-              envKey="GEMINI_API_KEY"
-              configured={status?.credentials.geminiConfigured ?? false}
-              detail="Primary provider in LLMRouter for unstructured HTML extraction with token-aware chunking and 413 sub-chunking."
-            />
-            <CredentialRow
-              label="Multi-Tier LLM Fallbacks (Groq / Llama 3 / DeepSeek)"
-              envKey="GROQ_API_KEY / LLAMA3_API_KEY / DEEPSEEK_API_KEY"
-              configured={Boolean(
-                status?.credentials.groqConfigured ||
-                  status?.credentials.llama3Configured ||
-                  status?.credentials.deepseekConfigured
-              )}
-              detail={
-                status?.credentials.llmDemoFallbackActive
-                  ? "Chain: Gemini Flash -> Groq -> Llama 3 -> DeepSeek. No LLM API keys active; extraction uses deterministic heuristic demo fallback (Unverified) without fabricating data."
-                  : "4-tier fallback chain executes Gemini Flash -> Groq -> Llama 3 -> DeepSeek with 429 exponential backoff and 413 recursive sub-chunking."
-              }
-            />
-            <CredentialRow
-              label="Google Sheets & Drive OAuth"
-              envKey="Workspace OAuth"
-              configured={Boolean(
-                googleHasToken ||
-                  sheetsStatus.status === "Connected" ||
-                  status?.credentials.googleSheetsConfigured
-              )}
-              detail={
-                googleHasToken
-                  ? `Authorized as ${googleUserEmail ?? "Google user"} (in-memory OAuth token active).`
-                  : sheetsStatus.status === "Connected"
-                  ? "Spreadsheet connected. Click 'Sign in with Google' below to authorize fresh writes in this browser session."
-                  : "Google Drive & Sheets integration enabled. Click 'Sign in with Google' below (or Export/Sync) to authorize spreadsheet creation & writes."
-              }
-            />
-            <CredentialRow
-              label="GitHub REST API Enrichment"
-              envKey="GITHUB_TOKEN"
-              configured={status?.credentials.githubTokenConfigured ?? false}
-              detail="Optional token raising star-count and repo metrics lookup limit from 60 to 5,000 requests/hour."
-            />
+            {healthItems.length > 0 ? (
+              healthItems.map((item) => <IntegrationStatusRow key={item.id} item={item} />)
+            ) : (
+              <p className="text-xs text-slate-400 py-2">Loading live integration health checks...</p>
+            )}
           </div>
 
           <div className="mt-5 pt-4 border-t border-slate-800/80 space-y-3">
@@ -683,14 +773,14 @@ export function OverviewPanel({
               <div className="flex items-center gap-2">
                 <span
                   className={`inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-0.5 rounded-md border ${
-                    sheetsStatus.status === "Connected" || googleHasToken
+                    sheetsStatus.status === "Connected"
                       ? "bg-emerald-950/50 border-emerald-700/60 text-emerald-300"
                       : sheetsStatus.status === "Sync Failed"
                       ? "bg-rose-950/50 border-rose-700/60 text-rose-300"
                       : "bg-slate-900 border-slate-700 text-slate-300"
                   }`}
                 >
-                  {sheetsStatus.status === "Connected" || googleHasToken ? (
+                  {sheetsStatus.status === "Connected" ? (
                     <CheckCircle2 className="w-3.5 h-3.5" />
                   ) : sheetsStatus.status === "Sync Failed" ? (
                     <AlertTriangle className="w-3.5 h-3.5" />
@@ -700,7 +790,7 @@ export function OverviewPanel({
                   <span>
                     {sheetsStatus.status === "Sync Failed"
                       ? "Sync Failed"
-                      : sheetsStatus.status === "Connected" || googleHasToken
+                      : sheetsStatus.status === "Connected"
                       ? "Connected"
                       : "Not Connected"}
                   </span>
@@ -860,6 +950,211 @@ export function OverviewPanel({
               </p>
             )}
           </div>
+        </div>
+      </section>
+
+      {/* Daily UTC Schedule & Pipeline Execution History */}
+      <section className="grid grid-cols-1 xl:grid-cols-2 gap-6 items-stretch">
+        <div className="rounded-xl bg-[#0E172B] border border-slate-800/80 p-5 sm:p-6 space-y-4">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <CalendarClock className="w-4 h-4 text-sky-400 shrink-0" />
+              <h2 className="font-display text-base font-semibold text-slate-100">
+                Daily 24h UTC Automation Schedule
+              </h2>
+            </div>
+            <span
+              className={`text-xs font-medium px-2 py-0.5 rounded border ${
+                status?.scheduler?.enabled
+                  ? "bg-emerald-950/50 border-emerald-700/60 text-emerald-300"
+                  : "bg-slate-900 border-slate-700 text-slate-400"
+              }`}
+            >
+              {status?.scheduler?.enabled ? "Enabled" : "Paused"}
+            </span>
+          </div>
+
+          <p className="text-xs text-slate-400">
+            Runs rolling 24h collection across all 9 job boards, 12+ RSS feeds + HN, and fresh research papers at a configurable UTC time without overlapping active runs.
+          </p>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 items-end">
+            <div>
+              <label htmlFor="daily-utc-time" className="text-xs text-slate-400 block mb-1">
+                Daily UTC Time (HH:MM)
+              </label>
+              <input
+                id="daily-utc-time"
+                type="text"
+                value={scheduleUtcInput}
+                onChange={(e) => setScheduleUtcInput(e.target.value)}
+                placeholder="02:00"
+                className="w-full px-3 py-1.5 rounded-lg bg-[#070D1A] border border-slate-800 text-xs font-mono text-slate-100 focus:outline-none focus:ring-2 focus:ring-sky-500"
+              />
+            </div>
+
+            <label className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-[#070D1A] border border-slate-800 text-xs text-slate-200 cursor-pointer h-[32px]">
+              <input
+                type="checkbox"
+                checked={scheduleEnabledInput}
+                onChange={(e) => setScheduleEnabledInput(e.target.checked)}
+                className="rounded border-slate-700 bg-slate-900 text-sky-500 focus:ring-sky-500"
+              />
+              <span>Auto-run daily</span>
+            </label>
+
+            <button
+              type="button"
+              disabled={schedulerUpdating}
+              onClick={() =>
+                onUpdateScheduler({
+                  enabled: scheduleEnabledInput,
+                  utcTime: scheduleUtcInput,
+                })
+              }
+              className="px-3.5 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 disabled:opacity-60 text-white text-xs font-medium transition-colors h-[32px]"
+            >
+              {schedulerUpdating ? "Saving..." : "Save Schedule"}
+            </button>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs pt-1">
+            <div className="rounded-lg bg-[#070D1A] border border-slate-800/80 px-3 py-2">
+              <div className="text-slate-500">Next Scheduled (UTC)</div>
+              <div className="font-mono text-slate-200 mt-0.5 truncate">
+                {status?.scheduler?.enabled && status.scheduler.next_run_at
+                  ? status.scheduler.next_run_at.replace("T", " ").slice(0, 16) + " UTC"
+                  : "Paused"}
+              </div>
+            </div>
+            <div className="rounded-lg bg-[#070D1A] border border-slate-800/80 px-3 py-2">
+              <div className="text-slate-500">Last Successful Run</div>
+              <div className="font-mono text-emerald-300 mt-0.5 truncate">
+                {status?.lastSuccessfulRunAt
+                  ? status.lastSuccessfulRunAt.replace("T", " ").slice(0, 16) + " UTC"
+                  : "None persisted yet"}
+              </div>
+            </div>
+            <div className="rounded-lg bg-[#070D1A] border border-slate-800/80 px-3 py-2">
+              <div className="text-slate-500">Latest Source Health</div>
+              <div className="font-mono text-slate-200 mt-0.5 tabular-nums">
+                {lastSourceOutcomes.length === 0
+                  ? "No run telemetry yet"
+                  : `${okSources.length} ok · ${emptySources.length} empty · ${failedSources.length} failed`}
+              </div>
+            </div>
+          </div>
+
+          {lastSourceOutcomes.length > 0 && (
+            <div className="pt-2 border-t border-slate-800/80 space-y-2">
+              <div className="text-xs font-medium text-slate-300">
+                Latest Source Outcomes (Empty vs Failed)
+              </div>
+              <div className="max-h-40 overflow-y-auto space-y-1.5 pr-1">
+                {lastSourceOutcomes.map((s, idx) => (
+                  <div
+                    key={`${s.category}-${s.source}-${idx}`}
+                    className={`flex items-center justify-between gap-2 text-[11px] rounded px-2.5 py-1.5 border ${
+                      s.status === "failed"
+                        ? "bg-rose-950/25 border-rose-800/50 text-rose-200"
+                        : s.status === "empty"
+                        ? "bg-[#070D1A] border-slate-800 text-slate-400"
+                        : "bg-[#070D1A] border-emerald-900/40 text-slate-300"
+                    }`}
+                  >
+                    <div className="truncate">
+                      <span className="font-mono text-slate-400 mr-1.5">[{s.category}]</span>
+                      <span className="font-medium text-slate-200">{s.source}</span>
+                      {s.error && <span className="ml-2 text-rose-300">— {s.error}</span>}
+                      {s.status === "empty" && !s.error && (
+                        <span className="ml-2 text-slate-500">— 200 OK (0 qualifying 24h items)</span>
+                      )}
+                    </div>
+                    <span
+                      className={`font-mono shrink-0 ${
+                        s.status === "failed"
+                          ? "text-rose-400"
+                          : s.status === "empty"
+                          ? "text-amber-300"
+                          : "text-emerald-400"
+                      }`}
+                    >
+                      {s.status === "ok"
+                        ? `${s.freshCount ?? s.discoveredCount} kept`
+                        : s.status.toUpperCase()}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="rounded-xl bg-[#0E172B] border border-slate-800/80 p-5 sm:p-6 space-y-3">
+          <div className="flex items-center justify-between gap-2">
+            <div>
+              <h2 className="font-display text-base font-semibold text-slate-100">
+                Recent Pipeline Runs
+              </h2>
+              <p className="text-xs text-slate-400 mt-0.5">
+                Persisted execution history separating completed, partial, and failed runs. Historical counts are never wiped on failure.
+              </p>
+            </div>
+            <span className="font-mono text-xs text-slate-400 tabular-nums">
+              {pipelineRuns.length} logged
+            </span>
+          </div>
+
+          {pipelineRuns.length === 0 ? (
+            <p className="text-sm text-slate-400">
+              No pipeline runs persisted in SQLite yet. Click Refresh 24h Feeds or Run Collection to execute a monitored run.
+            </p>
+          ) : (
+            <div className="overflow-x-auto max-h-80 overflow-y-auto">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="border-b border-slate-800 text-slate-400">
+                    <th className="py-2 pr-2 font-medium">Trigger</th>
+                    <th className="py-2 px-2 font-medium">Status</th>
+                    <th className="py-2 px-2 font-medium">24h Fresh</th>
+                    <th className="py-2 px-2 font-medium">Summary</th>
+                    <th className="py-2 pl-2 font-medium text-right">Started (UTC)</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/60">
+                  {pipelineRuns.map((run) => {
+                    const statusCls =
+                      run.status === "completed"
+                        ? "text-emerald-400"
+                        : run.status === "partial"
+                        ? "text-amber-300"
+                        : run.status === "running"
+                        ? "text-sky-400"
+                        : "text-rose-400";
+                    return (
+                      <tr key={run.run_id} className="hover:bg-slate-800/30">
+                        <td className="py-2 pr-2 font-mono text-slate-300 whitespace-nowrap">
+                          {run.trigger_type}
+                        </td>
+                        <td className={`py-2 px-2 font-medium whitespace-nowrap ${statusCls}`}>
+                          {run.status}
+                        </td>
+                        <td className="py-2 px-2 font-mono text-slate-300 tabular-nums whitespace-nowrap">
+                          {run.fresh_24h_counts?.jobs ?? 0}J / {run.fresh_24h_counts?.news ?? 0}N / {run.fresh_24h_counts?.research_papers ?? 0}P
+                        </td>
+                        <td className="py-2 px-2 text-slate-400 max-w-[240px] truncate" title={run.summary ?? ""}>
+                          {run.summary ?? "—"}
+                        </td>
+                        <td className="py-2 pl-2 text-right font-mono text-slate-400 tabular-nums whitespace-nowrap">
+                          {run.started_at.replace("T", " ").slice(0, 16)}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       </section>
 

@@ -95,6 +95,7 @@ const SCHEMA_DDL_STATEMENTS: string[] = [
     abstract TEXT,
     authors_json TEXT NOT NULL DEFAULT '[]',
     publication_date TEXT,
+    published_at TEXT,
     doi TEXT,
     arxiv_id TEXT,
     github_repository TEXT,
@@ -217,6 +218,30 @@ const SCHEMA_DDL_STATEMENTS: string[] = [
     rows_unchanged INTEGER NOT NULL DEFAULT 0,
     last_error TEXT
   );`,
+  `CREATE TABLE IF NOT EXISTS pipeline_runs (
+    run_id TEXT PRIMARY KEY,
+    trigger_type TEXT NOT NULL,
+    mode TEXT NOT NULL DEFAULT 'full',
+    categories_json TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    status TEXT NOT NULL,
+    historical_counts_json TEXT NOT NULL DEFAULT '{}',
+    fresh_24h_counts_json TEXT NOT NULL DEFAULT '{}',
+    errors_json TEXT NOT NULL DEFAULT '[]',
+    source_outcomes_json TEXT NOT NULL DEFAULT '[]',
+    summary TEXT
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_pipeline_runs_started ON pipeline_runs(started_at DESC);`,
+  `CREATE TABLE IF NOT EXISTS scheduler_state (
+    id TEXT PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    utc_time TEXT NOT NULL DEFAULT '02:00',
+    last_run_at TEXT,
+    last_success_at TEXT,
+    next_run_at TEXT,
+    updated_at TEXT NOT NULL
+  );`,
 ];
 
 const TRACEABILITY_COLUMNS: Array<[string, string]> = [
@@ -275,6 +300,7 @@ export interface ResearchPaperInput {
   abstract: string | null;
   authors: string[];
   publication_date: string | null;
+  published_at?: string | null;
   doi: string | null;
   arxiv_id: string | null;
   github_repository: string | null;
@@ -289,6 +315,43 @@ export interface ResearchPaperInput {
   verification_status: VerificationStatus;
   rejection_reason: string | null;
   source_metadata: Record<string, unknown>;
+}
+
+export interface SourceOutcomeRecord {
+  category: string;
+  source: string;
+  url: string;
+  status: "ok" | "empty" | "failed";
+  discoveredCount: number;
+  freshCount?: number;
+  retried: boolean;
+  attempts: number;
+  httpStatus?: number | null;
+  error: string | null;
+}
+
+export interface PipelineRunRecord {
+  run_id: string;
+  trigger_type: "manual" | "scheduled" | "daily_24h";
+  mode: "full" | "daily_24h";
+  categories: string[];
+  started_at: string;
+  completed_at: string | null;
+  status: "running" | "completed" | "partial" | "failed";
+  historical_counts: Record<string, number>;
+  fresh_24h_counts: Record<string, number>;
+  errors: Array<Record<string, unknown>>;
+  source_outcomes: SourceOutcomeRecord[];
+  summary: string | null;
+}
+
+export interface SchedulerStateRecord {
+  enabled: boolean;
+  utc_time: string;
+  last_run_at: string | null;
+  last_success_at: string | null;
+  next_run_at: string | null;
+  updated_at: string;
 }
 
 export interface JobInput {
@@ -455,11 +518,83 @@ export class AtlasDatabase {
         conn.exec("ALTER TABLE sheets_sync_state ADD COLUMN tab_statuses_json TEXT NOT NULL DEFAULT '{}';");
       }
 
+      const paperInfoRows = conn.prepare("PRAGMA table_info(research_papers);").all() as Array<{ name: string }>;
+      const paperCols = new Set(paperInfoRows.map((r) => String(r.name)));
+      if (!paperCols.has("published_at")) {
+        conn.exec("ALTER TABLE research_papers ADD COLUMN published_at TEXT;");
+      }
+      conn.exec("CREATE INDEX IF NOT EXISTS idx_papers_published_at ON research_papers(published_at);");
+
       conn.exec("COMMIT");
       this.initialized = true;
     } catch (err) {
       conn.exec("ROLLBACK");
       throw err;
+    }
+  }
+
+  public checkpointWal(mode: "PASSIVE" | "FULL" | "RESTART" | "TRUNCATE" = "PASSIVE"): void {
+    if (!this.db) return;
+    try {
+      this.db.exec(`PRAGMA wal_checkpoint(${mode});`);
+    } catch {
+      // Ignore busy WAL checkpoint error if concurrent reader holds lock
+    }
+  }
+
+  public close(): void {
+    if (!this.db) return;
+    try {
+      this.checkpointWal("TRUNCATE");
+      this.db.close();
+    } finally {
+      this.db = null;
+      this.initialized = false;
+    }
+  }
+
+  public checkHealth(): {
+    ok: boolean;
+    integrityCheck: string;
+    tableCounts: Record<string, number>;
+    journalMode: string;
+    error: string | null;
+  } {
+    try {
+      this.initializeSchema();
+      const conn = this.getConnection();
+      const icRows = conn.prepare("PRAGMA integrity_check;").all() as Array<Record<string, unknown>>;
+      const icMessages = icRows
+        .map((r) => String(Object.values(r)[0] ?? "").trim())
+        .filter(Boolean);
+      const icText = icMessages.join("; ") || "unknown";
+      const icOk = icMessages.length === 1 && icMessages[0].toLowerCase() === "ok";
+      const jmRow = conn.prepare("PRAGMA journal_mode;").get() as { journal_mode?: string } | undefined;
+      if (!icOk) {
+        return {
+          ok: false,
+          integrityCheck: icText,
+          tableCounts: {},
+          journalMode: String(jmRow?.journal_mode ?? "unknown"),
+          error: `SQLite PRAGMA integrity_check failed: ${icText}`,
+        };
+      }
+      const tableCounts = this.countRecords();
+      return {
+        ok: true,
+        integrityCheck: "ok",
+        tableCounts,
+        journalMode: String(jmRow?.journal_mode ?? "unknown"),
+        error: null,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        integrityCheck: "error",
+        tableCounts: {},
+        journalMode: "unknown",
+        error: err instanceof Error ? err.message : String(err),
+      };
     }
   }
 
@@ -470,6 +605,26 @@ export class AtlasDatabase {
     return rows.map((row) => ({ ...row }));
   }
 
+  private parseRowTimestampMs(row: Record<string, unknown>, tableName: string): number | null {
+    let raw: unknown = null;
+    if (tableName === "jobs") {
+      raw = row.posted_at;
+    } else if (tableName === "news") {
+      raw = row.published_at;
+    } else if (tableName === "research_papers") {
+      raw = row.published_at;
+    }
+    if (typeof raw !== "string" || !raw.trim()) return null;
+    const s = raw.trim();
+    const normalized = /^\d{4}-\d{2}-\d{2}$/.test(s)
+      ? `${s}T00:00:00.000Z`
+      : /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/.test(s)
+      ? `${s.replace(" ", "T")}Z`
+      : s;
+    const ms = Date.parse(normalized);
+    return Number.isFinite(ms) ? ms : null;
+  }
+
   public fetchDataset(tableName: string, limit?: number): Array<Record<string, unknown>> {
     if (!ALLOWED_DATASET_TABLES.has(tableName)) {
       throw new Error(`Unsupported dataset table: ${tableName}`);
@@ -478,6 +633,67 @@ export class AtlasDatabase {
       return this.fetchAll(`SELECT * FROM ${tableName} ORDER BY rowid ASC LIMIT ?;`, limit);
     }
     return this.fetchAll(`SELECT * FROM ${tableName} ORDER BY rowid ASC;`);
+  }
+
+  public fetchDatasetWindow(
+    tableName: string,
+    opts?: { limit?: number; windowHours?: number | null; refNow?: Date }
+  ): Array<Record<string, unknown>> {
+    if (!ALLOWED_DATASET_TABLES.has(tableName)) {
+      throw new Error(`Unsupported dataset table: ${tableName}`);
+    }
+    const windowHours = opts?.windowHours ?? null;
+    if (
+      !windowHours ||
+      (tableName !== "jobs" && tableName !== "news" && tableName !== "research_papers")
+    ) {
+      return this.fetchDataset(tableName, opts?.limit);
+    }
+    const refMs = (opts?.refNow ?? new Date()).getTime();
+    const minMs = refMs - windowHours * 3600_000;
+    const maxMs = refMs + 5 * 60_000;
+    const orderSql =
+      tableName === "jobs"
+        ? "ORDER BY posted_at DESC, rowid DESC"
+        : tableName === "news"
+        ? "ORDER BY published_at DESC, rowid DESC"
+        : "ORDER BY COALESCE(published_at, publication_date) DESC, rowid DESC";
+    const allRows = this.fetchAll(`SELECT * FROM ${tableName} ${orderSql};`);
+    const filtered: Array<Record<string, unknown>> = [];
+    for (const row of allRows) {
+      const ts = this.parseRowTimestampMs(row, tableName);
+      if (ts !== null && ts >= minMs && ts <= maxMs) {
+        filtered.push(row);
+        if (opts?.limit !== undefined && filtered.length >= opts.limit) break;
+      }
+    }
+    return filtered;
+  }
+
+  public countFresh24h(
+    windowHours = 24,
+    refNow: Date = new Date()
+  ): { jobs: number; news: number; research_papers: number } {
+    this.initializeSchema();
+    const refMs = refNow.getTime();
+    const minMs = refMs - windowHours * 3600_000;
+    const maxMs = refMs + 5 * 60_000;
+
+    const countTable = (table: "jobs" | "news" | "research_papers", cols: string): number => {
+      const rows = this.fetchAll(`SELECT ${cols} FROM ${table};`);
+      let cnt = 0;
+      for (const r of rows) {
+        const ts = this.parseRowTimestampMs(r, table);
+        if (ts !== null && ts >= minMs && ts <= maxMs) cnt++;
+      }
+      return cnt;
+    };
+
+    return {
+      jobs: countTable("jobs", "posted_at"),
+      news: countTable("news", "published_at"),
+      research_papers: countTable("research_papers", "published_at"),
+    };
   }
 
   public countRecords(): Record<string, number> {
@@ -745,16 +961,17 @@ export class AtlasDatabase {
 
     const stmt = conn.prepare(`
       INSERT INTO research_papers (
-        paper_id, title, abstract, authors_json, publication_date,
+        paper_id, title, abstract, authors_json, publication_date, published_at,
         doi, arxiv_id, github_repository, github_stars, official_website,
         source_name, source_url, source_title, collected_at, last_checked_at,
         supported_fields_json, verification_status, rejection_reason, source_metadata_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(paper_id) DO UPDATE SET
         title = excluded.title,
         abstract = COALESCE(excluded.abstract, research_papers.abstract),
         authors_json = excluded.authors_json,
         publication_date = COALESCE(excluded.publication_date, research_papers.publication_date),
+        published_at = COALESCE(excluded.published_at, research_papers.published_at),
         doi = COALESCE(excluded.doi, research_papers.doi),
         arxiv_id = COALESCE(excluded.arxiv_id, research_papers.arxiv_id),
         github_repository = COALESCE(excluded.github_repository, research_papers.github_repository),
@@ -774,12 +991,14 @@ export class AtlasDatabase {
     try {
       for (const r of records) {
         const pid = existingByUrl.get(r.source_url) ?? r.paper_id;
+        existingByUrl.set(r.source_url, pid);
         stmt.run(
           pid,
           r.title,
           r.abstract ?? null,
           JSON.stringify(r.authors ?? []),
           r.publication_date ?? null,
+          r.published_at ?? null,
           r.doi ?? null,
           r.arxiv_id ?? null,
           r.github_repository ?? null,
@@ -808,6 +1027,15 @@ export class AtlasDatabase {
     if (records.length === 0) return 0;
     this.initializeSchema();
     const conn = this.getConnection();
+    const existingRows = conn.prepare("SELECT job_id, application_url FROM jobs;").all() as Array<{
+      job_id: string;
+      application_url: string;
+    }>;
+    const existingByUrl = new Map<string, string>();
+    for (const row of existingRows) {
+      existingByUrl.set(String(row.application_url), String(row.job_id));
+    }
+
     const stmt = conn.prepare(`
       INSERT INTO jobs (
         job_id, title, company, location, employment_type, description,
@@ -815,7 +1043,7 @@ export class AtlasDatabase {
         source_title, collected_at, last_checked_at, supported_fields_json,
         verification_status, rejection_reason, canonical_company_id, source_metadata_json
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(application_url) DO UPDATE SET
+      ON CONFLICT(job_id) DO UPDATE SET
         title = excluded.title,
         location = CASE
           WHEN excluded.last_checked_at IS NOT NULL THEN excluded.location
@@ -842,8 +1070,10 @@ export class AtlasDatabase {
     conn.exec("BEGIN");
     try {
       for (const r of records) {
+        const jid = existingByUrl.get(r.application_url) ?? r.job_id;
+        existingByUrl.set(r.application_url, jid);
         stmt.run(
-          r.job_id,
+          jid,
           r.title,
           r.company || "Unknown",
           r.location || "Unknown",
@@ -876,6 +1106,15 @@ export class AtlasDatabase {
     if (records.length === 0) return 0;
     this.initializeSchema();
     const conn = this.getConnection();
+    const existingRows = conn.prepare("SELECT news_id, article_url FROM news;").all() as Array<{
+      news_id: string;
+      article_url: string;
+    }>;
+    const existingByUrl = new Map<string, string>();
+    for (const row of existingRows) {
+      existingByUrl.set(String(row.article_url), String(row.news_id));
+    }
+
     const stmt = conn.prepare(`
       INSERT INTO news (
         news_id, headline, summary, publisher, published_at, article_url,
@@ -883,7 +1122,7 @@ export class AtlasDatabase {
         collected_at, last_checked_at, supported_fields_json, verification_status,
         rejection_reason, source_metadata_json
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(article_url) DO UPDATE SET
+      ON CONFLICT(news_id) DO UPDATE SET
         headline = excluded.headline,
         summary = COALESCE(excluded.summary, news.summary),
         category = CASE
@@ -904,8 +1143,10 @@ export class AtlasDatabase {
     conn.exec("BEGIN");
     try {
       for (const r of records) {
+        const nid = existingByUrl.get(r.article_url) ?? r.news_id;
+        existingByUrl.set(r.article_url, nid);
         stmt.run(
-          r.news_id,
+          nid,
           r.headline,
           r.summary ?? null,
           r.publisher || "Unknown",
@@ -1253,6 +1494,168 @@ export class AtlasDatabase {
         state.rowsUpdated,
         state.rowsUnchanged,
         state.lastError
+      );
+  }
+
+  public createPipelineRun(run: {
+    runId: string;
+    triggerType: "manual" | "scheduled" | "daily_24h";
+    mode: "full" | "daily_24h";
+    categories: string[];
+    startedAt: string;
+    historicalCounts: Record<string, number>;
+    fresh24hCounts: Record<string, number>;
+  }): void {
+    this.initializeSchema();
+    const conn = this.getConnection();
+    conn
+      .prepare(
+        `INSERT INTO pipeline_runs (
+          run_id, trigger_type, mode, categories_json, started_at, completed_at,
+          status, historical_counts_json, fresh_24h_counts_json, errors_json, source_outcomes_json, summary
+        ) VALUES (?, ?, ?, ?, ?, NULL, 'running', ?, ?, '[]', '[]', NULL);`
+      )
+      .run(
+        run.runId,
+        run.triggerType,
+        run.mode,
+        JSON.stringify(run.categories),
+        run.startedAt,
+        JSON.stringify(run.historicalCounts),
+        JSON.stringify(run.fresh24hCounts)
+      );
+  }
+
+  public completePipelineRun(update: {
+    runId: string;
+    completedAt: string;
+    status: "completed" | "partial" | "failed";
+    historicalCounts: Record<string, number>;
+    fresh24hCounts: Record<string, number>;
+    errors: Array<Record<string, unknown>>;
+    sourceOutcomes: SourceOutcomeRecord[];
+    summary: string;
+  }): void {
+    this.initializeSchema();
+    const conn = this.getConnection();
+    conn
+      .prepare(
+        `UPDATE pipeline_runs SET
+          completed_at = ?,
+          status = ?,
+          historical_counts_json = ?,
+          fresh_24h_counts_json = ?,
+          errors_json = ?,
+          source_outcomes_json = ?,
+          summary = ?
+        WHERE run_id = ?;`
+      )
+      .run(
+        update.completedAt,
+        update.status,
+        JSON.stringify(update.historicalCounts),
+        JSON.stringify(update.fresh24hCounts),
+        JSON.stringify(update.errors),
+        JSON.stringify(update.sourceOutcomes),
+        update.summary,
+        update.runId
+      );
+  }
+
+  public markInterruptedRunsFailed(reason = "Interrupted by server restart"): number {
+    this.initializeSchema();
+    const conn = this.getConnection();
+    const nowIso = new Date().toISOString();
+    const res = conn
+      .prepare(
+        `UPDATE pipeline_runs SET
+          completed_at = COALESCE(completed_at, ?),
+          status = 'failed',
+          summary = COALESCE(summary, ?)
+        WHERE status = 'running';`
+      )
+      .run(nowIso, reason);
+    return Number(res.changes ?? 0);
+  }
+
+  public fetchPipelineRuns(limit = 20): PipelineRunRecord[] {
+    this.initializeSchema();
+    const rows = this.fetchAll(
+      "SELECT * FROM pipeline_runs ORDER BY started_at DESC LIMIT ?;",
+      Math.max(1, limit)
+    );
+    const parseJson = <T>(raw: unknown, fallback: T): T => {
+      if (typeof raw !== "string" || !raw.trim()) return fallback;
+      try {
+        return JSON.parse(raw) as T;
+      } catch {
+        return fallback;
+      }
+    };
+    return rows.map((r) => ({
+      run_id: String(r.run_id),
+      trigger_type: (String(r.trigger_type) as PipelineRunRecord["trigger_type"]) || "manual",
+      mode: (String(r.mode) as PipelineRunRecord["mode"]) || "full",
+      categories: parseJson<string[]>(r.categories_json, []),
+      started_at: String(r.started_at),
+      completed_at: (r.completed_at as string | null) ?? null,
+      status: (String(r.status) as PipelineRunRecord["status"]) || "completed",
+      historical_counts: parseJson<Record<string, number>>(r.historical_counts_json, {}),
+      fresh_24h_counts: parseJson<Record<string, number>>(r.fresh_24h_counts_json, {}),
+      errors: parseJson<Array<Record<string, unknown>>>(r.errors_json, []),
+      source_outcomes: parseJson<SourceOutcomeRecord[]>(r.source_outcomes_json, []),
+      summary: (r.summary as string | null) ?? null,
+    }));
+  }
+
+  public getLastSuccessfulRun(includePartial = false): PipelineRunRecord | null {
+    this.initializeSchema();
+    const runs = this.fetchPipelineRuns(25);
+    return (
+      runs.find((r) =>
+        includePartial ? r.status === "completed" || r.status === "partial" : r.status === "completed"
+      ) ?? null
+    );
+  }
+
+  public getSchedulerState(): SchedulerStateRecord | null {
+    this.initializeSchema();
+    const rows = this.fetchAll("SELECT * FROM scheduler_state WHERE id = 'default';");
+    if (rows.length === 0) return null;
+    const r = rows[0];
+    return {
+      enabled: Number(r.enabled ?? 1) === 1,
+      utc_time: String(r.utc_time ?? "02:00"),
+      last_run_at: (r.last_run_at as string | null) ?? null,
+      last_success_at: (r.last_success_at as string | null) ?? null,
+      next_run_at: (r.next_run_at as string | null) ?? null,
+      updated_at: String(r.updated_at ?? new Date().toISOString()),
+    };
+  }
+
+  public saveSchedulerState(state: SchedulerStateRecord): void {
+    this.initializeSchema();
+    const conn = this.getConnection();
+    conn
+      .prepare(
+        `INSERT INTO scheduler_state (
+          id, enabled, utc_time, last_run_at, last_success_at, next_run_at, updated_at
+        ) VALUES ('default', ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          enabled = excluded.enabled,
+          utc_time = excluded.utc_time,
+          last_run_at = excluded.last_run_at,
+          last_success_at = excluded.last_success_at,
+          next_run_at = excluded.next_run_at,
+          updated_at = excluded.updated_at;`
+      )
+      .run(
+        state.enabled ? 1 : 0,
+        state.utc_time,
+        state.last_run_at,
+        state.last_success_at,
+        state.next_run_at,
+        state.updated_at
       );
   }
 }

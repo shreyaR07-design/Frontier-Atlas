@@ -1,17 +1,29 @@
 /**
  * Multi-tier LLM extraction router with token-aware intelligent chunking,
  * recursive sub-chunking on context-limit / 413 errors, exponential backoff retries,
- * and source-evidence verification.
+ * secret redaction, live provider probing, and source-evidence verification.
  *
  * Provider chain:
  *   1. Google Gemini Flash (@google/genai) - primary when GEMINI_API_KEY is configured
  *   2. Groq (OpenAI-compatible REST) - fallback when GROQ_API_KEY is configured
- *   3. Llama 3 (OpenAI-compatible REST) - fallback when LLAMA3_API_KEY is configured
+ *   3. Llama 3 through Groq (or custom LLAMA3_ENDPOINT_URL) - fallback when GROQ_API_KEY or LLAMA3_API_KEY is configured
  *   4. DeepSeek (OpenAI-compatible REST) - fallback when DEEPSEEK_API_KEY is configured
  *   + Honest heuristic demo fallback when zero API keys are configured (marked Unverified)
  */
 
 import { GoogleGenAI } from "@google/genai";
+
+export type IntegrationConnectionStatus = "Configured" | "Not Configured" | "Connection Failed";
+
+export interface LLMProviderProbeResult {
+  provider: string;
+  model: string;
+  via: string;
+  status: IntegrationConnectionStatus;
+  latencyMs: number | null;
+  error: string | null;
+  checkedAt: string;
+}
 
 export interface TextChunk {
   index: number;
@@ -63,6 +75,19 @@ const SYSTEM_INSTRUCTION =
   "You are a precision data-extraction engine. Return valid JSON ONLY with a top-level 'records' array. " +
   "Extract strictly from the provided source text. Never fabricate URLs, dates, metrics, or descriptions. " +
   "Use null or 'Unknown' if a field is absent in the text.";
+
+export function redactSecrets(input: string): string {
+  if (!input) return input;
+  return input
+    .replace(/\bAIza[0-9A-Za-z_-]{16,}\b/g, "[REDACTED_KEY]")
+    .replace(/\bgsk_[0-9A-Za-z_-]{12,}\b/g, "[REDACTED_KEY]")
+    .replace(/\bsk-[0-9A-Za-z_-]{12,}\b/g, "[REDACTED_KEY]")
+    .replace(/\bgh[pou]_[0-9A-Za-z]{16,}\b/g, "[REDACTED_TOKEN]")
+    .replace(/\bgithub_pat_[0-9A-Za-z_]{16,}\b/g, "[REDACTED_TOKEN]")
+    .replace(/\bya29\.[0-9A-Za-z_-]{16,}\b/g, "[REDACTED_TOKEN]")
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, "$1[REDACTED]")
+    .replace(/([?&](?:key|api_key|token|access_token)=)[^&\s"']+/gi, "$1[REDACTED]");
+}
 
 export function estimateTokens(text: string): number {
   if (!text) return 0;
@@ -235,25 +260,33 @@ function buildExtractionPrompt(category: string, sourceUrl: string, chunkBody: s
 
 export interface LLMProvider {
   readonly providerName: string;
+  readonly model?: string;
+  readonly via?: string;
   isConfigured(): boolean;
-  generateJson(prompt: string, systemInstruction?: string): Promise<Record<string, unknown>>;
+  generateJson(
+    prompt: string,
+    systemInstruction?: string,
+    opts?: { timeoutMs?: number }
+  ): Promise<Record<string, unknown>>;
 }
 
 function classifyHttpError(providerName: string, status: number, bodyText: string, retryAfterHeader: string | null): Error {
-  const lower = bodyText.toLowerCase();
+  const safeBody = redactSecrets(bodyText);
+  const lower = safeBody.toLowerCase();
   if (
     status === 413 ||
     lower.includes("context length") ||
     lower.includes("token limit") ||
     lower.includes("maximum context") ||
     lower.includes("too many tokens") ||
-    lower.includes("payload too large")
+    lower.includes("payload too large") ||
+    lower.includes("request entity too large")
   ) {
-    return new PayloadTooLargeError(`${providerName} context/payload limit (${status})`);
+    return new PayloadTooLargeError(`${providerName} context/payload limit (HTTP ${status})`);
   }
   if (status === 429) {
     const sec = retryAfterHeader && /^\d+$/.test(retryAfterHeader.trim()) ? Number(retryAfterHeader) * 1000 : null;
-    return new RateLimitError(`${providerName} rate limit (429)`, sec);
+    return new RateLimitError(`${providerName} rate limit (HTTP 429)`, sec);
   }
   if (status === 401 || status === 403) {
     return new FatalProviderError(`${providerName} authentication error (HTTP ${status})`);
@@ -261,77 +294,124 @@ function classifyHttpError(providerName: string, status: number, bodyText: strin
   if (status >= 500) {
     return new TransientProviderError(`${providerName} upstream server error (HTTP ${status})`);
   }
-  return new FatalProviderError(`${providerName} client error (HTTP ${status}): ${bodyText.slice(0, 200)}`);
+  return new FatalProviderError(`${providerName} client error (HTTP ${status}): ${safeBody.slice(0, 200)}`);
 }
 
 export class GeminiLLMProvider implements LLMProvider {
   public readonly providerName = "gemini";
+  public readonly model: string;
+  public readonly via = "google-genai";
   private readonly apiKey: string | null;
-  private readonly model: string;
+  private readonly timeoutMs: number;
 
-  constructor(apiKey: string | null, model: string) {
+  constructor(apiKey: string | null, model: string, timeoutMs = 25_000) {
     this.apiKey = apiKey;
     this.model = model;
+    this.timeoutMs = timeoutMs;
   }
 
   public isConfigured(): boolean {
     return Boolean(this.apiKey && this.apiKey.trim());
   }
 
-  public async generateJson(prompt: string, systemInstruction = SYSTEM_INSTRUCTION): Promise<Record<string, unknown>> {
+  public async generateJson(
+    prompt: string,
+    systemInstruction = SYSTEM_INSTRUCTION,
+    opts?: { timeoutMs?: number }
+  ): Promise<Record<string, unknown>> {
     if (!this.isConfigured()) {
       throw new FatalProviderError("GEMINI_API_KEY is not configured");
     }
+    const effectiveTimeoutMs = opts?.timeoutMs ?? this.timeoutMs;
     const ai = new GoogleGenAI({
       apiKey: this.apiKey!,
       httpOptions: {
+        timeout: effectiveTimeoutMs,
         headers: {
           "User-Agent": "aistudio-build",
         },
       },
     });
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(new TransientProviderError(`gemini request timeout after ${effectiveTimeoutMs}ms`));
+      }, effectiveTimeoutMs);
+    });
+
     const isGemini4Series = this.model.startsWith("gemini-4-");
     try {
-      const response = await ai.models.generateContent({
-        model: this.model,
-        contents: prompt,
-        config: isGemini4Series
-          ? {
-              systemInstruction,
-              responseMimeType: "application/json",
-            }
-          : {
-              systemInstruction,
-              responseMimeType: "application/json",
-              temperature: 0,
-            },
-      });
+      const response = await Promise.race([
+        ai.models.generateContent({
+          model: this.model,
+          contents: prompt,
+          config: isGemini4Series
+            ? {
+                systemInstruction,
+                responseMimeType: "application/json",
+                abortSignal: controller.signal,
+              }
+            : {
+                systemInstruction,
+                responseMimeType: "application/json",
+                temperature: 0,
+                abortSignal: controller.signal,
+              },
+        }),
+        timeoutPromise,
+      ]);
       return parseJsonResponse(response.text ?? "");
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      if (
+        err instanceof MalformedJSONError ||
+        err instanceof PayloadTooLargeError ||
+        err instanceof RateLimitError ||
+        err instanceof FatalProviderError ||
+        err instanceof TransientProviderError
+      ) {
+        throw err;
+      }
+      const msg = redactSecrets(err instanceof Error ? err.message : String(err));
       const lower = msg.toLowerCase();
-      if (err instanceof MalformedJSONError) throw err;
+      if (err instanceof Error && err.name === "AbortError") {
+        throw new TransientProviderError(`gemini request timeout after ${effectiveTimeoutMs}ms`);
+      }
       if (lower.includes("413") || lower.includes("token") || lower.includes("context") || lower.includes("too large")) {
         throw new PayloadTooLargeError(`gemini context/payload limit: ${msg}`);
       }
       if (lower.includes("429") || lower.includes("quota") || lower.includes("resource_exhausted")) {
-        throw new RateLimitError(`gemini rate limit: ${msg}`);
+        throw new RateLimitError(`gemini rate limit (429): ${msg}`);
       }
-      if (lower.includes("401") || lower.includes("403") || lower.includes("api key")) {
-        throw new FatalProviderError(`gemini auth error: ${msg}`);
+      if (
+        lower.includes("401") ||
+        lower.includes("403") ||
+        lower.includes("404") ||
+        lower.includes("api key") ||
+        lower.includes("not found") ||
+        lower.includes("permission_denied") ||
+        lower.includes("unauthenticated")
+      ) {
+        throw new FatalProviderError(`gemini auth/model error: ${msg}`);
       }
       throw new TransientProviderError(`gemini request error: ${msg}`);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 }
 
 export class OpenAICompatibleLLMProvider implements LLMProvider {
   public readonly providerName: string;
+  public readonly model: string;
+  public readonly via: string;
   private readonly opts: {
     providerName: string;
     apiKey: string | null;
     model: string;
     endpointUrl: string;
+    via?: string;
     timeoutMs?: number;
   };
 
@@ -340,22 +420,30 @@ export class OpenAICompatibleLLMProvider implements LLMProvider {
     apiKey: string | null;
     model: string;
     endpointUrl: string;
+    via?: string;
     timeoutMs?: number;
   }) {
     this.opts = opts;
     this.providerName = opts.providerName;
+    this.model = opts.model;
+    this.via = opts.via || opts.providerName;
   }
 
   public isConfigured(): boolean {
     return Boolean(this.opts.apiKey && this.opts.apiKey.trim());
   }
 
-  public async generateJson(prompt: string, systemInstruction = SYSTEM_INSTRUCTION): Promise<Record<string, unknown>> {
+  public async generateJson(
+    prompt: string,
+    systemInstruction = SYSTEM_INSTRUCTION,
+    opts?: { timeoutMs?: number }
+  ): Promise<Record<string, unknown>> {
     if (!this.isConfigured()) {
       throw new FatalProviderError(`${this.providerName} API key is not configured`);
     }
+    const timeoutMs = opts?.timeoutMs ?? this.opts.timeoutMs ?? 25_000;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.opts.timeoutMs ?? 25_000);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const resp = await fetch(this.opts.endpointUrl, {
         method: "POST",
@@ -394,7 +482,12 @@ export class OpenAICompatibleLLMProvider implements LLMProvider {
       ) {
         throw err;
       }
-      const msg = err instanceof Error ? (err.name === "AbortError" ? "timeout" : err.message) : String(err);
+      const msg =
+        err instanceof Error
+          ? err.name === "AbortError"
+            ? `request timeout after ${timeoutMs}ms`
+            : redactSecrets(err.message)
+          : redactSecrets(String(err));
       throw new TransientProviderError(`${this.providerName} network error: ${msg}`);
     } finally {
       clearTimeout(timer);
@@ -571,6 +664,7 @@ export interface LLMExtractionResult {
   chunksProcessed: number;
   subChunksSplit: number;
   attemptedProviders: string[];
+  fallbackLog: string[];
   errors: string[];
 }
 
@@ -600,9 +694,66 @@ export class LLMRouter {
     return this.providers.some((p) => p.isConfigured());
   }
 
+  public async probeProviders(opts?: { timeoutMs?: number }): Promise<LLMProviderProbeResult[]> {
+    const timeoutMs = opts?.timeoutMs ?? 12_000;
+    const probePrompt = 'Return JSON {"ok": true} only.';
+    const probeSystem = 'Return valid JSON object {"ok": true} only.';
+
+    return Promise.all(
+      this.providers.map(async (provider): Promise<LLMProviderProbeResult> => {
+        const checkedAt = new Date().toISOString();
+        const model = provider.model || "default";
+        const via = provider.via || provider.providerName;
+
+        if (!provider.isConfigured()) {
+          return {
+            provider: provider.providerName,
+            model,
+            via,
+            status: "Not Configured",
+            latencyMs: null,
+            error: "API key is not configured.",
+            checkedAt,
+          };
+        }
+
+        const startedAt = Date.now();
+        try {
+          await provider.generateJson(probePrompt, probeSystem, { timeoutMs });
+          return {
+            provider: provider.providerName,
+            model,
+            via,
+            status: "Configured",
+            latencyMs: Date.now() - startedAt,
+            error: null,
+            checkedAt,
+          };
+        } catch (err) {
+          const safeError = redactSecrets(err instanceof Error ? err.message : String(err));
+          return {
+            provider: provider.providerName,
+            model,
+            via,
+            status: "Connection Failed",
+            latencyMs: Date.now() - startedAt,
+            error: safeError,
+            checkedAt,
+          };
+        }
+      })
+    );
+  }
+
   private async callProviders(
-    prompt: string
-  ): Promise<{ payload: Record<string, unknown>; providerName: string; attemptedProviders: string[] }> {
+    prompt: string,
+    onLog?: (msg: string) => void
+  ): Promise<{
+    payload: Record<string, unknown>;
+    providerName: string;
+    attemptedProviders: string[];
+    fallbackLog: string[];
+  }> {
     const configured = this.providers.filter((p) => p.isConfigured());
     if (configured.length === 0) {
       throw new FatalProviderError(
@@ -612,16 +763,34 @@ export class LLMRouter {
 
     const errors: string[] = [];
     const attemptedProviders: string[] = [];
-    for (const provider of configured) {
+    const fallbackLog: string[] = [];
+    for (let idx = 0; idx < configured.length; idx++) {
+      const provider = configured[idx];
       attemptedProviders.push(provider.providerName);
       try {
         const payload = await runWithRetry(() => provider.generateJson(prompt), 3);
-        return { payload, providerName: provider.providerName, attemptedProviders };
+        const successMsg =
+          idx === 0
+            ? `[LLMRouter] Primary provider '${provider.providerName}' succeeded.`
+            : `[LLMRouter] Fallback provider '${provider.providerName}' succeeded after prior failure(s).`;
+        fallbackLog.push(successMsg);
+        onLog?.(successMsg);
+        return { payload, providerName: provider.providerName, attemptedProviders, fallbackLog };
       } catch (err) {
         if (err instanceof PayloadTooLargeError) {
+          const splitMsg = `[LLMRouter] Provider '${provider.providerName}' hit payload/context limit (${redactSecrets(err.message)}); splitting into smaller chunks.`;
+          fallbackLog.push(splitMsg);
+          onLog?.(splitMsg);
           throw err;
         }
-        errors.push(`${provider.providerName}: ${err instanceof Error ? err.message : String(err)}`);
+        const safeReason = redactSecrets(err instanceof Error ? err.message : String(err));
+        errors.push(`${provider.providerName}: ${safeReason}`);
+        const nextProvider = configured[idx + 1]?.providerName;
+        const failMsg = nextProvider
+          ? `[LLMRouter] Provider '${provider.providerName}' failed (${safeReason}); falling back to '${nextProvider}'.`
+          : `[LLMRouter] Provider '${provider.providerName}' failed (${safeReason}); no remaining fallback providers.`;
+        fallbackLog.push(failMsg);
+        onLog?.(failMsg);
       }
     }
     throw new Error(`All configured LLM providers failed: ${errors.join("; ")}`);
@@ -632,21 +801,30 @@ export class LLMRouter {
     sourceUrl: string,
     text: string,
     tokenBudget: number,
-    depth = 0
+    depth = 0,
+    onLog?: (msg: string) => void
   ): Promise<{
     rawRecords: Array<Record<string, unknown>>;
     providerUsed: string | null;
     attemptedProviders: string[];
+    fallbackLog: string[];
     subSplits: number;
     errors: string[];
   }> {
     const prompt = buildExtractionPrompt(category, sourceUrl, text);
     try {
-      const { payload, providerName, attemptedProviders } = await this.callProviders(prompt);
+      const { payload, providerName, attemptedProviders, fallbackLog } = await this.callProviders(prompt, onLog);
       const recs = Array.isArray(payload.records)
         ? payload.records.filter((r): r is Record<string, unknown> => Boolean(r && typeof r === "object"))
         : [];
-      return { rawRecords: recs, providerUsed: providerName, attemptedProviders, subSplits: 0, errors: [] };
+      return {
+        rawRecords: recs,
+        providerUsed: providerName,
+        attemptedProviders,
+        fallbackLog,
+        subSplits: 0,
+        errors: [],
+      };
     } catch (err) {
       if (err instanceof PayloadTooLargeError && depth < 4 && tokenBudget > 250) {
         const nextBudget = Math.max(250, Math.floor(tokenBudget / 2));
@@ -656,13 +834,15 @@ export class LLMRouter {
         });
         const merged: Array<Record<string, unknown>> = [];
         const subErrors: string[] = [];
+        const fallbackLogs: string[] = [];
         const attemptedSet = new Set<string>();
         let lastProvider: string | null = null;
         let totalSplits = 1;
         for (const sub of subChunks) {
-          const res = await this.extractChunkRecursive(category, sourceUrl, sub.text, nextBudget, depth + 1);
+          const res = await this.extractChunkRecursive(category, sourceUrl, sub.text, nextBudget, depth + 1, onLog);
           merged.push(...res.rawRecords);
           subErrors.push(...res.errors);
+          fallbackLogs.push(...res.fallbackLog);
           for (const p of res.attemptedProviders) attemptedSet.add(p);
           totalSplits += res.subSplits;
           if (res.providerUsed) lastProvider = res.providerUsed;
@@ -671,6 +851,7 @@ export class LLMRouter {
           rawRecords: merged,
           providerUsed: lastProvider,
           attemptedProviders: Array.from(attemptedSet),
+          fallbackLog: fallbackLogs,
           subSplits: totalSplits,
           errors: subErrors,
         };
@@ -679,8 +860,9 @@ export class LLMRouter {
         rawRecords: [],
         providerUsed: null,
         attemptedProviders: [],
+        fallbackLog: [],
         subSplits: 0,
-        errors: [err instanceof Error ? err.message : String(err)],
+        errors: [redactSecrets(err instanceof Error ? err.message : String(err))],
       };
     }
   }
@@ -691,6 +873,7 @@ export class LLMRouter {
     sourceName: string;
     sourceText: string;
     allowHeuristicFallback?: boolean;
+    onLog?: (msg: string) => void;
   }): Promise<LLMExtractionResult> {
     const result: LLMExtractionResult = {
       category: opts.category,
@@ -702,6 +885,7 @@ export class LLMRouter {
       chunksProcessed: 0,
       subChunksSplit: 0,
       attemptedProviders: [],
+      fallbackLog: [],
       errors: [],
     };
 
@@ -717,6 +901,8 @@ export class LLMRouter {
         result.mode = "heuristic_demo_fallback";
         result.llmConnected = false;
         result.errors.push(`${msg} Executed deterministic heuristic fallback (records marked Unverified).`);
+        result.fallbackLog.push(`[LLMRouter] ${msg} Using deterministic heuristic fallback.`);
+        opts.onLog?.(`[LLMRouter] ${msg} Using deterministic heuristic fallback.`);
         result.chunksProcessed = 1;
         result.records = extractWithHeuristicDemo(
           opts.category,
@@ -744,7 +930,9 @@ export class LLMRouter {
         opts.category,
         opts.sourceUrl,
         chunk.text,
-        this.maxInputTokens
+        this.maxInputTokens,
+        0,
+        opts.onLog
       );
       if (chunkRes.providerUsed) {
         result.providerUsed = chunkRes.providerUsed;
@@ -752,6 +940,7 @@ export class LLMRouter {
         result.llmConnected = true;
       }
       for (const p of chunkRes.attemptedProviders) attemptedSet.add(p);
+      result.fallbackLog.push(...chunkRes.fallbackLog);
       result.subChunksSplit += chunkRes.subSplits;
       result.errors.push(...chunkRes.errors);
 

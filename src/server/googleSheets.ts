@@ -8,6 +8,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { AtlasDatabase, TabExportStatus } from "./atlasDb.ts";
+import { type IntegrationConnectionStatus, redactSecrets } from "./llmRouter.ts";
 export type { TabExportStatus } from "./atlasDb.ts";
 
 export interface ExportSpec {
@@ -258,6 +259,7 @@ export interface GoogleSheetsConfig {
   spreadsheetId: string | null;
   spreadsheetName: string;
   apiBaseUrl?: string; // Overrideable for local integration tests
+  driveApiBaseUrl?: string; // Overrideable for local integration tests
   oauthTokenUrl?: string;
 }
 
@@ -297,6 +299,7 @@ export interface SheetsConnectionStatus {
 export class GoogleSheetsService {
   private cachedToken: { token: string; expiresAtMs: number } | null = null;
   private readonly apiBase: string;
+  private readonly driveApiBase: string;
   private readonly config: GoogleSheetsConfig;
   private readonly db: AtlasDatabase;
 
@@ -304,6 +307,7 @@ export class GoogleSheetsService {
     this.config = config;
     this.db = db;
     this.apiBase = (config.apiBaseUrl || "https://sheets.googleapis.com/v4").replace(/\/+$/, "");
+    this.driveApiBase = (config.driveApiBaseUrl || "https://www.googleapis.com/drive/v3").replace(/\/+$/, "");
   }
 
   private resolveCredentialsPath(): string | null {
@@ -458,12 +462,13 @@ export class GoogleSheetsService {
     throw lastError instanceof Error ? lastError : new Error("Google Sheets request failed");
   }
 
-  private async sheetsJson<T>(
+  private async apiJson<T>(
+    baseUrl: string,
     accessToken: string,
     pathSuffix: string,
     opts: { method?: string; body?: unknown } = {}
   ): Promise<T> {
-    const resp = await this.fetchWithQuotaRetry(`${this.apiBase}${pathSuffix}`, {
+    const resp = await this.fetchWithQuotaRetry(`${baseUrl}${pathSuffix}`, {
       method: opts.method ?? "GET",
       headers: {
         Authorization: `Bearer ${accessToken}`,
@@ -481,15 +486,15 @@ export class GoogleSheetsService {
       }
     }
     if (!resp.ok) {
-      const apiMsg = (parsed as { error?: { message?: string } })?.error?.message;
+      const apiMsg = redactSecrets((parsed as { error?: { message?: string } })?.error?.message || "");
       if (resp.status === 401) {
         throw new Error(
-          `Google Sheets authentication expired or unauthorized (HTTP 401${apiMsg ? `: ${apiMsg}` : ""}). Re-authenticate with Google or check your Service Account credentials.`
+          `Google Workspace authentication expired or unauthorized (HTTP 401${apiMsg ? `: ${apiMsg}` : ""}). Re-authenticate with Google or check your Service Account credentials.`
         );
       }
       if (resp.status === 403) {
         throw new Error(
-          `Google Sheets permission denied (HTTP 403${apiMsg ? `: ${apiMsg}` : ""}). Ensure the Google Sheets API is enabled and the spreadsheet is shared with Editor access.`
+          `Google Workspace permission denied (HTTP 403${apiMsg ? `: ${apiMsg}` : ""}). Ensure the Google Sheets & Drive APIs are enabled and permissions (drive.file, spreadsheets) were granted.`
         );
       }
       if (resp.status === 404) {
@@ -497,10 +502,26 @@ export class GoogleSheetsService {
           `Google Spreadsheet not found (HTTP 404${apiMsg ? `: ${apiMsg}` : ""}). Verify GOOGLE_SHEETS_SPREADSHEET_ID or leave it blank to create a new spreadsheet.`
         );
       }
-      const errMsg = apiMsg || `Google Sheets API HTTP ${resp.status}`;
+      const errMsg = apiMsg || `Google Workspace API HTTP ${resp.status}`;
       throw new Error(errMsg);
     }
     return parsed as T;
+  }
+
+  private async sheetsJson<T>(
+    accessToken: string,
+    pathSuffix: string,
+    opts: { method?: string; body?: unknown } = {}
+  ): Promise<T> {
+    return this.apiJson<T>(this.apiBase, accessToken, pathSuffix, opts);
+  }
+
+  private async driveJson<T>(
+    accessToken: string,
+    pathSuffix: string,
+    opts: { method?: string; body?: unknown } = {}
+  ): Promise<T> {
+    return this.apiJson<T>(this.driveApiBase, accessToken, pathSuffix, opts);
   }
 
   private resolveTargetSpreadsheetId(overrideId?: string | null): string | null {
@@ -844,6 +865,12 @@ export class GoogleSheetsService {
           `/spreadsheets/${targetId}?fields=spreadsheetId,spreadsheetUrl`
         );
         spreadsheetUrl = meta.spreadsheetUrl || `https://docs.google.com/spreadsheets/d/${targetId}`;
+      } else {
+        // Real live API check against Google Drive drive.file scope when no spreadsheet ID exists yet
+        await this.driveJson<{ files?: Array<{ id?: string; name?: string }> }>(
+          token,
+          "/files?pageSize=1&fields=files(id,name)"
+        );
       }
       this.db.saveSheetsSyncState({
         status: "Connected",
@@ -859,6 +886,7 @@ export class GoogleSheetsService {
         lastError: null,
       });
     } catch (err) {
+      const safeErr = redactSecrets(err instanceof Error ? err.message : String(err));
       this.db.saveSheetsSyncState({
         status: "Sync Failed",
         spreadsheetId: this.safeResolveTargetSpreadsheetId(opts?.spreadsheetId),
@@ -870,10 +898,66 @@ export class GoogleSheetsService {
         rowsAdded: prev?.rowsAdded ?? 0,
         rowsUpdated: prev?.rowsUpdated ?? 0,
         rowsUnchanged: prev?.rowsUnchanged ?? 0,
-        lastError: err instanceof Error ? err.message : String(err),
+        lastError: safeErr,
       });
     }
     return this.getStatus();
+  }
+
+  public async probeHealth(opts?: {
+    oauthAccessToken?: string | null;
+    spreadsheetId?: string | null;
+  }): Promise<{
+    status: IntegrationConnectionStatus;
+    error: string | null;
+    detail: string;
+    credentialSource: "oauth" | "path" | "json_env" | null;
+    spreadsheetId: string | null;
+    spreadsheetUrl: string | null;
+    checkedAt: string;
+  }> {
+    const checkedAt = new Date().toISOString();
+    const hasOauth = Boolean(opts?.oauthAccessToken?.trim());
+    const saSource = this.getCredentialSource();
+    const credentialSource: "oauth" | "path" | "json_env" | null = hasOauth ? "oauth" : saSource;
+
+    if (!hasOauth && !saSource) {
+      const saved = this.db.getSheetsSyncState();
+      return {
+        status: "Not Configured",
+        error: null,
+        detail: "No active Google OAuth token or Service Account credentials. Click 'Sign in with Google' to authorize Drive (drive.file) & Sheets.",
+        credentialSource: null,
+        spreadsheetId: this.safeResolveTargetSpreadsheetId(opts?.spreadsheetId) ?? saved?.spreadsheetId ?? null,
+        spreadsheetUrl: saved?.spreadsheetUrl ?? null,
+        checkedAt,
+      };
+    }
+
+    const verified = await this.verifyConnection(opts);
+    if (verified.status === "Connected") {
+      return {
+        status: "Configured",
+        error: null,
+        detail: verified.spreadsheetId
+          ? `Verified live ${credentialSource === "oauth" ? "Google OAuth" : "Service Account"} access to spreadsheet ${verified.spreadsheetId}.`
+          : `Verified live ${credentialSource === "oauth" ? "Google OAuth" : "Service Account"} Drive (drive.file) & Sheets readiness.`,
+        credentialSource,
+        spreadsheetId: verified.spreadsheetId,
+        spreadsheetUrl: verified.spreadsheetUrl,
+        checkedAt,
+      };
+    }
+
+    return {
+      status: "Connection Failed",
+      error: verified.lastError || "Google Workspace verification failed.",
+      detail: verified.lastError || "Google Workspace verification failed.",
+      credentialSource,
+      spreadsheetId: verified.spreadsheetId,
+      spreadsheetUrl: verified.spreadsheetUrl,
+      checkedAt,
+    };
   }
 
   public async exportOrSync(

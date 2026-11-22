@@ -7,8 +7,11 @@ import {
   type EntityMappingLogInput,
   type JobInput,
   type NewsInput,
+  type PipelineRunRecord,
   type ProductInput,
   type ResearchPaperInput,
+  type SchedulerStateRecord,
+  type SourceOutcomeRecord,
   type StartupInput,
   type VerificationStatus,
   sha256Prefix,
@@ -23,8 +26,10 @@ import {
 import { PoliteHttpClient } from "./httpClient.ts";
 import {
   GeminiLLMProvider,
+  type IntegrationConnectionStatus,
   LLMRouter,
   OpenAICompatibleLLMProvider,
+  redactSecrets,
 } from "./llmRouter.ts";
 
 export interface AtlasConfig {
@@ -34,6 +39,8 @@ export interface AtlasConfig {
   exportsDir: string;
   dbPath: string;
   freshnessWindowHours: number;
+  dailyCollectionUtcTime: string;
+  dailyCollectionEnabled: boolean;
   targetStartups: number;
   targetProducts: number;
   targetResearchPapers: number;
@@ -58,15 +65,52 @@ export interface AtlasConfig {
   googleSheetsSpreadsheetName: string;
 }
 
+export function normalizeUtcTimeHHMM(raw: string | null | undefined, fallback = "02:00"): string {
+  const s = (raw ?? "").trim();
+  const m = s.match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return fallback;
+  const hh = Number(m[1]);
+  const mm = Number(m[2]);
+  if (!Number.isInteger(hh) || !Number.isInteger(mm) || hh < 0 || hh > 23 || mm < 0 || mm > 59) {
+    return fallback;
+  }
+  return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
+}
+
+export function computeNextUtcRunIso(
+  utcTime: string,
+  now: Date = new Date(),
+  lastScheduledAt?: string | null
+): string {
+  const normalized = normalizeUtcTimeHHMM(utcTime, "02:00");
+  const [hhStr, mmStr] = normalized.split(":");
+  const hh = Number(hhStr);
+  const mm = Number(mmStr);
+  const candidate = new Date(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), hh, mm, 0, 0)
+  );
+  const lastMs = lastScheduledAt ? Date.parse(lastScheduledAt) : Number.NaN;
+  if (candidate.getTime() <= now.getTime() || (Number.isFinite(lastMs) && candidate.getTime() <= lastMs)) {
+    candidate.setUTCDate(candidate.getUTCDate() + 1);
+  }
+  return candidate.toISOString();
+}
+
 export function loadAtlasConfig(atlasDir: string): AtlasConfig {
   const rootDir = path.resolve(atlasDir, "..");
   const dataDir = path.resolve(atlasDir, "data");
   const exportsDir = path.resolve(dataDir, "exports");
-  const rawDbUrl = process.env.DATABASE_URL || "sqlite:///data/frontier_atlas.db";
-  let dbPath = path.resolve(dataDir, "frontier_atlas.db");
+  const rawDbUrl = process.env.DATABASE_URL || "sqlite:///data/frontier_atlas_recovered.db";
+  const recoveredDefaultPath = path.resolve(dataDir, "frontier_atlas_recovered.db");
+  let dbPath = recoveredDefaultPath;
   if (rawDbUrl.startsWith("sqlite:///")) {
     const rel = rawDbUrl.slice("sqlite:///".length);
-    dbPath = path.isAbsolute(rel) ? rel : path.resolve(atlasDir, rel);
+    const resolved = path.isAbsolute(rel) ? rel : path.resolve(atlasDir, rel);
+    // Guard against legacy container/env DATABASE_URL pointing to the corrupted original frontier_atlas.db
+    dbPath =
+      path.basename(resolved) === "frontier_atlas.db" && fs.existsSync(recoveredDefaultPath)
+        ? recoveredDefaultPath
+        : resolved;
   }
   const parseIntEnv = (val: string | undefined, def: number) => {
     const n = Number(val);
@@ -87,6 +131,8 @@ export function loadAtlasConfig(atlasDir: string): AtlasConfig {
     exportsDir,
     dbPath,
     freshnessWindowHours: parseIntEnv(process.env.FRESHNESS_WINDOW_HOURS, 24),
+    dailyCollectionUtcTime: normalizeUtcTimeHHMM(process.env.DAILY_COLLECTION_UTC_TIME, "02:00"),
+    dailyCollectionEnabled: parseBoolEnv(process.env.DAILY_COLLECTION_ENABLED, true),
     targetStartups: 1000,
     targetProducts: 1000,
     targetResearchPapers: 1000,
@@ -100,9 +146,9 @@ export function loadAtlasConfig(atlasDir: string): AtlasConfig {
     groqApiKey: process.env.GROQ_API_KEY?.trim() || null,
     groqModel: process.env.GROQ_MODEL?.trim() || "llama-3.3-70b-versatile",
     llama3ApiKey: process.env.LLAMA3_API_KEY?.trim() || null,
-    llama3Model: process.env.LLAMA3_MODEL?.trim() || "meta-llama/Llama-3.3-70B-Instruct",
+    llama3Model: process.env.LLAMA3_MODEL?.trim() || "llama-3.1-8b-instant",
     llama3EndpointUrl:
-      process.env.LLAMA3_ENDPOINT_URL?.trim() || "https://api.together.xyz/v1/chat/completions",
+      process.env.LLAMA3_ENDPOINT_URL?.trim() || "https://api.groq.com/openai/v1/chat/completions",
     deepseekApiKey: process.env.DEEPSEEK_API_KEY?.trim() || null,
     deepseekModel: process.env.DEEPSEEK_MODEL?.trim() || "deepseek-chat",
     githubToken: process.env.GITHUB_TOKEN?.trim() || null,
@@ -392,21 +438,26 @@ function extractXmlTags(block: string, tagName: string): string[] {
   return results;
 }
 
-function createLLMRouter(config: AtlasConfig): LLMRouter {
+export function createLLMRouter(config: AtlasConfig): LLMRouter {
+  const llama3UsesGroq = !config.llama3EndpointUrl || config.llama3EndpointUrl.includes("api.groq.com");
+  const llama3EffectiveKey = config.llama3ApiKey || (llama3UsesGroq ? config.groqApiKey : null);
+
   return new LLMRouter([
-    new GeminiLLMProvider(config.geminiApiKey, config.geminiModel),
+    new GeminiLLMProvider(config.geminiApiKey, config.geminiModel, config.requestTimeoutMs),
     new OpenAICompatibleLLMProvider({
       providerName: "groq",
       apiKey: config.groqApiKey,
       model: config.groqModel,
       endpointUrl: "https://api.groq.com/openai/v1/chat/completions",
+      via: "groq",
       timeoutMs: config.requestTimeoutMs,
     }),
     new OpenAICompatibleLLMProvider({
       providerName: "llama3",
-      apiKey: config.llama3ApiKey,
+      apiKey: llama3EffectiveKey,
       model: config.llama3Model,
-      endpointUrl: config.llama3EndpointUrl,
+      endpointUrl: config.llama3EndpointUrl || "https://api.groq.com/openai/v1/chat/completions",
+      via: llama3UsesGroq ? "groq" : "custom_endpoint",
       timeoutMs: config.requestTimeoutMs,
     }),
     new OpenAICompatibleLLMProvider({
@@ -414,6 +465,7 @@ function createLLMRouter(config: AtlasConfig): LLMRouter {
       apiKey: config.deepseekApiKey,
       model: config.deepseekModel,
       endpointUrl: "https://api.deepseek.com/v1/chat/completions",
+      via: "deepseek",
       timeoutMs: config.requestTimeoutMs,
     }),
   ]);
@@ -1993,7 +2045,7 @@ export class EntityResolver {
 
   public resolve(opts: {
     rawName: string;
-    entityType: "startup" | "product" | "company";
+    entityType: "startup" | "product" | "company" | "publisher";
     website?: string | null;
     sourceUrl: string;
   }): string {
@@ -2148,6 +2200,12 @@ export class EntityResolver {
 
 type RawRecord = Record<string, unknown>;
 type CollectorError = { source: string; url: string; error: string };
+interface CollectionBatchResult {
+  records: RawRecord[];
+  errors: CollectorError[];
+  hasMore: boolean;
+  sourceOutcomes: SourceOutcomeRecord[];
+}
 
 const AI_ROLE_TITLE_OR_TAG_RE =
   /\b(ai|artificial intelligence|machine learning|deep learning|llm|large language model|generative ai|genai|nlp|natural language|computer vision|mlops|ai\/ml|data scien|robotics|foundation model|research scientist|research engineer|inference|alignment|transformer|rag|agentic|pytorch|tensorflow|neural|copilot|autonomous)\b/i;
@@ -2280,15 +2338,30 @@ async function collectStartups(
   llmRouter: LLMRouter,
   verifier: LiveSourceVerifier,
   limit: number,
-  page: number
-): Promise<{ records: RawRecord[]; errors: CollectorError[]; hasMore: boolean }> {
+  page: number,
+  onLog?: (msg: string) => void
+): Promise<CollectionBatchResult> {
   const url = "https://yc-oss.github.io/api/companies/all.json";
-  const res = await http.fetch(url, { timeoutMs: config.requestTimeoutMs });
+  const res = await http.fetch(url, { timeoutMs: config.requestTimeoutMs, maxAttempts: 2 });
   if (!res.ok) {
+    const errText = res.error || "fetch_failed";
     return {
       records: [],
-      errors: [{ source: "yc_oss_directory", url, error: res.error || "fetch_failed" }],
+      errors: [{ source: "yc_oss_directory", url, error: errText }],
       hasMore: false,
+      sourceOutcomes: [
+        {
+          category: "startups",
+          source: "yc_oss_directory",
+          url,
+          status: "failed",
+          discoveredCount: 0,
+          retried: res.attempts > 1,
+          attempts: res.attempts,
+          httpStatus: res.status || null,
+          error: errText,
+        },
+      ],
     };
   }
   verifier.seedSnapshot(url, res.status, res.content, res.contentType);
@@ -2297,10 +2370,24 @@ async function collectStartups(
   try {
     companies = JSON.parse(res.content);
   } catch (err) {
+    const errText = `invalid_json: ${String(err)}`;
     return {
       records: [],
-      errors: [{ source: "yc_oss_directory", url, error: `invalid_json: ${String(err)}` }],
+      errors: [{ source: "yc_oss_directory", url, error: errText }],
       hasMore: false,
+      sourceOutcomes: [
+        {
+          category: "startups",
+          source: "yc_oss_directory",
+          url,
+          status: "failed",
+          discoveredCount: 0,
+          retried: res.attempts > 1,
+          attempts: res.attempts,
+          httpStatus: res.status || null,
+          error: errText,
+        },
+      ],
     };
   }
   if (!Array.isArray(companies)) {
@@ -2308,6 +2395,19 @@ async function collectStartups(
       records: [],
       errors: [{ source: "yc_oss_directory", url, error: "unexpected_payload_shape" }],
       hasMore: false,
+      sourceOutcomes: [
+        {
+          category: "startups",
+          source: "yc_oss_directory",
+          url,
+          status: "failed",
+          discoveredCount: 0,
+          retried: res.attempts > 1,
+          attempts: res.attempts,
+          httpStatus: res.status || null,
+          error: "unexpected_payload_shape",
+        },
+      ],
     };
   }
 
@@ -2380,6 +2480,7 @@ async function collectStartups(
         sourceUrl: siteUrl,
         sourceName: "yc_oss_directory_llm",
         sourceText: text,
+        onLog,
       });
       const hit = llmRes.records[0];
       if (hit) {
@@ -2396,7 +2497,24 @@ async function collectStartups(
     }
   }
 
-  return { records, errors: [], hasMore };
+  return {
+    records,
+    errors: [],
+    hasMore,
+    sourceOutcomes: [
+      {
+        category: "startups",
+        source: "yc_oss_directory",
+        url,
+        status: records.length > 0 ? "ok" : "empty",
+        discoveredCount: records.length,
+        retried: res.attempts > 1,
+        attempts: res.attempts,
+        httpStatus: res.status || null,
+        error: null,
+      },
+    ],
+  };
 }
 
 async function collectProducts(
@@ -2405,9 +2523,10 @@ async function collectProducts(
   verifier: LiveSourceVerifier,
   limit: number,
   page: number
-): Promise<{ records: RawRecord[]; errors: CollectorError[]; hasMore: boolean }> {
+): Promise<CollectionBatchResult> {
   const safePage = Math.max(1, page);
   const errors: CollectorError[] = [];
+  const sourceOutcomes: SourceOutcomeRecord[] = [];
   const hfRecords: RawRecord[] = [];
   const ghRecords: RawRecord[] = [];
   const hnRecords: RawRecord[] = [];
@@ -2619,8 +2738,38 @@ async function collectProducts(
     pushUnique(r);
   }
 
+  const pushSourceSummary = (source: string, url: string, count: number) => {
+    const err = errors.find((e) => e.source === source || (source === "github_repositories" && e.source === "github_search"));
+    if (err && count === 0) {
+      sourceOutcomes.push({
+        category: "products",
+        source,
+        url: err.url,
+        status: "failed",
+        discoveredCount: 0,
+        retried: true,
+        attempts: 2,
+        error: err.error,
+      });
+    } else {
+      sourceOutcomes.push({
+        category: "products",
+        source,
+        url,
+        status: count > 0 ? "ok" : "empty",
+        discoveredCount: count,
+        retried: false,
+        attempts: 1,
+        error: err ? err.error : null,
+      });
+    }
+  };
+  pushSourceSummary("huggingface_spaces", "https://huggingface.co/api/spaces", hfRecords.length);
+  pushSourceSummary("github_repositories", "https://api.github.com/search/repositories", ghRecords.length);
+  pushSourceSummary("show_hn", "https://hn.algolia.com/api/v1/search_by_date?tags=show_hn", hnRecords.length);
+
   const finalRecords = merged.slice(0, limit);
-  return { records: finalRecords, errors, hasMore: finalRecords.length >= limit };
+  return { records: finalRecords, errors, hasMore: finalRecords.length >= limit, sourceOutcomes };
 }
 
 function reconstructOpenAlexAbstract(inv: unknown): string | null {
@@ -2643,27 +2792,53 @@ async function collectResearchPapers(
   verifier: LiveSourceVerifier,
   limit: number,
   page: number
-): Promise<{ records: RawRecord[]; errors: CollectorError[]; hasMore: boolean }> {
+): Promise<CollectionBatchResult> {
   const safePage = Math.max(1, page);
   const errors: CollectorError[] = [];
+  const sourceOutcomes: SourceOutcomeRecord[] = [];
   const hfPapers: RawRecord[] = [];
   const arxivPapers: RawRecord[] = [];
   const oaPapers: RawRecord[] = [];
   const crPapers: RawRecord[] = [];
   const nowIso = new Date().toISOString();
 
-  // 1. Hugging Face Daily Papers (includes direct githubRepo + githubStars!)
+  // 1. Hugging Face Daily Papers (includes direct githubRepo + githubStars + exact UTC publishedAt!)
   const fetchHfPapers = async () => {
     const url = "https://huggingface.co/api/daily_papers?limit=100";
-    const res = await http.fetch(url, { timeoutMs: config.requestTimeoutMs });
+    const res = await http.fetch(url, { timeoutMs: config.requestTimeoutMs, maxAttempts: 2 });
     if (!res.ok) {
-      errors.push({ source: "huggingface_daily_papers", url, error: res.error || "fetch_failed" });
+      const errText = res.error || "fetch_failed";
+      errors.push({ source: "huggingface_daily_papers", url, error: errText });
+      sourceOutcomes.push({
+        category: "research_papers",
+        source: "huggingface_daily_papers",
+        url,
+        status: "failed",
+        discoveredCount: 0,
+        retried: res.attempts > 1,
+        attempts: res.attempts,
+        httpStatus: res.status || null,
+        error: errText,
+      });
       return;
     }
     verifier.seedSnapshot(url, res.status, res.content, res.contentType);
     try {
       const arr = JSON.parse(res.content);
-      if (!Array.isArray(arr)) return;
+      if (!Array.isArray(arr)) {
+        sourceOutcomes.push({
+          category: "research_papers",
+          source: "huggingface_daily_papers",
+          url,
+          status: "empty",
+          discoveredCount: 0,
+          retried: res.attempts > 1,
+          attempts: res.attempts,
+          httpStatus: res.status || null,
+          error: null,
+        });
+        return;
+      }
       for (const item of arr as Array<Record<string, unknown>>) {
         const paper = (item.paper as Record<string, unknown> | undefined) ?? item;
         const paperIdRaw = String(paper.id ?? "").trim();
@@ -2678,7 +2853,9 @@ async function collectResearchPapers(
           .map((a) => String(a.name ?? (a.user as Record<string, unknown> | undefined)?.fullname ?? "").trim())
           .filter(Boolean);
         const abstract = String(paper.summary ?? item.summary ?? "").replace(/\s+/g, " ").trim() || null;
-        const pubDt = parseUtcDatetime(paper.publishedAt ?? item.publishedAt);
+        const pubMeta = parseUtcDatetimeWithMeta(paper.publishedAt ?? item.publishedAt);
+        const pubDt = pubMeta.date;
+        const pubAtIso = pubDt ? pubDt.toISOString() : null;
         const pubDate = pubDt ? pubDt.toISOString().slice(0, 10) : null;
         const ghRepo = validateOptionalUrl(paper.githubRepo) || findFirstGithubRepo(abstract);
         const ghStars = typeof paper.githubStars === "number" && paper.githubStars >= 0 ? paper.githubStars : null;
@@ -2687,6 +2864,7 @@ async function collectResearchPapers(
           abstract,
           authors,
           publication_date: pubDate,
+          published_at: pubAtIso,
           doi: null,
           arxiv_id: isArxivId ? paperIdRaw : null,
           github_repository: ghRepo ? findFirstGithubRepo(ghRepo) || ghRepo : null,
@@ -2697,6 +2875,8 @@ async function collectResearchPapers(
           collected_at: nowIso,
           source_metadata: {
             api_url: url,
+            published_at_utc: pubAtIso,
+            timestamp_precision: pubMeta.precision,
             upvotes: paper.upvotes ?? null,
             ai_keywords: Array.isArray(paper.ai_keywords) ? paper.ai_keywords : [],
             github_metrics: ghRepo
@@ -2705,22 +2885,55 @@ async function collectResearchPapers(
           },
         });
       }
+      sourceOutcomes.push({
+        category: "research_papers",
+        source: "huggingface_daily_papers",
+        url,
+        status: hfPapers.length > 0 ? "ok" : "empty",
+        discoveredCount: hfPapers.length,
+        retried: res.attempts > 1,
+        attempts: res.attempts,
+        httpStatus: res.status || null,
+        error: null,
+      });
     } catch (err) {
-      errors.push({ source: "huggingface_daily_papers", url, error: `invalid_json: ${String(err)}` });
+      const errText = `invalid_json: ${String(err)}`;
+      errors.push({ source: "huggingface_daily_papers", url, error: errText });
+      sourceOutcomes.push({
+        category: "research_papers",
+        source: "huggingface_daily_papers",
+        url,
+        status: "failed",
+        discoveredCount: 0,
+        retried: res.attempts > 1,
+        attempts: res.attempts,
+        httpStatus: res.status || null,
+        error: errText,
+      });
     }
   };
 
-  // 2. arXiv Atom API (100/page)
+  // 2. arXiv Atom API (100/page, exact UTC submitted timestamp)
   const fetchArxiv = async () => {
     const pagesNeeded = Math.min(6, Math.max(1, Math.ceil((limit * 0.4) / 100)));
+    let arxivErr: string | null = null;
+    let lastStatus: number | null = null;
+    let totalAttempts = 0;
+    const baseUrl = "https://export.arxiv.org/api/query";
     for (let offset = 0; offset < pagesNeeded && arxivPapers.length < limit; offset++) {
       const pIdx = safePage - 1 + offset;
       const start = pIdx * 100;
       const maxRes = Math.min(100, Math.max(10, limit));
-      const arxivUrl = `https://export.arxiv.org/api/query?search_query=${encodeURIComponent("cat:cs.AI OR cat:cs.LG OR cat:cs.CL")}&start=${start}&max_results=${maxRes}&sortBy=submittedDate&sortOrder=descending`;
-      const res = await http.fetch(arxivUrl, { timeoutMs: Math.max(config.requestTimeoutMs, 25000) });
+      const arxivUrl = `${baseUrl}?search_query=${encodeURIComponent("cat:cs.AI OR cat:cs.LG OR cat:cs.CL")}&start=${start}&max_results=${maxRes}&sortBy=submittedDate&sortOrder=descending`;
+      const res = await http.fetch(arxivUrl, {
+        timeoutMs: Math.max(config.requestTimeoutMs, 25000),
+        maxAttempts: 2,
+      });
+      totalAttempts = Math.max(totalAttempts, res.attempts);
+      lastStatus = res.status || lastStatus;
       if (!res.ok) {
-        errors.push({ source: "arxiv", url: arxivUrl, error: res.error || "fetch_failed" });
+        arxivErr = res.error || "fetch_failed";
+        errors.push({ source: "arxiv", url: arxivUrl, error: arxivErr });
         break;
       }
       verifier.seedSnapshot(arxivUrl, res.status, res.content, res.contentType);
@@ -2734,7 +2947,10 @@ async function collectResearchPapers(
         const arxivId = idUrl.replace(/\/+$/, "").split("/").pop() ?? null;
         const summary = extractXmlTag(entry, "summary")?.replace(/\s+/g, " ").trim() || null;
         const published = extractXmlTag(entry, "published");
-        const pubDate = published ? published.slice(0, 10) : null;
+        const pubMeta = parseUtcDatetimeWithMeta(published);
+        const pubDt = pubMeta.date;
+        const pubAtIso = pubDt ? pubDt.toISOString() : null;
+        const pubDate = pubDt ? pubDt.toISOString().slice(0, 10) : published ? published.slice(0, 10) : null;
         const comment = extractXmlTag(entry, "arxiv:comment");
         const doi = extractXmlTag(entry, "arxiv:doi");
         const authors = extractXmlTags(entry, "author")
@@ -2746,6 +2962,7 @@ async function collectResearchPapers(
           abstract: summary,
           authors,
           publication_date: pubDate,
+          published_at: pubAtIso,
           doi: doi || null,
           arxiv_id: arxivId,
           github_repository: githubRepo,
@@ -2754,22 +2971,45 @@ async function collectResearchPapers(
           source_name: "arxiv",
           source_url: normalizeUrl(idUrl),
           collected_at: nowIso,
-          source_metadata: { api_url: arxivUrl, comment },
+          source_metadata: {
+            api_url: arxivUrl,
+            published_at_utc: pubAtIso,
+            timestamp_precision: pubMeta.precision,
+            comment,
+          },
         });
       }
     }
+    sourceOutcomes.push({
+      category: "research_papers",
+      source: "arxiv",
+      url: baseUrl,
+      status: arxivPapers.length > 0 ? "ok" : arxivErr ? "failed" : "empty",
+      discoveredCount: arxivPapers.length,
+      retried: totalAttempts > 1,
+      attempts: Math.max(1, totalAttempts),
+      httpStatus: lastStatus,
+      error: arxivPapers.length === 0 ? arxivErr : null,
+    });
   };
 
-  // 3. OpenAlex API (100/page)
+  // 3. OpenAlex API (100/page, date-only metadata — never fabricate timestamps)
   const fetchOpenAlex = async () => {
     const pagesNeeded = Math.min(10, Math.max(1, Math.ceil((limit * 0.7) / 100)));
+    let oaErr: string | null = null;
+    let lastStatus: number | null = null;
+    let totalAttempts = 0;
+    const baseUrl = "https://api.openalex.org/works";
     for (let offset = 0; offset < pagesNeeded && oaPapers.length < limit; offset++) {
       const curPage = safePage + offset;
       const perPage = Math.min(100, Math.max(15, limit));
-      const oaUrl = `https://api.openalex.org/works?search=${encodeURIComponent("artificial intelligence")}&per-page=${perPage}&page=${curPage}&sort=publication_date:desc`;
-      const res = await http.fetch(oaUrl, { timeoutMs: config.requestTimeoutMs });
+      const oaUrl = `${baseUrl}?search=${encodeURIComponent("artificial intelligence")}&per-page=${perPage}&page=${curPage}&sort=publication_date:desc`;
+      const res = await http.fetch(oaUrl, { timeoutMs: config.requestTimeoutMs, maxAttempts: 2 });
+      totalAttempts = Math.max(totalAttempts, res.attempts);
+      lastStatus = res.status || lastStatus;
       if (!res.ok) {
-        errors.push({ source: "openalex", url: oaUrl, error: res.error || "fetch_failed" });
+        oaErr = res.error || "fetch_failed";
+        errors.push({ source: "openalex", url: oaUrl, error: oaErr });
         break;
       }
       verifier.seedSnapshot(oaUrl, res.status, res.content, res.contentType);
@@ -2799,11 +3039,18 @@ async function collectResearchPapers(
           const arxivId = landingUrl.toLowerCase().includes("arxiv")
             ? landingUrl.replace(/\/+$/, "").split("/").pop() ?? null
             : null;
+          const createdDt = parseUtcDatetimeWithMeta(work.created_date);
+          const pubDate = typeof work.publication_date === "string" ? work.publication_date : null;
+          const exactPubAt =
+            createdDt.date && typeof work.created_date === "string" && work.created_date.includes("T")
+              ? createdDt.date.toISOString()
+              : null;
           oaPapers.push({
             title,
             abstract,
             authors,
-            publication_date: typeof work.publication_date === "string" ? work.publication_date : null,
+            publication_date: pubDate,
+            published_at: exactPubAt,
             doi,
             arxiv_id: arxivId,
             github_repository: findFirstGithubRepo(abstract, title, landingUrl),
@@ -2814,6 +3061,8 @@ async function collectResearchPapers(
             collected_at: nowIso,
             source_metadata: {
               api_url: oaUrl,
+              published_at_utc: exactPubAt,
+              timestamp_precision: exactPubAt ? "verified_exact" : pubDate ? "date_only" : "unverified",
               openalex_id: oaId,
               openalex_api_url: oaApiUrl,
               cited_by_count: work.cited_by_count ?? null,
@@ -2822,22 +3071,41 @@ async function collectResearchPapers(
           });
         }
       } catch (err) {
-        errors.push({ source: "openalex", url: oaUrl, error: `invalid_json: ${String(err)}` });
+        oaErr = `invalid_json: ${String(err)}`;
+        errors.push({ source: "openalex", url: oaUrl, error: oaErr });
         break;
       }
     }
+    sourceOutcomes.push({
+      category: "research_papers",
+      source: "openalex",
+      url: baseUrl,
+      status: oaPapers.length > 0 ? "ok" : oaErr ? "failed" : "empty",
+      discoveredCount: oaPapers.length,
+      retried: totalAttempts > 1,
+      attempts: Math.max(1, totalAttempts),
+      httpStatus: lastStatus,
+      error: oaPapers.length === 0 ? oaErr : null,
+    });
   };
 
   // 4. Crossref API (100/page)
   const fetchCrossref = async () => {
     const pagesNeeded = Math.min(6, Math.max(1, Math.ceil((limit * 0.4) / 100)));
+    let crErr: string | null = null;
+    let lastStatus: number | null = null;
+    let totalAttempts = 0;
+    const baseUrl = "https://api.crossref.org/works";
     for (let offsetIdx = 0; offsetIdx < pagesNeeded && crPapers.length < limit; offsetIdx++) {
       const rows = Math.min(100, Math.max(10, limit));
       const offset = (safePage - 1 + offsetIdx) * rows;
-      const crUrl = `https://api.crossref.org/works?query=${encodeURIComponent("large language model")}&rows=${rows}&offset=${offset}&sort=published&order=desc`;
-      const res = await http.fetch(crUrl, { timeoutMs: config.requestTimeoutMs });
+      const crUrl = `${baseUrl}?query=${encodeURIComponent("large language model")}&rows=${rows}&offset=${offset}&sort=published&order=desc`;
+      const res = await http.fetch(crUrl, { timeoutMs: config.requestTimeoutMs, maxAttempts: 2 });
+      totalAttempts = Math.max(totalAttempts, res.attempts);
+      lastStatus = res.status || lastStatus;
       if (!res.ok) {
-        errors.push({ source: "crossref", url: crUrl, error: res.error || "fetch_failed" });
+        crErr = res.error || "fetch_failed";
+        errors.push({ source: "crossref", url: crUrl, error: crErr });
         break;
       }
       verifier.seedSnapshot(crUrl, res.status, res.content, res.contentType);
@@ -2864,11 +3132,14 @@ async function collectResearchPapers(
             Array.isArray(dateParts) && dateParts.length > 0
               ? dateParts.map((p, idx) => (idx > 0 ? String(p).padStart(2, "0") : String(p))).join("-")
               : null;
+          const createdDtRaw = (item.created as Record<string, unknown> | undefined)?.["date-time"];
+          const createdDt = parseUtcDatetime(createdDtRaw);
           crPapers.push({
             title,
             abstract,
             authors,
             publication_date: pubDate,
+            published_at: createdDt ? createdDt.toISOString() : null,
             doi: typeof item.DOI === "string" ? item.DOI : null,
             arxiv_id: null,
             github_repository: findFirstGithubRepo(abstract),
@@ -2877,26 +3148,55 @@ async function collectResearchPapers(
             source_name: "crossref",
             source_url: normalizeUrl(itemUrl),
             collected_at: nowIso,
-            source_metadata: { api_url: crUrl, publisher: item.publisher ?? null, type: item.type ?? null },
+            source_metadata: {
+              api_url: crUrl,
+              published_at_utc: createdDt ? createdDt.toISOString() : null,
+              timestamp_precision: createdDt ? "verified_exact" : pubDate ? "date_only" : "unverified",
+              publisher: item.publisher ?? null,
+              type: item.type ?? null,
+            },
           });
         }
       } catch (err) {
-        errors.push({ source: "crossref", url: crUrl, error: `invalid_json: ${String(err)}` });
+        crErr = `invalid_json: ${String(err)}`;
+        errors.push({ source: "crossref", url: crUrl, error: crErr });
         break;
       }
     }
+    sourceOutcomes.push({
+      category: "research_papers",
+      source: "crossref",
+      url: baseUrl,
+      status: crPapers.length > 0 ? "ok" : crErr ? "failed" : "empty",
+      discoveredCount: crPapers.length,
+      retried: totalAttempts > 1,
+      attempts: Math.max(1, totalAttempts),
+      httpStatus: lastStatus,
+      error: crPapers.length === 0 ? crErr : null,
+    });
   };
 
   await Promise.all([fetchHfPapers(), fetchArxiv(), fetchOpenAlex(), fetchCrossref()]);
 
-  // Interleave & deduplicate by normalized title / source_url
+  // Interleave & deduplicate by normalized source_url / arxiv_id / doi / normalized title
   const all: RawRecord[] = [];
   const seenKeys = new Set<string>();
   const addPaper = (rec: RawRecord) => {
     const key = String(rec.source_url).toLowerCase();
+    const arxivKey = rec.arxiv_id ? `ax:${String(rec.arxiv_id).toLowerCase().replace(/v\d+$/, "")}` : null;
+    const doiKey = rec.doi ? `doi:${String(rec.doi).toLowerCase()}` : null;
     const titleKey = normText(String(rec.title ?? ""));
-    if (seenKeys.has(key) || (titleKey && seenKeys.has(`t:${titleKey}`))) return;
+    if (
+      seenKeys.has(key) ||
+      (arxivKey && seenKeys.has(arxivKey)) ||
+      (doiKey && seenKeys.has(doiKey)) ||
+      (titleKey && seenKeys.has(`t:${titleKey}`))
+    ) {
+      return;
+    }
     seenKeys.add(key);
+    if (arxivKey) seenKeys.add(arxivKey);
+    if (doiKey) seenKeys.add(doiKey);
     if (titleKey) seenKeys.add(`t:${titleKey}`);
     all.push(rec);
   };
@@ -2946,13 +3246,22 @@ async function collectResearchPapers(
       }
       return;
     }
-    const headers: Record<string, string> = { Accept: "application/vnd.github+json" };
+    const headers: Record<string, string> = {
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+    };
     if (config.githubToken) headers.Authorization = `Bearer ${config.githubToken}`;
     const ghRes = await http.fetch(`https://api.github.com/repos/${slug}`, {
       headers,
       timeoutMs: 8000,
       maxAttempts: 1,
     });
+    const rlRemaining = ghRes.headers["x-ratelimit-remaining"] ?? null;
+    const rlLimit = ghRes.headers["x-ratelimit-limit"] ?? null;
+    const rlResetRaw = ghRes.headers["x-ratelimit-reset"];
+    const rlResetIso =
+      rlResetRaw && /^\d+$/.test(rlResetRaw.trim()) ? new Date(Number(rlResetRaw) * 1000).toISOString() : null;
+
     if (ghRes.status === 403 || ghRes.status === 429) {
       ghRateLimited = true;
       for (const rec of slugToRecords.get(slug) ?? []) {
@@ -2961,6 +3270,10 @@ async function collectResearchPapers(
           ...(typeof meta.github_metrics === "object" && meta.github_metrics ? meta.github_metrics : {}),
           stars: rec.github_stars ?? null,
           metrics_status: `rate_limited_http_${ghRes.status}`,
+          rate_limit_remaining: rlRemaining !== null ? Number(rlRemaining) : 0,
+          rate_limit_limit: rlLimit !== null ? Number(rlLimit) : null,
+          rate_limit_reset_at: rlResetIso,
+          authenticated: Boolean(config.githubToken),
           metrics_updated_at: metricsCheckedAt,
         };
         rec.source_metadata = meta;
@@ -2973,7 +3286,10 @@ async function collectResearchPapers(
         meta.github_metrics = {
           ...(typeof meta.github_metrics === "object" && meta.github_metrics ? meta.github_metrics : {}),
           stars: rec.github_stars ?? null,
-          metrics_status: ghRes.error || `http_${ghRes.status || 0}`,
+          metrics_status: redactSecrets(ghRes.error || `http_${ghRes.status || 0}`),
+          rate_limit_remaining: rlRemaining !== null ? Number(rlRemaining) : null,
+          rate_limit_reset_at: rlResetIso,
+          authenticated: Boolean(config.githubToken),
           metrics_updated_at: metricsCheckedAt,
         };
         rec.source_metadata = meta;
@@ -2991,6 +3307,10 @@ async function collectResearchPapers(
         language: ghJson.language ?? null,
         updated_at: ghJson.updated_at ?? null,
         metrics_updated_at: metricsCheckedAt,
+        rate_limit_remaining: rlRemaining !== null ? Number(rlRemaining) : null,
+        rate_limit_limit: rlLimit !== null ? Number(rlLimit) : null,
+        rate_limit_reset_at: rlResetIso,
+        authenticated: Boolean(config.githubToken),
         metrics_status: "verified_github_api",
       };
       for (const rec of slugToRecords.get(slug) ?? []) {
@@ -3021,7 +3341,7 @@ async function collectResearchPapers(
     }
   }
 
-  return { records: limited, errors, hasMore: limited.length >= limit };
+  return { records: limited, errors, hasMore: limited.length >= limit, sourceOutcomes };
 }
 
 async function collectJobs(
@@ -3030,11 +3350,16 @@ async function collectJobs(
   verifier: LiveSourceVerifier,
   limit: number,
   page: number
-): Promise<{ records: RawRecord[]; errors: CollectorError[]; hasMore: boolean }> {
+): Promise<CollectionBatchResult> {
   const safePage = Math.max(1, page);
   const errors: CollectorError[] = [];
+  const sourceOutcomes: SourceOutcomeRecord[] = [];
   const combined: RawRecord[] = [];
   const nowIso = new Date().toISOString();
+
+  const recordOutcome = (outcome: SourceOutcomeRecord) => {
+    sourceOutcomes.push(outcome);
+  };
 
   const tasks: Array<Promise<void>> = [];
 
@@ -3042,15 +3367,18 @@ async function collectJobs(
   tasks.push(
     (async () => {
       const remUrl = `https://remotive.com/api/remote-jobs?limit=${Math.min(200, Math.max(100, limit))}`;
-      const res = await http.fetch(remUrl, { timeoutMs: config.requestTimeoutMs });
+      const res = await http.fetch(remUrl, { timeoutMs: config.requestTimeoutMs, maxAttempts: 2 });
       if (!res.ok) {
-        errors.push({ source: "remotive", url: remUrl, error: res.error || "fetch_failed" });
+        const err = res.error || "fetch_failed";
+        errors.push({ source: "remotive", url: remUrl, error: err });
+        recordOutcome({ category: "jobs", source: "remotive", url: remUrl, status: "failed", discoveredCount: 0, retried: res.attempts > 1, attempts: res.attempts, httpStatus: res.status || null, error: err });
         return;
       }
       verifier.seedSnapshot(remUrl, res.status, res.content, res.contentType);
       try {
         const payload = JSON.parse(res.content) as Record<string, unknown>;
         const jobs = Array.isArray(payload.jobs) ? (payload.jobs as Array<Record<string, unknown>>) : [];
+        let added = 0;
         for (const job of jobs) {
           const title = String(job.title ?? "").trim();
           const company = String(job.company_name ?? "").trim();
@@ -3086,9 +3414,13 @@ async function collectJobs(
               remote_evidence: remoteInfo.evidence,
             },
           });
+          added++;
         }
+        recordOutcome({ category: "jobs", source: "remotive", url: remUrl, status: added > 0 ? "ok" : "empty", discoveredCount: added, retried: res.attempts > 1, attempts: res.attempts, httpStatus: res.status || null, error: null });
       } catch (err) {
-        errors.push({ source: "remotive", url: remUrl, error: `invalid_json: ${String(err)}` });
+        const errText = `invalid_json: ${String(err)}`;
+        errors.push({ source: "remotive", url: remUrl, error: errText });
+        recordOutcome({ category: "jobs", source: "remotive", url: remUrl, status: "failed", discoveredCount: 0, retried: res.attempts > 1, attempts: res.attempts, httpStatus: res.status || null, error: errText });
       }
     })()
   );
@@ -3467,13 +3799,50 @@ async function collectJobs(
     );
   }
 
+  // Finalize source outcomes for boards 2-9 based on combined + errors
   await Promise.all(tasks);
 
+  const countBySource = new Map<string, number>();
+  for (const r of combined) {
+    const sn = String(r.source_name ?? "");
+    countBySource.set(sn, (countBySource.get(sn) ?? 0) + 1);
+  }
+  const jobSourceSpecs: Array<[string, string]> = [
+    ["arbeitnow", "https://www.arbeitnow.com/api/job-board-api"],
+    ["weworkremotely", "https://weworkremotely.com/remote-jobs.rss"],
+    ["jobicy", "https://jobicy.com/api/v2/remote-jobs"],
+    ...["anthropic", "scaleai", "xai", "togetherai"].map(
+      (b): [string, string] => [`greenhouse:${b}`, `https://boards-api.greenhouse.io/v1/boards/${b}/jobs`]
+    ),
+    ...["openai", "perplexity", "cohere", "cursor", "elevenlabs", "harvey"].map(
+      (b): [string, string] => [`ashby:${b}`, `https://api.ashbyhq.com/posting-api/job-board/${b}`]
+    ),
+    ["himalayas", "https://himalayas.app/jobs/api/search?q=ai"],
+    ["remoteok", "https://remoteok.com/api"],
+    ...["palantir", "zoox"].map(
+      (b): [string, string] => [`lever:${b}`, `https://api.lever.co/v0/postings/${b}?mode=json`]
+    ),
+  ];
+  for (const [src, url] of jobSourceSpecs) {
+    const cnt = countBySource.get(src) ?? 0;
+    const err = errors.find((e) => e.source === src);
+    recordOutcome({
+      category: "jobs",
+      source: src,
+      url: err?.url ?? url,
+      status: cnt > 0 ? "ok" : err ? "failed" : "empty",
+      discoveredCount: cnt,
+      retried: true,
+      attempts: 2,
+      error: cnt === 0 && err ? err.error : null,
+    });
+  }
+
   combined.sort((a, b) => String(b.posted_at).localeCompare(String(a.posted_at)));
-  // Keep newest fresh records first (or all qualifying AI records up to Math.max(limit, 250) when freshness filtering will narrow further)
-  const cap = Math.max(limit, 500);
+  // Keep generous pool for rolling 24h filtering
+  const cap = Math.max(limit, 1500);
   const sliced = combined.slice(0, cap);
-  return { records: sliced, errors, hasMore: combined.length > cap };
+  return { records: sliced, errors, hasMore: combined.length > cap, sourceOutcomes };
 }
 
 async function collectNews(
@@ -3482,9 +3851,10 @@ async function collectNews(
   verifier: LiveSourceVerifier,
   limit: number,
   page: number
-): Promise<{ records: RawRecord[]; errors: CollectorError[]; hasMore: boolean }> {
+): Promise<CollectionBatchResult> {
   const safePage = Math.max(1, page);
   const errors: CollectorError[] = [];
+  const sourceOutcomes: SourceOutcomeRecord[] = [];
   const records: RawRecord[] = [];
   const nowIso = new Date().toISOString();
 
@@ -3507,12 +3877,30 @@ async function collectNews(
   const feedTasks =
     safePage === 1
       ? rssSources.map(async (src) => {
-          const res = await http.fetch(src.url, { timeoutMs: Math.min(config.requestTimeoutMs, 10000), maxAttempts: 1 });
+          let res = await http.fetch(src.url, { timeoutMs: Math.min(config.requestTimeoutMs, 12000), maxAttempts: 2 });
+          let retried = res.attempts > 1;
           if (!res.ok) {
-            errors.push({ source: src.name, url: src.url, error: res.error || "fetch_failed" });
+            retried = true;
+            res = await http.fetch(src.url, { timeoutMs: Math.min(config.requestTimeoutMs, 15000), maxAttempts: 2 });
+          }
+          if (!res.ok) {
+            const err = res.error || "fetch_failed";
+            errors.push({ source: src.name, url: src.url, error: err });
+            sourceOutcomes.push({
+              category: "news",
+              source: src.name,
+              url: src.url,
+              status: "failed",
+              discoveredCount: 0,
+              retried,
+              attempts: res.attempts,
+              httpStatus: res.status || null,
+              error: err,
+            });
             return;
           }
           verifier.seedSnapshot(src.url, res.status, res.content, res.contentType);
+          const beforeCount = records.length;
           const items = extractXmlTags(res.content, "item");
           if (items.length > 0) {
             for (const item of items) {
@@ -3579,18 +3967,35 @@ async function collectNews(
               });
             }
           }
+          const added = records.length - beforeCount;
+          sourceOutcomes.push({
+            category: "news",
+            source: src.name,
+            url: src.url,
+            status: added > 0 ? "ok" : "empty",
+            discoveredCount: added,
+            retried,
+            attempts: res.attempts,
+            httpStatus: res.status || null,
+            error: null,
+          });
         })
       : [];
 
   // Hacker News Algolia stories (filtered for qualifying AI news)
   let gotHn = false;
+  let hnErr: string | null = null;
+  let hnCount = 0;
+  let hnStatus: number | null = null;
   const hnTask = (async () => {
     for (let offset = 0; offset < 2; offset++) {
       const hnPage = Math.max(0, safePage - 1) + offset;
       const hnUrl = `https://hn.algolia.com/api/v1/search_by_date?tags=story&hitsPerPage=100&page=${hnPage}`;
-      const hnRes = await http.fetch(hnUrl, { timeoutMs: config.requestTimeoutMs });
+      const hnRes = await http.fetch(hnUrl, { timeoutMs: config.requestTimeoutMs, maxAttempts: 2 });
+      hnStatus = hnRes.status || hnStatus;
       if (!hnRes.ok) {
-        errors.push({ source: "hn_algolia", url: hnUrl, error: hnRes.error || "fetch_failed" });
+        hnErr = hnRes.error || "fetch_failed";
+        errors.push({ source: "hn_algolia", url: hnUrl, error: hnErr });
         break;
       }
       verifier.seedSnapshot(hnUrl, hnRes.status, hnRes.content, hnRes.contentType);
@@ -3620,20 +4025,33 @@ async function collectNews(
             collected_at: nowIso,
             source_metadata: { points: hit.points ?? null, objectID: objId, api_url: hnUrl },
           });
+          hnCount++;
         }
       } catch (err) {
-        errors.push({ source: "hn_algolia", url: hnUrl, error: `invalid_json: ${String(err)}` });
+        hnErr = `invalid_json: ${String(err)}`;
+        errors.push({ source: "hn_algolia", url: hnUrl, error: hnErr });
         break;
       }
     }
+    sourceOutcomes.push({
+      category: "news",
+      source: "hn_algolia",
+      url: "https://hn.algolia.com/api/v1/search_by_date?tags=story",
+      status: hnCount > 0 ? "ok" : hnErr ? "failed" : "empty",
+      discoveredCount: hnCount,
+      retried: true,
+      attempts: 2,
+      httpStatus: hnStatus,
+      error: hnCount === 0 ? hnErr : null,
+    });
   })();
 
   await Promise.all([...feedTasks, hnTask]);
 
   records.sort((a, b) => String(b.published_at).localeCompare(String(a.published_at)));
-  const cap = Math.max(limit, 300);
+  const cap = Math.max(limit, 1000);
   const sliced = records.slice(0, cap);
-  return { records: sliced, errors, hasMore: records.length > cap || gotHn };
+  return { records: sliced, errors, hasMore: records.length > cap || gotHn, sourceOutcomes };
 }
 
 function csvEscape(val: string | number): string {
@@ -3739,18 +4157,164 @@ function parseVerificationStatus(raw: string | undefined): VerificationStatus {
 
 // ---------- Main Backend Service ----------
 
+export interface IntegrationHealthItem {
+  id: "sqlite" | "gemini" | "groq" | "llama3" | "deepseek" | "github" | "google_sheets";
+  label: string;
+  envKey: string;
+  status: IntegrationConnectionStatus;
+  detail: string;
+  error: string | null;
+  latencyMs: number | null;
+  checkedAt: string | null;
+  tested: boolean;
+}
+
+export interface IntegrationHealthSummary {
+  checkedAt: string | null;
+  items: IntegrationHealthItem[];
+  byId: Record<string, IntegrationHealthItem>;
+}
+
+export async function probeGithubApi(
+  http: PoliteHttpClient,
+  githubToken: string | null,
+  apiBaseUrl = "https://api.github.com"
+): Promise<IntegrationHealthItem> {
+  const checkedAt = new Date().toISOString();
+  const base: Omit<IntegrationHealthItem, "status" | "detail" | "error" | "latencyMs"> = {
+    id: "github",
+    label: "GitHub REST API Enrichment",
+    envKey: "GITHUB_TOKEN",
+    checkedAt,
+    tested: true,
+  };
+
+  if (!githubToken || !githubToken.trim()) {
+    return {
+      ...base,
+      status: "Not Configured",
+      detail: "GITHUB_TOKEN is not set. Unauthenticated public GitHub endpoints remain limited to 60 requests/hour.",
+      error: null,
+      latencyMs: null,
+    };
+  }
+
+  const startedAt = Date.now();
+  const cleanBase = apiBaseUrl.replace(/\/+$/, "");
+  const res = await http.fetch(`${cleanBase}/rate_limit`, {
+    headers: {
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      Authorization: `Bearer ${githubToken.trim()}`,
+    },
+    checkRobots: false,
+    timeoutMs: 8000,
+    maxAttempts: 1,
+  });
+  const latencyMs = Date.now() - startedAt;
+
+  if (!res.ok) {
+    const safeDetail = redactSecrets(res.error || `HTTP ${res.status}`);
+    let apiMessage = "";
+    try {
+      const parsed = JSON.parse(res.content) as { message?: string };
+      if (parsed.message) apiMessage = redactSecrets(parsed.message);
+    } catch {
+      // Ignore parse failure
+    }
+    const errText =
+      res.status === 401
+        ? `GitHub authentication failed (HTTP 401${apiMessage ? `: ${apiMessage}` : ""}). Check GITHUB_TOKEN.`
+        : res.status === 403 || res.status === 429
+        ? `GitHub API rate-limited or forbidden (HTTP ${res.status}${apiMessage ? `: ${apiMessage}` : ""}).`
+        : `GitHub API check failed (${safeDetail}${apiMessage ? `: ${apiMessage}` : ""}).`;
+    return {
+      ...base,
+      status: "Connection Failed",
+      detail: errText,
+      error: errText,
+      latencyMs,
+    };
+  }
+
+  try {
+    const payload = JSON.parse(res.content) as {
+      resources?: { core?: { limit?: number; remaining?: number; reset?: number } };
+    };
+    const core = payload.resources?.core;
+    const limit = typeof core?.limit === "number" ? core.limit : 5000;
+    const remaining = typeof core?.remaining === "number" ? core.remaining : null;
+    const detail =
+      remaining !== null
+        ? `Authenticated GitHub REST API verified (${remaining.toLocaleString()}/${limit.toLocaleString()} core requests/hr remaining).`
+        : `Authenticated GitHub REST API verified (${limit.toLocaleString()} requests/hr limit).`;
+    return {
+      ...base,
+      status: "Configured",
+      detail,
+      error: null,
+      latencyMs,
+    };
+  } catch (err) {
+    const errMsg = `GitHub API returned invalid JSON: ${redactSecrets(err instanceof Error ? err.message : String(err))}`;
+    return {
+      ...base,
+      status: "Connection Failed",
+      detail: errMsg,
+      error: errMsg,
+      latencyMs,
+    };
+  }
+}
+
+export interface ActiveRunStateSnapshot {
+  id: string;
+  triggerType: "manual" | "scheduled" | "daily_24h";
+  mode: "full" | "daily_24h";
+  status: "idle" | "running" | "completed" | "partial" | "failed";
+  categories: string[];
+  limit: number;
+  page: number;
+  startedAt: string | null;
+  finishedAt: string | null;
+  logs: string[];
+  result: unknown | null;
+  error: string | null;
+}
+
 export class AtlasBackendService {
   private readonly config: AtlasConfig;
   private readonly db: AtlasDatabase;
   private readonly http: PoliteHttpClient;
   private readonly llmRouter: LLMRouter;
   private readonly sheets: GoogleSheetsService;
+  private latestHealth: IntegrationHealthSummary | null = null;
+  private healthCheckInFlight: Promise<IntegrationHealthSummary> | null = null;
+  private runInFlight: Promise<unknown> | null = null;
+  private schedulerTimer: ReturnType<typeof setInterval> | null = null;
+  private activeRunState: ActiveRunStateSnapshot = {
+    id: "none",
+    triggerType: "manual",
+    mode: "full",
+    status: "idle",
+    categories: [],
+    limit: 20,
+    page: 1,
+    startedAt: null,
+    finishedAt: null,
+    logs: [],
+    result: null,
+    error: null,
+  };
 
   constructor(atlasDir: string) {
     this.config = loadAtlasConfig(atlasDir);
     this.db = new AtlasDatabase(this.config.dbPath);
     this.db.initializeSchema();
-    this.hydrateFromCsvExportsIfEmpty();
+    this.db.markInterruptedRunsFailed();
+    const hydrated = this.hydrateFromCsvExportsIfEmpty();
+    this.ensureSchedulerInitialized();
+    this.db.checkpointWal(hydrated ? "TRUNCATE" : "PASSIVE");
     this.http = new PoliteHttpClient({
       userAgent: this.config.userAgent,
       timeoutMs: this.config.requestTimeoutMs,
@@ -3771,12 +4335,123 @@ export class AtlasBackendService {
     );
   }
 
-  private hydrateFromCsvExportsIfEmpty(): void {
-    const counts = this.db.countRecords();
-    const totalExisting = Object.values(counts).reduce((sum, n) => sum + n, 0);
-    if (totalExisting > 0 || !fs.existsSync(this.config.exportsDir)) {
-      return;
+  private ensureSchedulerInitialized(): SchedulerStateRecord {
+    const existing = this.db.getSchedulerState();
+    const now = new Date();
+    if (existing) {
+      const nextIso = existing.next_run_at || computeNextUtcRunIso(existing.utc_time, now, existing.last_run_at);
+      if (nextIso !== existing.next_run_at) {
+        const updated: SchedulerStateRecord = {
+          ...existing,
+          next_run_at: nextIso,
+          updated_at: now.toISOString(),
+        };
+        this.db.saveSchedulerState(updated);
+        return updated;
+      }
+      return existing;
     }
+    const lastSuccess = this.db.getLastSuccessfulRun(false)?.completed_at ?? null;
+    const latestRun = this.db.fetchPipelineRuns(1)[0];
+    const initial: SchedulerStateRecord = {
+      enabled: this.config.dailyCollectionEnabled,
+      utc_time: this.config.dailyCollectionUtcTime,
+      last_run_at: latestRun?.started_at ?? null,
+      last_success_at: lastSuccess,
+      next_run_at: computeNextUtcRunIso(this.config.dailyCollectionUtcTime, now, latestRun?.started_at ?? null),
+      updated_at: now.toISOString(),
+    };
+    this.db.saveSchedulerState(initial);
+    return initial;
+  }
+
+  public getSchedulerStatus(): SchedulerStateRecord {
+    return this.ensureSchedulerInitialized();
+  }
+
+  public updateSchedulerConfig(opts: { enabled?: boolean; utcTime?: string }): SchedulerStateRecord {
+    const current = this.ensureSchedulerInitialized();
+    const nextUtc =
+      opts.utcTime !== undefined ? normalizeUtcTimeHHMM(opts.utcTime, current.utc_time) : current.utc_time;
+    const nextEnabled = opts.enabled !== undefined ? Boolean(opts.enabled) : current.enabled;
+    const now = new Date();
+    const updated: SchedulerStateRecord = {
+      ...current,
+      enabled: nextEnabled,
+      utc_time: nextUtc,
+      next_run_at: computeNextUtcRunIso(nextUtc, now, current.last_run_at),
+      updated_at: now.toISOString(),
+    };
+    this.db.saveSchedulerState(updated);
+    return updated;
+  }
+
+  public startScheduler(pollIntervalMs = 30_000): void {
+    if (this.schedulerTimer) return;
+    this.ensureSchedulerInitialized();
+    this.schedulerTimer = setInterval(() => {
+      void this.tickScheduler().catch(() => {});
+    }, Math.max(1000, pollIntervalMs));
+    this.schedulerTimer.unref?.();
+  }
+
+  public stopScheduler(): void {
+    if (this.schedulerTimer) {
+      clearInterval(this.schedulerTimer);
+      this.schedulerTimer = null;
+    }
+  }
+
+  public async tickScheduler(now: Date = new Date()): Promise<boolean> {
+    const state = this.ensureSchedulerInitialized();
+    if (!state.enabled || !state.next_run_at) return false;
+    const nextMs = Date.parse(state.next_run_at);
+    if (!Number.isFinite(nextMs) || now.getTime() < nextMs) return false;
+    if (this.isRunInProgress()) return false;
+
+    const nowIso = now.toISOString();
+    const advanced: SchedulerStateRecord = {
+      ...state,
+      last_run_at: nowIso,
+      next_run_at: computeNextUtcRunIso(state.utc_time, now, nowIso),
+      updated_at: nowIso,
+    };
+    this.db.saveSchedulerState(advanced);
+
+    const started = this.startBackgroundRun({
+      triggerType: "scheduled",
+      mode: "daily_24h",
+      categories: ["jobs", "news", "research_papers"],
+      limit: 1000,
+      page: 1,
+      includeAllFresh24h: true,
+    });
+    return started.started;
+  }
+
+  public isRunInProgress(): boolean {
+    return this.runInFlight !== null;
+  }
+
+  public getActiveRunState(): ActiveRunStateSnapshot {
+    return { ...this.activeRunState };
+  }
+
+  public getDatabaseHealth() {
+    return this.db.checkHealth();
+  }
+
+  public close(): void {
+    this.stopScheduler();
+    this.db.close();
+  }
+
+  private hydrateFromCsvExportsIfEmpty(): boolean {
+    if (!fs.existsSync(this.config.exportsDir)) {
+      return false;
+    }
+    const counts = this.db.countRecords();
+    let hydratedAny = false;
 
     const readExport = (filename: string): Array<Record<string, string>> => {
       const p = path.resolve(this.config.exportsDir, filename);
@@ -3784,8 +4459,8 @@ export class AtlasBackendService {
       return parseCsvRecords(fs.readFileSync(p, "utf-8"));
     };
 
-    const startupRows = readExport("startups.csv");
-    if (startupRows.length > 0) {
+    const startupRows = counts.startups === 0 || counts.entity_mapping_log === 0 ? readExport("startups.csv") : [];
+    if (counts.startups === 0 && startupRows.length > 0) {
       const inputs: StartupInput[] = startupRows
         .filter((r) => r.startup_id && r.name && r.source_url)
         .map((r) => ({
@@ -3808,11 +4483,14 @@ export class AtlasBackendService {
           canonical_entity_id: r.canonical_entity_id || null,
           source_metadata: parseJsonMeta(r.source_metadata_json),
         }));
-      this.db.upsertStartups(inputs);
+      if (inputs.length > 0) {
+        this.db.upsertStartups(inputs);
+        hydratedAny = true;
+      }
     }
 
-    const productRows = readExport("products.csv");
-    if (productRows.length > 0) {
+    const productRows = counts.products === 0 || counts.entity_mapping_log === 0 ? readExport("products.csv") : [];
+    if (counts.products === 0 && productRows.length > 0) {
       const inputs: ProductInput[] = productRows
         .filter((r) => r.product_id && r.name && r.source_url)
         .map((r) => ({
@@ -3834,29 +4512,104 @@ export class AtlasBackendService {
           canonical_entity_id: r.canonical_entity_id || null,
           source_metadata: parseJsonMeta(r.source_metadata_json),
         }));
-      this.db.upsertProducts(inputs);
+      if (inputs.length > 0) {
+        this.db.upsertProducts(inputs);
+        hydratedAny = true;
+      }
     }
 
-    const paperRows = readExport("research_papers.csv");
-    if (paperRows.length > 0) {
-      const inputs: ResearchPaperInput[] = paperRows
-        .filter((r) => r.paper_id && r.title && r.source_url)
-        .map((r) => {
-          const starsRaw = r.github_stars?.trim();
-          const starsParsed = starsRaw && /^\d+$/.test(starsRaw) ? Number(starsRaw) : null;
-          return {
-            paper_id: r.paper_id,
+    if (counts.research_papers === 0) {
+      const paperRows = readExport("research_papers.csv");
+      if (paperRows.length > 0) {
+        const inputs: ResearchPaperInput[] = paperRows
+          .filter((r) => r.paper_id && r.title && r.source_url)
+          .map((r) => {
+            const starsRaw = r.github_stars?.trim();
+            const starsParsed = starsRaw && /^\d+$/.test(starsRaw) ? Number(starsRaw) : null;
+            const meta = parseJsonMeta(r.source_metadata_json);
+            const publishedAt =
+              typeof meta.published_at_utc === "string" && meta.published_at_utc
+                ? meta.published_at_utc
+                : null;
+            return {
+              paper_id: r.paper_id,
+              title: r.title,
+              abstract: r.abstract || null,
+              authors: parseSemiList(r.authors),
+              publication_date: r.publication_date || null,
+              published_at: publishedAt,
+              doi: r.doi || null,
+              arxiv_id: r.arxiv_id || null,
+              github_repository: r.github_repository || null,
+              github_stars: starsParsed,
+              official_website: r.official_website || null,
+              source_name: r.source_name || "unknown",
+              source_url: r.source_url,
+              source_title: r.source_title || null,
+              collected_at: r.collected_at || new Date().toISOString(),
+              last_checked_at: r.last_checked_at || null,
+              supported_fields: parseSemiList(r.supported_fields),
+              verification_status: parseVerificationStatus(r.verification_status),
+              rejection_reason: r.rejection_reason || null,
+              source_metadata: parseJsonMeta(r.source_metadata_json),
+            };
+          });
+        if (inputs.length > 0) {
+          this.db.upsertResearchPapers(inputs);
+          hydratedAny = true;
+        }
+      }
+    }
+
+    if (counts.jobs === 0) {
+      const jobRows = readExport("jobs.csv");
+      if (jobRows.length > 0) {
+        const inputs: JobInput[] = jobRows
+          .filter((r) => r.job_id && r.title && r.application_url && r.posted_at)
+          .map((r) => ({
+            job_id: r.job_id,
             title: r.title,
-            abstract: r.abstract || null,
-            authors: parseSemiList(r.authors),
-            publication_date: r.publication_date || null,
-            doi: r.doi || null,
-            arxiv_id: r.arxiv_id || null,
-            github_repository: r.github_repository || null,
-            github_stars: starsParsed,
+            company: r.company || "Unknown",
+            location: r.location || "Unknown",
+            employment_type: r.employment_type || "Unknown",
+            description: r.description || null,
+            posted_at: r.posted_at,
+            application_url: r.application_url,
             official_website: r.official_website || null,
             source_name: r.source_name || "unknown",
-            source_url: r.source_url,
+            source_url: r.source_url || r.application_url,
+            source_title: r.source_title || null,
+            collected_at: r.collected_at || new Date().toISOString(),
+            last_checked_at: r.last_checked_at || null,
+            supported_fields: parseSemiList(r.supported_fields),
+            verification_status: parseVerificationStatus(r.verification_status),
+            rejection_reason: r.rejection_reason || null,
+            canonical_company_id: r.canonical_company_id || null,
+            source_metadata: parseJsonMeta(r.source_metadata_json),
+          }));
+        if (inputs.length > 0) {
+          this.db.upsertJobs(inputs);
+          hydratedAny = true;
+        }
+      }
+    }
+
+    if (counts.news === 0) {
+      const newsRows = readExport("news.csv");
+      if (newsRows.length > 0) {
+        const inputs: NewsInput[] = newsRows
+          .filter((r) => r.news_id && r.headline && r.article_url && r.published_at)
+          .map((r) => ({
+            news_id: r.news_id,
+            headline: r.headline,
+            summary: r.summary || null,
+            publisher: r.publisher || "Unknown",
+            published_at: r.published_at,
+            article_url: r.article_url,
+            official_website: r.official_website || null,
+            category: r.category || "AI",
+            source_name: r.source_name || null,
+            source_url: r.source_url || r.article_url,
             source_title: r.source_title || null,
             collected_at: r.collected_at || new Date().toISOString(),
             last_checked_at: r.last_checked_at || null,
@@ -3864,144 +4617,350 @@ export class AtlasBackendService {
             verification_status: parseVerificationStatus(r.verification_status),
             rejection_reason: r.rejection_reason || null,
             source_metadata: parseJsonMeta(r.source_metadata_json),
-          };
-        });
-      this.db.upsertResearchPapers(inputs);
-    }
-
-    const jobRows = readExport("jobs.csv");
-    if (jobRows.length > 0) {
-      const inputs: JobInput[] = jobRows
-        .filter((r) => r.job_id && r.title && r.application_url && r.posted_at)
-        .map((r) => ({
-          job_id: r.job_id,
-          title: r.title,
-          company: r.company || "Unknown",
-          location: r.location || "Unknown",
-          employment_type: r.employment_type || "Unknown",
-          description: r.description || null,
-          posted_at: r.posted_at,
-          application_url: r.application_url,
-          official_website: r.official_website || null,
-          source_name: r.source_name || "unknown",
-          source_url: r.source_url || r.application_url,
-          source_title: r.source_title || null,
-          collected_at: r.collected_at || new Date().toISOString(),
-          last_checked_at: r.last_checked_at || null,
-          supported_fields: parseSemiList(r.supported_fields),
-          verification_status: parseVerificationStatus(r.verification_status),
-          rejection_reason: r.rejection_reason || null,
-          canonical_company_id: r.canonical_company_id || null,
-          source_metadata: parseJsonMeta(r.source_metadata_json),
-        }));
-      this.db.upsertJobs(inputs);
-    }
-
-    const newsRows = readExport("news.csv");
-    if (newsRows.length > 0) {
-      const inputs: NewsInput[] = newsRows
-        .filter((r) => r.news_id && r.headline && r.article_url && r.published_at)
-        .map((r) => ({
-          news_id: r.news_id,
-          headline: r.headline,
-          summary: r.summary || null,
-          publisher: r.publisher || "Unknown",
-          published_at: r.published_at,
-          article_url: r.article_url,
-          official_website: r.official_website || null,
-          category: r.category || "AI",
-          source_name: r.source_name || null,
-          source_url: r.source_url || r.article_url,
-          source_title: r.source_title || null,
-          collected_at: r.collected_at || new Date().toISOString(),
-          last_checked_at: r.last_checked_at || null,
-          supported_fields: parseSemiList(r.supported_fields),
-          verification_status: parseVerificationStatus(r.verification_status),
-          rejection_reason: r.rejection_reason || null,
-          source_metadata: parseJsonMeta(r.source_metadata_json),
-        }));
-      this.db.upsertNews(inputs);
-    }
-
-    const mappingRows = readExport("entity_mapping_log.csv");
-    if (mappingRows.length > 0) {
-      const canonicalMap = new Map<
-        string,
-        {
-          canonical_id: string;
-          canonical_name: string;
-          normalized_name: string;
-          entity_type: string;
-          aliases: Set<string>;
-          created_at: string;
+          }));
+        if (inputs.length > 0) {
+          this.db.upsertNews(inputs);
+          hydratedAny = true;
         }
-      >();
-      const mappingInputs: EntityMappingLogInput[] = mappingRows
-        .filter((r) => r.mapping_id && r.raw_name && r.canonical_id)
-        .map((r) => {
-          const conf = Number(r.confidence);
-          const ts = r.timestamp || new Date().toISOString();
-          const existing = canonicalMap.get(r.canonical_id);
-          if (!existing) {
-            canonicalMap.set(r.canonical_id, {
-              canonical_id: r.canonical_id,
-              canonical_name: r.canonical_name || r.raw_name,
-              normalized_name: r.normalized_name || normalizeEntityName(r.canonical_name || r.raw_name),
-              entity_type: r.entity_type || "company",
-              aliases: new Set([r.raw_name]),
-              created_at: ts,
-            });
-          } else {
-            existing.aliases.add(r.raw_name);
+      }
+    }
+
+    if (counts.entity_mapping_log === 0) {
+      const mappingRows = readExport("entity_mapping_log.csv");
+      if (mappingRows.length > 0) {
+        const canonicalMap = new Map<
+          string,
+          {
+            canonical_id: string;
+            canonical_name: string;
+            normalized_name: string;
+            entity_type: string;
+            aliases: Set<string>;
+            created_at: string;
           }
-          return {
-            mapping_id: r.mapping_id,
-            raw_name: r.raw_name,
-            normalized_name: r.normalized_name || normalizeEntityName(r.raw_name),
-            canonical_name: r.canonical_name || r.raw_name,
-            canonical_id: r.canonical_id,
-            source_url: r.source_url || "",
-            match_method: r.match_method || "imported_mapping",
-            confidence: Number.isFinite(conf) ? conf : 1.0,
-            decision: r.decision || "new_entity",
-            timestamp: ts,
-            entity_type: r.entity_type || "company",
-            match_reason: r.match_reason || null,
-          };
-        });
-      const domainByCanonical = new Map<string, string>();
-      for (const s of startupRows) {
-        if (s.canonical_entity_id && s.website) {
-          const d = extractDomain(s.website);
-          if (d && !GENERIC_HOST_DOMAINS.has(d)) domainByCanonical.set(s.canonical_entity_id, d);
+        >();
+        const mappingInputs: EntityMappingLogInput[] = mappingRows
+          .filter((r) => r.mapping_id && r.raw_name && r.canonical_id)
+          .map((r) => {
+            const conf = Number(r.confidence);
+            const ts = r.timestamp || new Date().toISOString();
+            const existing = canonicalMap.get(r.canonical_id);
+            if (!existing) {
+              canonicalMap.set(r.canonical_id, {
+                canonical_id: r.canonical_id,
+                canonical_name: r.canonical_name || r.raw_name,
+                normalized_name: r.normalized_name || normalizeEntityName(r.canonical_name || r.raw_name),
+                entity_type: r.entity_type || "company",
+                aliases: new Set([r.raw_name]),
+                created_at: ts,
+              });
+            } else {
+              existing.aliases.add(r.raw_name);
+            }
+            return {
+              mapping_id: r.mapping_id,
+              raw_name: r.raw_name,
+              normalized_name: r.normalized_name || normalizeEntityName(r.raw_name),
+              canonical_name: r.canonical_name || r.raw_name,
+              canonical_id: r.canonical_id,
+              source_url: r.source_url || "",
+              match_method: r.match_method || "imported_mapping",
+              confidence: Number.isFinite(conf) ? conf : 1.0,
+              decision: r.decision || "new_entity",
+              timestamp: ts,
+              entity_type: r.entity_type || "company",
+              match_reason: r.match_reason || null,
+            };
+          });
+        const domainByCanonical = new Map<string, string>();
+        for (const s of startupRows) {
+          if (s.canonical_entity_id && s.website) {
+            const d = extractDomain(s.website);
+            if (d && !GENERIC_HOST_DOMAINS.has(d)) domainByCanonical.set(s.canonical_entity_id, d);
+          }
+        }
+        for (const p of productRows) {
+          if (p.canonical_entity_id && p.website && !domainByCanonical.has(p.canonical_entity_id)) {
+            const d = extractDomain(p.website);
+            if (d && !GENERIC_HOST_DOMAINS.has(d)) domainByCanonical.set(p.canonical_entity_id, d);
+          }
+        }
+        const canonicalRows: CanonicalEntityRow[] = Array.from(canonicalMap.values()).map((c) => ({
+          canonical_id: c.canonical_id,
+          canonical_name: c.canonical_name,
+          normalized_name: c.normalized_name,
+          entity_type: c.entity_type,
+          primary_domain: domainByCanonical.get(c.canonical_id) ?? null,
+          aliases_json: JSON.stringify(Array.from(c.aliases)),
+          created_at: c.created_at,
+        }));
+        if (canonicalRows.length > 0) {
+          this.db.upsertCanonicalEntities(canonicalRows);
+        }
+        if (mappingInputs.length > 0) {
+          this.db.upsertEntityMappingLogs(mappingInputs);
+          hydratedAny = true;
         }
       }
-      for (const p of productRows) {
-        if (p.canonical_entity_id && p.website && !domainByCanonical.has(p.canonical_entity_id)) {
-          const d = extractDomain(p.website);
-          if (d && !GENERIC_HOST_DOMAINS.has(d)) domainByCanonical.set(p.canonical_entity_id, d);
-        }
+    }
+
+    return hydratedAny;
+  }
+
+  private buildInitialUntestedHealth(): IntegrationHealthSummary {
+    const dbHealth = this.db.checkHealth();
+    const totalRows = Object.values(dbHealth.tableCounts).reduce((s, n) => s + n, 0);
+    const items: IntegrationHealthItem[] = [
+      {
+        id: "sqlite",
+        label: "SQLite Persistent Database",
+        envKey: "DATABASE_URL",
+        status: dbHealth.ok ? "Configured" : "Connection Failed",
+        detail: dbHealth.ok
+          ? `SQLite (${dbHealth.journalMode.toUpperCase()}) verified: ${totalRows.toLocaleString()} rows across 6 datasets.`
+          : dbHealth.error || "SQLite health check failed.",
+        error: dbHealth.ok ? null : dbHealth.error,
+        latencyMs: 0,
+        checkedAt: new Date().toISOString(),
+        tested: true,
+      },
+      {
+        id: "gemini",
+        label: `Google Gemini (${this.config.geminiModel})`,
+        envKey: "GEMINI_API_KEY",
+        status: "Not Configured",
+        detail: this.config.geminiApiKey
+          ? "Credential present — awaiting live API test before marking Configured."
+          : "GEMINI_API_KEY is not set in environment.",
+        error: null,
+        latencyMs: null,
+        checkedAt: null,
+        tested: !this.config.geminiApiKey,
+      },
+      {
+        id: "groq",
+        label: `Groq (${this.config.groqModel})`,
+        envKey: "GROQ_API_KEY",
+        status: "Not Configured",
+        detail: this.config.groqApiKey
+          ? "Credential present — awaiting live API test before marking Configured."
+          : "GROQ_API_KEY is not set in environment.",
+        error: null,
+        latencyMs: null,
+        checkedAt: null,
+        tested: !this.config.groqApiKey,
+      },
+      {
+        id: "llama3",
+        label: `Llama 3 (${this.config.llama3Model})`,
+        envKey: "GROQ_API_KEY / LLAMA3_API_KEY",
+        status: "Not Configured",
+        detail:
+          this.config.llama3ApiKey || this.config.groqApiKey
+            ? "Credential present — awaiting live API test before marking Configured."
+            : "Neither GROQ_API_KEY nor LLAMA3_API_KEY is set in environment.",
+        error: null,
+        latencyMs: null,
+        checkedAt: null,
+        tested: !(this.config.llama3ApiKey || this.config.groqApiKey),
+      },
+      {
+        id: "deepseek",
+        label: `DeepSeek (${this.config.deepseekModel})`,
+        envKey: "DEEPSEEK_API_KEY",
+        status: "Not Configured",
+        detail: this.config.deepseekApiKey
+          ? "Credential present — awaiting live API test before marking Configured."
+          : "DEEPSEEK_API_KEY is not set in environment.",
+        error: null,
+        latencyMs: null,
+        checkedAt: null,
+        tested: !this.config.deepseekApiKey,
+      },
+      {
+        id: "github",
+        label: "GitHub REST API Enrichment",
+        envKey: "GITHUB_TOKEN",
+        status: "Not Configured",
+        detail: this.config.githubToken
+          ? "Credential present — awaiting live API test before marking Configured."
+          : "GITHUB_TOKEN is not set (public rate limit 60 req/hr).",
+        error: null,
+        latencyMs: null,
+        checkedAt: null,
+        tested: !this.config.githubToken,
+      },
+      {
+        id: "google_sheets",
+        label: "Google Sheets & Drive OAuth",
+        envKey: "Workspace OAuth (drive.file, spreadsheets)",
+        status: "Not Configured",
+        detail: this.sheets.isConfigured()
+          ? "Service Account configured — awaiting live API test before marking Configured."
+          : "Sign in with Google to authorize Drive (drive.file) & Sheets spreadsheet creation/sync.",
+        error: null,
+        latencyMs: null,
+        checkedAt: null,
+        tested: !this.sheets.isConfigured(),
+      },
+    ];
+    const byId: Record<string, IntegrationHealthItem> = {};
+    for (const item of items) byId[item.id] = item;
+    return { checkedAt: null, items, byId };
+  }
+
+  public getIntegrationHealthSummary(): IntegrationHealthSummary {
+    return this.latestHealth ?? this.buildInitialUntestedHealth();
+  }
+
+  public async ensureInitialHealthChecked(): Promise<IntegrationHealthSummary> {
+    if (this.latestHealth?.checkedAt) {
+      return this.latestHealth;
+    }
+    if (this.healthCheckInFlight) {
+      return this.healthCheckInFlight;
+    }
+    return this.runIntegrationHealthChecks();
+  }
+
+  public async runIntegrationHealthChecks(opts?: {
+    oauthAccessToken?: string | null;
+    spreadsheetId?: string | null;
+  }): Promise<IntegrationHealthSummary> {
+    if (this.healthCheckInFlight && !opts?.oauthAccessToken && !opts?.spreadsheetId) {
+      return this.healthCheckInFlight;
+    }
+    const task = (async (): Promise<IntegrationHealthSummary> => {
+      const checkedAt = new Date().toISOString();
+      const dbStart = Date.now();
+      const dbHealth = this.db.checkHealth();
+      const totalDbRows = Object.values(dbHealth.tableCounts).reduce((s, n) => s + n, 0);
+
+      const [llmProbes, githubProbe, sheetsProbe] = await Promise.all([
+        this.llmRouter.probeProviders({ timeoutMs: 10_000 }),
+        probeGithubApi(this.http, this.config.githubToken),
+        this.sheets.probeHealth(opts),
+      ]);
+
+      const llmByName = new Map(llmProbes.map((p) => [p.provider, p]));
+      const geminiProbe = llmByName.get("gemini");
+      const groqProbe = llmByName.get("groq");
+      const llama3Probe = llmByName.get("llama3");
+      const deepseekProbe = llmByName.get("deepseek");
+
+      const toLlmItem = (
+        id: "gemini" | "groq" | "llama3" | "deepseek",
+        label: string,
+        envKey: string,
+        probe: (typeof llmProbes)[number] | undefined,
+        fallbackModel: string
+      ): IntegrationHealthItem => {
+        const status: IntegrationConnectionStatus = probe?.status ?? "Not Configured";
+        const detail =
+          status === "Configured"
+            ? `Live probe succeeded (${probe?.model ?? fallbackModel} via ${probe?.via ?? id}${probe?.latencyMs !== null ? `, ${probe?.latencyMs}ms` : ""}).`
+            : status === "Connection Failed"
+            ? probe?.error || "Connection test failed."
+            : id === "llama3"
+            ? "Neither GROQ_API_KEY nor LLAMA3_API_KEY is set."
+            : `${envKey} is not set.`;
+        return {
+          id,
+          label,
+          envKey,
+          status,
+          detail,
+          error: status === "Connection Failed" ? probe?.error ?? "Connection test failed." : null,
+          latencyMs: probe?.latencyMs ?? null,
+          checkedAt: probe?.checkedAt ?? checkedAt,
+          tested: true,
+        };
+      };
+
+      const items: IntegrationHealthItem[] = [
+        {
+          id: "sqlite",
+          label: "SQLite Persistent Database",
+          envKey: "DATABASE_URL",
+          status: dbHealth.ok ? "Configured" : "Connection Failed",
+          detail: dbHealth.ok
+            ? `SQLite (${dbHealth.journalMode.toUpperCase()}) verified: ${totalDbRows.toLocaleString()} records across 6 datasets.`
+            : dbHealth.error || "SQLite check failed.",
+          error: dbHealth.ok ? null : dbHealth.error,
+          latencyMs: Date.now() - dbStart,
+          checkedAt,
+          tested: true,
+        },
+        toLlmItem(
+          "gemini",
+          `Google Gemini (${this.config.geminiModel})`,
+          "GEMINI_API_KEY",
+          geminiProbe,
+          this.config.geminiModel
+        ),
+        toLlmItem(
+          "groq",
+          `Groq (${this.config.groqModel})`,
+          "GROQ_API_KEY",
+          groqProbe,
+          this.config.groqModel
+        ),
+        toLlmItem(
+          "llama3",
+          `Llama 3 via ${llama3Probe?.via === "groq" ? "Groq" : "Endpoint"} (${this.config.llama3Model})`,
+          "GROQ_API_KEY / LLAMA3_API_KEY",
+          llama3Probe,
+          this.config.llama3Model
+        ),
+        toLlmItem(
+          "deepseek",
+          `DeepSeek (${this.config.deepseekModel})`,
+          "DEEPSEEK_API_KEY",
+          deepseekProbe,
+          this.config.deepseekModel
+        ),
+        githubProbe,
+        {
+          id: "google_sheets",
+          label: "Google Sheets & Drive OAuth",
+          envKey: "Workspace OAuth (drive.file, spreadsheets)",
+          status: sheetsProbe.status,
+          detail: sheetsProbe.detail,
+          error: sheetsProbe.error,
+          latencyMs: null,
+          checkedAt: sheetsProbe.checkedAt,
+          tested: true,
+        },
+      ];
+
+      const byId: Record<string, IntegrationHealthItem> = {};
+      for (const item of items) byId[item.id] = item;
+      const summary: IntegrationHealthSummary = { checkedAt, items, byId };
+      this.latestHealth = summary;
+      return summary;
+    })();
+
+    this.healthCheckInFlight = task;
+    try {
+      return await task;
+    } finally {
+      if (this.healthCheckInFlight === task) {
+        this.healthCheckInFlight = null;
       }
-      const canonicalRows: CanonicalEntityRow[] = Array.from(canonicalMap.values()).map((c) => ({
-        canonical_id: c.canonical_id,
-        canonical_name: c.canonical_name,
-        normalized_name: c.normalized_name,
-        entity_type: c.entity_type,
-        primary_domain: domainByCanonical.get(c.canonical_id) ?? null,
-        aliases_json: JSON.stringify(Array.from(c.aliases)),
-        created_at: c.created_at,
-      }));
-      this.db.upsertCanonicalEntities(canonicalRows);
-      this.db.upsertEntityMappingLogs(mappingInputs);
     }
   }
 
   public getStatus(): Record<string, unknown> {
     const counts = this.db.countRecords();
+    const freshCounts24h = this.db.countFresh24h(this.config.freshnessWindowHours);
     const verificationCounts = this.db.getVerificationCounts();
     const checkpoints = this.db.fetchCheckpoints();
     const failureCount = this.db.getFailureCount();
     const auditTrail = this.db.fetchAuditTrail({ limit: 50 });
+    const pipelineRuns = this.db.fetchPipelineRuns(12);
+    const lastSuccessRun = this.db.getLastSuccessfulRun(false);
+    const lastUsableRun = this.db.getLastSuccessfulRun(true);
+    const scheduler = this.getSchedulerStatus();
 
     const qualityReportPath = path.resolve(this.config.dataDir, "quality_report.json");
     let qualityReport: unknown = null;
@@ -4021,12 +4980,28 @@ export class AtlasBackendService {
       : [];
 
     const sheetsStatus: SheetsConnectionStatus = this.sheets.getStatus();
+    const integrationHealth = this.getIntegrationHealthSummary();
+    const byId = integrationHealth.byId;
+
+    const anyLlmLiveVerified = ["gemini", "groq", "llama3", "deepseek"].some(
+      (k) => byId[k]?.status === "Configured"
+    );
+
+    const latestCompletedOrPartial = pipelineRuns.find((r) => r.status !== "running") ?? null;
 
     return {
       counts,
+      freshCounts24h,
       verificationCounts,
       auditTrail,
       failureCount,
+      pipelineRuns,
+      scheduler,
+      lastSuccessfulRunAt: lastSuccessRun?.completed_at ?? lastSuccessRun?.started_at ?? null,
+      lastCollectionAt: lastUsableRun?.completed_at ?? lastUsableRun?.started_at ?? null,
+      latestRunStatus: latestCompletedOrPartial?.status ?? null,
+      lastSourceOutcomes: latestCompletedOrPartial?.source_outcomes ?? [],
+      activeRun: this.getActiveRunState(),
       targets: {
         startups: this.config.targetStartups,
         products: this.config.targetProducts,
@@ -4034,21 +5009,23 @@ export class AtlasBackendService {
       },
       freshnessWindowHours: this.config.freshnessWindowHours,
       credentials: {
-        geminiConfigured: Boolean(this.config.geminiApiKey),
+        geminiConfigured: byId.gemini?.status === "Configured",
         geminiModel: this.config.geminiModel,
-        groqConfigured: Boolean(this.config.groqApiKey),
-        llama3Configured: Boolean(this.config.llama3ApiKey),
-        deepseekConfigured: Boolean(this.config.deepseekApiKey),
+        groqConfigured: byId.groq?.status === "Configured",
+        llama3Configured: byId.llama3?.status === "Configured",
+        deepseekConfigured: byId.deepseek?.status === "Configured",
         llmChain: this.llmRouter.allProviderNames(),
-        llmDemoFallbackActive: !this.llmRouter.isConfigured(),
-        githubTokenConfigured: Boolean(this.config.githubToken),
-        googleSheetsConfigured: this.sheets.isConfigured(),
+        llmDemoFallbackActive: !anyLlmLiveVerified && !this.llmRouter.isConfigured(),
+        githubTokenConfigured: byId.github?.status === "Configured",
+        googleSheetsConfigured: byId.google_sheets?.status === "Configured",
         googleSheetsSpreadsheetId: Boolean(this.config.googleSheetsSpreadsheetId || sheetsStatus.spreadsheetId),
       },
+      integrationHealth,
       sheetsStatus,
       storage: {
         backend: "sqlite",
         sqlitePath: this.config.dbPath,
+        integrityCheck: integrationHealth.byId?.sqlite?.status === "Configured" ? "ok" : integrationHealth.byId?.sqlite?.error ?? "unknown",
       },
       checkpoints,
       qualityReport,
@@ -4056,9 +5033,19 @@ export class AtlasBackendService {
     };
   }
 
-  public getDataset(category: string, limit: number): Record<string, unknown> {
-    const rows = this.db.fetchDataset(category, limit);
-    return { category, rows, count: rows.length };
+  public getDataset(
+    category: string,
+    limit: number,
+    window: "all" | "24h" = "all"
+  ): Record<string, unknown> {
+    const windowHours = window === "24h" ? this.config.freshnessWindowHours : null;
+    const rows = this.db.fetchDatasetWindow(category, { limit, windowHours });
+    return {
+      category,
+      window,
+      rows,
+      count: rows.length,
+    };
   }
 
   public getAuditTrail(opts: {
@@ -4128,341 +5115,572 @@ export class AtlasBackendService {
     return this.sheets.verifyConnection(opts);
   }
 
-  public async runPipeline(opts: {
+  public startBackgroundRun(opts: {
+    triggerType?: "manual" | "scheduled" | "daily_24h";
+    mode?: "full" | "daily_24h";
     categories: string[];
     limit: number;
     page: number;
+    includeAllFresh24h?: boolean;
     skipAutoSheetsSync?: boolean;
-    onLog?: (msg: string) => void;
-  }): Promise<Record<string, unknown>> {
-    const log = opts.onLog ?? (() => {});
-    const safePage = Math.max(1, opts.page);
-    const limit = Math.max(1, opts.limit);
-    const verifier = new LiveSourceVerifier(this.config, this.http);
-    const existingEntities = this.db.fetchDataset("canonical_entities") as unknown as CanonicalEntityRow[];
-    const resolver = new EntityResolver(existingEntities);
+  }): { started: boolean; conflict: boolean; run: ActiveRunStateSnapshot } {
+    if (this.runInFlight) {
+      return { started: false, conflict: true, run: this.getActiveRunState() };
+    }
+    const triggerType = opts.triggerType ?? "manual";
+    const mode = opts.mode ?? "full";
+    const runId = `run_${Date.now()}`;
+    const startedAt = new Date().toISOString();
 
-    const categoryQuality: Record<string, unknown> = {};
-    const unavailableSources: string[] = [];
-    const collectorErrors: Array<Record<string, unknown>> = [];
-    const overallVerSummary: Record<VerificationStatus, number> = {
-      Verified: 0,
-      "Partially Verified": 0,
-      Unverified: 0,
-      "Source Unavailable": 0,
-      Rejected: 0,
+    this.activeRunState = {
+      id: runId,
+      triggerType,
+      mode,
+      status: "running",
+      categories: opts.categories,
+      limit: opts.limit,
+      page: opts.page,
+      startedAt,
+      finishedAt: null,
+      logs: [
+        `Starting ${mode === "daily_24h" ? "24h fresh" : "pipeline"} collection (${triggerType}) for: ${opts.categories.join(", ")} (limit=${opts.limit}/category, page=${opts.page})`,
+      ],
+      result: null,
+      error: null,
     };
 
-    for (const cat of opts.categories) {
-      log(`[${cat}] Collecting page ${safePage} (limit=${limit})...`);
-      let batch: { records: RawRecord[]; errors: CollectorError[]; hasMore: boolean };
-      try {
-        if (cat === "startups") batch = await collectStartups(this.config, this.http, this.llmRouter, verifier, limit, safePage);
-        else if (cat === "products") batch = await collectProducts(this.config, this.http, verifier, limit, safePage);
-        else if (cat === "research_papers") batch = await collectResearchPapers(this.config, this.http, verifier, limit, safePage);
-        else if (cat === "jobs") batch = await collectJobs(this.config, this.http, verifier, limit, safePage);
-        else if (cat === "news") batch = await collectNews(this.config, this.http, verifier, limit, safePage);
-        else continue;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        this.db.recordFailure({ stage: "collect", category: cat, reason: msg });
-        unavailableSources.push(`${cat}:collector_error`);
-        collectorErrors.push({ category: cat, source: cat, error: msg });
-        log(`[${cat}] Collector error: ${msg}`);
-        continue;
-      }
+    const appendLog = (line: string) => {
+      this.activeRunState.logs = [...this.activeRunState.logs, line].slice(-80);
+    };
 
-      for (const err of batch.errors) {
-        unavailableSources.push(err.source);
-        collectorErrors.push({ category: cat, ...err });
-        this.db.recordFailure({
-          stage: "collect",
-          category: cat,
-          sourceUrl: err.url,
-          reason: err.error,
-          payload: err,
-        });
-      }
+    void this.runPipeline({
+      runId,
+      triggerType,
+      mode,
+      categories: opts.categories,
+      limit: opts.limit,
+      page: opts.page,
+      includeAllFresh24h: opts.includeAllFresh24h,
+      skipAutoSheetsSync: opts.skipAutoSheetsSync,
+      onLog: appendLog,
+    })
+      .then((result) => {
+        const finalStatus =
+          (result.runStatus as ActiveRunStateSnapshot["status"] | undefined) ?? "completed";
+        this.activeRunState.finishedAt = new Date().toISOString();
+        this.activeRunState.result = result;
+        this.activeRunState.status = finalStatus;
+        const syncNote =
+          result && typeof result === "object" && "sheetsSync" in result && result.sheetsSync
+            ? (result.sheetsSync as { success?: boolean; error?: string | null }).success
+              ? " Google Sheets incremental sync succeeded."
+              : ` Google Sheets sync failed: ${(result.sheetsSync as { error?: string | null }).error ?? "unknown error"}`
+            : "";
+        appendLog(`Pipeline run ${finalStatus} and persisted to SQLite + CSV.${syncNote}`);
+      })
+      .catch((err) => {
+        this.activeRunState.finishedAt = new Date().toISOString();
+        this.activeRunState.status = "failed";
+        this.activeRunState.error = err instanceof Error ? err.message : String(err);
+        appendLog(`Pipeline run failed: ${this.activeRunState.error}`);
+      });
 
-      let working = batch.records;
-      let rejectedCount = 0;
-      const rejectionSamples: string[] = [];
-      let freshnessStats: Record<string, unknown> | null = null;
+    return { started: true, conflict: false, run: this.getActiveRunState() };
+  }
 
-      if (cat === "jobs" || cat === "news") {
-        const now = new Date();
-        const dateField = cat === "jobs" ? "posted_at" : "published_at";
-        const accepted: RawRecord[] = [];
-        let rejectedOlder = 0;
-        let rejectedMissing = 0;
-        let rejectedFuture = 0;
+  public async runPipeline(opts: {
+    runId?: string;
+    triggerType?: "manual" | "scheduled" | "daily_24h";
+    mode?: "full" | "daily_24h";
+    categories: string[];
+    limit: number;
+    page: number;
+    includeAllFresh24h?: boolean;
+    skipAutoSheetsSync?: boolean;
+    collectorsOverride?: Partial<
+      Record<
+        "startups" | "products" | "research_papers" | "jobs" | "news",
+        (limit: number, page: number) => Promise<CollectionBatchResult>
+      >
+    >;
+    onLog?: (msg: string) => void;
+  }): Promise<Record<string, unknown>> {
+    if (this.runInFlight) {
+      throw new Error("A pipeline collection run is already in progress.");
+    }
 
-        for (const rec of working) {
-          const dt = parseUtcDatetime(rec[dateField]);
-          const fresh = isWithinFreshnessWindow(dt, now, this.config.freshnessWindowHours);
-          if (fresh.ok) {
-            accepted.push(rec);
-          } else {
-            rejectedCount++;
-            if (fresh.reason === "missing_published_at") rejectedMissing++;
-            else if (fresh.reason === "future_publication_date") rejectedFuture++;
-            else rejectedOlder++;
-            if (rejectionSamples.length < 5) rejectionSamples.push(fresh.reason);
-            this.db.recordFailure({
-              stage: "freshness",
-              category: cat,
-              sourceUrl: (rec.source_url as string | null) ?? null,
-              reason: fresh.reason,
-              payload: rec,
-            });
-          }
-        }
-        freshnessStats = {
-          window_hours: this.config.freshnessWindowHours,
-          evaluated: working.length,
-          accepted: accepted.length,
-          rejected_older: rejectedOlder,
-          rejected_missing_date: rejectedMissing,
-          rejected_future_date: rejectedFuture,
-        };
-        working = accepted.slice(0, limit);
-      }
+    let releaseLock!: () => void;
+    const lockPromise = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    this.runInFlight = lockPromise;
 
-      // Assign deterministic IDs & deduplicate
-      const seenKeys = new Set<string>();
-      const uniqueRecords: RawRecord[] = [];
-      let duplicates = 0;
-      const missingFields: Record<string, number> = {};
-      const sourceDistribution: Record<string, number> = {};
+    const execute = async (): Promise<Record<string, unknown>> => {
+      const log = opts.onLog ?? (() => {});
+      const runId = opts.runId || `run_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      const triggerType = opts.triggerType ?? "manual";
+      const mode = opts.mode ?? "full";
+      const safePage = Math.max(1, opts.page);
+      const limit = Math.max(1, opts.limit);
+      const keepAllFresh24h = Boolean(opts.includeAllFresh24h || mode === "daily_24h");
+      const startedAt = new Date().toISOString();
+      const initialHistorical = this.db.countRecords();
+      const initialFresh24h = this.db.countFresh24h(this.config.freshnessWindowHours);
 
-      for (const rec of working) {
-        let id = "";
-        let dedupKey = "";
-        if (cat === "startups") {
-          const key = String(rec.website || rec.source_url);
-          id = makeStableId("stp", String(rec.name), key);
-          dedupKey = `${String(rec.name).toLowerCase()}|${String(rec.source_url).toLowerCase()}`;
-          rec.startup_id = id;
-        } else if (cat === "products") {
-          const key = String(rec.website || rec.source_url);
-          const compKey = rec.company_name === "Unknown" ? null : String(rec.company_name);
-          id = makeStableId("prd", String(rec.name), compKey, key);
-          dedupKey = `${String(rec.name).toLowerCase()}|${String(rec.source_url).toLowerCase()}`;
-          rec.product_id = id;
-        } else if (cat === "research_papers") {
-          const identity = String(rec.doi || rec.arxiv_id || rec.source_url);
-          id = makeStableId("pap", identity, String(rec.title));
-          dedupKey = String(rec.source_url).toLowerCase();
-          rec.paper_id = id;
-        } else if (cat === "jobs") {
-          id = makeStableId("job", String(rec.application_url), String(rec.title), String(rec.company));
-          dedupKey = String(rec.application_url).toLowerCase();
-          rec.job_id = id;
-        } else if (cat === "news") {
-          id = makeStableId("nws", String(rec.article_url));
-          dedupKey = String(rec.article_url).toLowerCase();
-          rec.news_id = id;
-        }
+      this.db.createPipelineRun({
+        runId,
+        triggerType,
+        mode,
+        categories: opts.categories,
+        startedAt,
+        historicalCounts: initialHistorical,
+        fresh24hCounts: initialFresh24h,
+      });
 
-        if (seenKeys.has(dedupKey)) {
-          duplicates++;
-          continue;
-        }
-        seenKeys.add(dedupKey);
-        uniqueRecords.push(rec);
-        const srcName = String(rec.source_name ?? rec.publisher ?? "unknown");
-        sourceDistribution[srcName] = (sourceDistribution[srcName] ?? 0) + 1;
+      const verifier = new LiveSourceVerifier(this.config, this.http);
+      const existingEntities = this.db.fetchDataset("canonical_entities") as unknown as CanonicalEntityRow[];
+      const resolver = new EntityResolver(existingEntities);
 
-        const tracked =
-          cat === "startups"
-            ? ["description", "website", "industry", "location", "founding_date"]
-            : cat === "products"
-            ? ["description", "website", "category", "company_name"]
-            : cat === "research_papers"
-            ? ["abstract", "authors", "publication_date", "doi", "arxiv_id", "github_repository", "github_stars"]
-            : cat === "jobs"
-            ? ["location", "employment_type", "description"]
-            : ["summary", "category"];
-        for (const f of tracked) {
-          const val = rec[f];
-          if (
-            val === null ||
-            val === undefined ||
-            val === "" ||
-            (Array.isArray(val) && val.length === 0) ||
-            (typeof val === "string" && val.trim().toLowerCase() === "unknown")
-          ) {
-            missingFields[f] = (missingFields[f] ?? 0) + 1;
-          }
-        }
-      }
-
-      const bulkSnapshotOnly = cat === "news" ? uniqueRecords.length > 150 : uniqueRecords.length > 100;
-      log(
-        `[${cat}] Verifying ${uniqueRecords.length} records against live ${
-          bulkSnapshotOnly ? "API/feed snapshots" : "source URLs & websites"
-        }...`
-      );
-      const checkedAtIso = new Date().toISOString();
-      const verified = await mapConcurrent(uniqueRecords, this.config.maxConcurrency, (rec) =>
-        verifier.verifyRecord(
-          cat as "startups" | "products" | "research_papers" | "jobs" | "news",
-          rec,
-          { liveCheck: true, bulkSnapshotOnly, checkedAtIso }
-        )
-      );
-
-      // Entity resolution
-      for (const rec of verified) {
-        if (cat === "startups") {
-          rec.canonical_entity_id = resolver.resolve({
-            rawName: String(rec.name),
-            entityType: "startup",
-            website: (rec.website as string | null) ?? null,
-            sourceUrl: String(rec.source_url),
-          });
-        } else if (cat === "products") {
-          rec.canonical_entity_id = resolver.resolve({
-            rawName: String(rec.name),
-            entityType: "product",
-            website: (rec.website as string | null) ?? null,
-            sourceUrl: String(rec.source_url),
-          });
-          if (rec.company_name && rec.company_name !== "Unknown") {
-            resolver.resolve({
-              rawName: String(rec.company_name),
-              entityType: "company",
-              website: null,
-              sourceUrl: String(rec.source_url),
-            });
-          }
-        } else if (cat === "jobs" && rec.company && rec.company !== "Unknown") {
-          rec.canonical_company_id = resolver.resolve({
-            rawName: String(rec.company),
-            entityType: "company",
-            website: null,
-            sourceUrl: String(rec.source_url),
-          });
-        }
-      }
-
-      // Persist category records
-      if (cat === "startups") this.db.upsertStartups(verified as unknown as StartupInput[]);
-      else if (cat === "products") this.db.upsertProducts(verified as unknown as ProductInput[]);
-      else if (cat === "research_papers") this.db.upsertResearchPapers(verified as unknown as ResearchPaperInput[]);
-      else if (cat === "jobs") this.db.upsertJobs(verified as unknown as JobInput[]);
-      else if (cat === "news") this.db.upsertNews(verified as unknown as NewsInput[]);
-
-      const verBreakdown: Record<VerificationStatus, number> = {
+      const categoryQuality: Record<string, unknown> = {};
+      const unavailableSources: string[] = [];
+      const collectorErrors: Array<Record<string, unknown>> = [];
+      const allSourceOutcomes: SourceOutcomeRecord[] = [];
+      let totalPersistedThisRun = 0;
+      const overallVerSummary: Record<VerificationStatus, number> = {
         Verified: 0,
         "Partially Verified": 0,
         Unverified: 0,
         "Source Unavailable": 0,
         Rejected: 0,
       };
-      const auditEntries: AuditEntryInput[] = [];
-      for (const rec of verified) {
-        const st = rec.verification_status as VerificationStatus;
-        verBreakdown[st] = (verBreakdown[st] ?? 0) + 1;
-        overallVerSummary[st] = (overallVerSummary[st] ?? 0) + 1;
-        const meta = (rec.source_metadata as Record<string, unknown>) || {};
-        const idCol =
-          cat === "startups"
-            ? "startup_id"
-            : cat === "products"
-            ? "product_id"
-            : cat === "research_papers"
-            ? "paper_id"
-            : cat === "jobs"
-            ? "job_id"
-            : "news_id";
-        const nameCol =
-          cat === "research_papers" ? "title" : cat === "jobs" ? "title" : cat === "news" ? "headline" : "name";
-        const supported = (rec.supported_fields as string[]) || [];
-        const issues = (meta.audit_issues as string[]) || [];
-        const reasonParts = [`Verified status assessed as '${st}'`];
-        if (supported.length > 0) reasonParts.push(`supported fields: ${supported.join(", ")}`);
-        if (issues.length > 0) reasonParts.push(`detected issues: ${issues.join(", ")}`);
-        if (rec.rejection_reason) reasonParts.push(`reason: ${String(rec.rejection_reason)}`);
 
-        auditEntries.push({
-          category: cat,
-          record_id: String(rec[idCol]),
-          record_name: String(rec[nameCol] ?? ""),
-          previous_status: null,
-          new_status: st,
-          issues,
-          source_url: String(rec.source_url),
-          source_title: (rec.source_title as string | null) ?? null,
-          evidence_excerpt: (meta.source_evidence_excerpt as string | null) ?? null,
-          reason: reasonParts.join("; "),
-          checked_at: checkedAtIso,
+      try {
+        for (const cat of opts.categories) {
+          log(`[${cat}] Collecting page ${safePage} (limit=${limit}, mode=${mode})...`);
+          let batch: CollectionBatchResult;
+          try {
+            const overrideFn = opts.collectorsOverride?.[cat as keyof NonNullable<typeof opts.collectorsOverride>];
+            if (overrideFn) batch = await overrideFn(limit, safePage);
+            else if (cat === "startups") batch = await collectStartups(this.config, this.http, this.llmRouter, verifier, limit, safePage, log);
+            else if (cat === "products") batch = await collectProducts(this.config, this.http, verifier, limit, safePage);
+            else if (cat === "research_papers") batch = await collectResearchPapers(this.config, this.http, verifier, limit, safePage);
+            else if (cat === "jobs") batch = await collectJobs(this.config, this.http, verifier, limit, safePage);
+            else if (cat === "news") batch = await collectNews(this.config, this.http, verifier, limit, safePage);
+            else continue;
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            this.db.recordFailure({ stage: "collect", category: cat, reason: msg });
+            unavailableSources.push(`${cat}:collector_error`);
+            collectorErrors.push({ category: cat, source: cat, error: msg });
+            allSourceOutcomes.push({
+              category: cat,
+              source: cat,
+              url: "",
+              status: "failed",
+              discoveredCount: 0,
+              retried: false,
+              attempts: 1,
+              error: msg,
+            });
+            log(`[${cat}] Collector error: ${msg}`);
+            continue;
+          }
+
+          if (Array.isArray(batch.sourceOutcomes)) {
+            allSourceOutcomes.push(...batch.sourceOutcomes);
+          }
+
+          for (const err of batch.errors) {
+            unavailableSources.push(err.source);
+            collectorErrors.push({ category: cat, ...err });
+            this.db.recordFailure({
+              stage: "collect",
+              category: cat,
+              sourceUrl: err.url,
+              reason: err.error,
+              payload: err,
+            });
+          }
+
+          let working = batch.records;
+          let rejectedCount = 0;
+          const rejectionSamples: string[] = [];
+          let freshnessStats: Record<string, unknown> | null = null;
+          const refNow = new Date();
+
+          if (cat === "jobs" || cat === "news") {
+            const dateField = cat === "jobs" ? "posted_at" : "published_at";
+            const accepted: RawRecord[] = [];
+            let rejectedOlder = 0;
+            let rejectedMissing = 0;
+            let rejectedFuture = 0;
+
+            for (const rec of working) {
+              const dt = parseUtcDatetime(rec[dateField], refNow);
+              const fresh = isWithinFreshnessWindow(dt, refNow, this.config.freshnessWindowHours);
+              if (fresh.ok) {
+                accepted.push(rec);
+              } else {
+                rejectedCount++;
+                if (fresh.reason === "missing_published_at") rejectedMissing++;
+                else if (fresh.reason === "future_publication_date") rejectedFuture++;
+                else rejectedOlder++;
+                if (rejectionSamples.length < 5) rejectionSamples.push(fresh.reason);
+                // Record invalid/future date anomalies cleanly without treating normal historical items as failures
+                if (fresh.reason === "future_publication_date" || fresh.reason === "missing_published_at") {
+                  this.db.recordFailure({
+                    stage: "freshness",
+                    category: cat,
+                    sourceUrl: (rec.source_url as string | null) ?? null,
+                    reason: fresh.reason,
+                    payload: rec,
+                  });
+                }
+              }
+            }
+            freshnessStats = {
+              window_hours: this.config.freshnessWindowHours,
+              evaluated: working.length,
+              accepted: accepted.length,
+              rejected_older: rejectedOlder,
+              rejected_missing_date: rejectedMissing,
+              rejected_future_date: rejectedFuture,
+            };
+            working = keepAllFresh24h ? accepted : accepted.slice(0, limit);
+          } else if (cat === "research_papers") {
+            let accepted = 0;
+            let older = 0;
+            let missing = 0;
+            let future = 0;
+            for (const rec of working) {
+              const dt = parseUtcDatetime(rec.published_at ?? rec.publication_date, refNow);
+              const fresh = isWithinFreshnessWindow(dt, refNow, this.config.freshnessWindowHours);
+              if (fresh.ok) accepted++;
+              else if (fresh.reason === "missing_published_at") missing++;
+              else if (fresh.reason === "future_publication_date") future++;
+              else older++;
+            }
+            freshnessStats = {
+              window_hours: this.config.freshnessWindowHours,
+              evaluated: working.length,
+              accepted,
+              rejected_older: older,
+              rejected_missing_date: missing,
+              rejected_future_date: future,
+            };
+          }
+
+          // Assign deterministic IDs & deduplicate
+          const seenKeys = new Set<string>();
+          const uniqueRecords: RawRecord[] = [];
+          let duplicates = 0;
+          const missingFields: Record<string, number> = {};
+          const sourceDistribution: Record<string, number> = {};
+
+          for (const rec of working) {
+            let id = "";
+            let dedupKey = "";
+            if (cat === "startups") {
+              const key = String(rec.website || rec.source_url);
+              id = makeStableId("stp", String(rec.name), key);
+              dedupKey = `${String(rec.name).toLowerCase()}|${String(rec.source_url).toLowerCase()}`;
+              rec.startup_id = id;
+            } else if (cat === "products") {
+              const key = String(rec.website || rec.source_url);
+              const compKey = rec.company_name === "Unknown" ? null : String(rec.company_name);
+              id = makeStableId("prd", String(rec.name), compKey, key);
+              dedupKey = `${String(rec.name).toLowerCase()}|${String(rec.source_url).toLowerCase()}`;
+              rec.product_id = id;
+            } else if (cat === "research_papers") {
+              const identity = String(rec.doi || rec.arxiv_id || rec.source_url);
+              id = makeStableId("pap", identity, String(rec.title));
+              dedupKey = String(rec.source_url).toLowerCase();
+              rec.paper_id = id;
+            } else if (cat === "jobs") {
+              id = makeStableId("job", String(rec.application_url), String(rec.title), String(rec.company));
+              dedupKey = String(rec.application_url).toLowerCase();
+              rec.job_id = id;
+            } else if (cat === "news") {
+              id = makeStableId("nws", String(rec.article_url));
+              dedupKey = String(rec.article_url).toLowerCase();
+              rec.news_id = id;
+            }
+
+            if (seenKeys.has(dedupKey)) {
+              duplicates++;
+              continue;
+            }
+            seenKeys.add(dedupKey);
+            uniqueRecords.push(rec);
+            const srcName = String(rec.source_name ?? rec.publisher ?? "unknown");
+            sourceDistribution[srcName] = (sourceDistribution[srcName] ?? 0) + 1;
+
+            const tracked =
+              cat === "startups"
+                ? ["description", "website", "industry", "location", "founding_date"]
+                : cat === "products"
+                ? ["description", "website", "category", "company_name"]
+                : cat === "research_papers"
+                ? ["abstract", "authors", "publication_date", "doi", "arxiv_id", "github_repository", "github_stars"]
+                : cat === "jobs"
+                ? ["location", "employment_type", "description"]
+                : ["summary", "category"];
+            for (const f of tracked) {
+              const val = rec[f];
+              if (
+                val === null ||
+                val === undefined ||
+                val === "" ||
+                (Array.isArray(val) && val.length === 0) ||
+                (typeof val === "string" && val.trim().toLowerCase() === "unknown")
+              ) {
+                missingFields[f] = (missingFields[f] ?? 0) + 1;
+              }
+            }
+          }
+
+          const bulkSnapshotOnly = cat === "news" ? uniqueRecords.length > 150 : uniqueRecords.length > 100;
+          log(
+            `[${cat}] Verifying ${uniqueRecords.length} records against live ${
+              bulkSnapshotOnly ? "API/feed snapshots" : "source URLs & websites"
+            }...`
+          );
+          const checkedAtIso = new Date().toISOString();
+          const verified = await mapConcurrent(uniqueRecords, this.config.maxConcurrency, (rec) =>
+            verifier.verifyRecord(
+              cat as "startups" | "products" | "research_papers" | "jobs" | "news",
+              rec,
+              { liveCheck: !opts.collectorsOverride, bulkSnapshotOnly, checkedAtIso }
+            )
+          );
+
+          // Entity resolution
+          for (const rec of verified) {
+            if (cat === "startups") {
+              rec.canonical_entity_id = resolver.resolve({
+                rawName: String(rec.name),
+                entityType: "startup",
+                website: (rec.website as string | null) ?? null,
+                sourceUrl: String(rec.source_url),
+              });
+            } else if (cat === "products") {
+              rec.canonical_entity_id = resolver.resolve({
+                rawName: String(rec.name),
+                entityType: "product",
+                website: (rec.website as string | null) ?? null,
+                sourceUrl: String(rec.source_url),
+              });
+              if (rec.company_name && rec.company_name !== "Unknown") {
+                resolver.resolve({
+                  rawName: String(rec.company_name),
+                  entityType: "company",
+                  website: null,
+                  sourceUrl: String(rec.source_url),
+                });
+              }
+            } else if (cat === "jobs" && rec.company && rec.company !== "Unknown") {
+              rec.canonical_company_id = resolver.resolve({
+                rawName: String(rec.company),
+                entityType: "company",
+                website: null,
+                sourceUrl: String(rec.source_url),
+              });
+            } else if (cat === "news" && rec.publisher && rec.publisher !== "Unknown") {
+              resolver.resolve({
+                rawName: String(rec.publisher),
+                entityType: "publisher",
+                website: (rec.official_website as string | null) ?? null,
+                sourceUrl: String(rec.article_url || rec.source_url),
+              });
+            }
+          }
+
+          // Persist category records
+          if (cat === "startups") this.db.upsertStartups(verified as unknown as StartupInput[]);
+          else if (cat === "products") this.db.upsertProducts(verified as unknown as ProductInput[]);
+          else if (cat === "research_papers") this.db.upsertResearchPapers(verified as unknown as ResearchPaperInput[]);
+          else if (cat === "jobs") this.db.upsertJobs(verified as unknown as JobInput[]);
+          else if (cat === "news") this.db.upsertNews(verified as unknown as NewsInput[]);
+          totalPersistedThisRun += verified.length;
+
+          const verBreakdown: Record<VerificationStatus, number> = {
+            Verified: 0,
+            "Partially Verified": 0,
+            Unverified: 0,
+            "Source Unavailable": 0,
+            Rejected: 0,
+          };
+          const auditEntries: AuditEntryInput[] = [];
+          for (const rec of verified) {
+            const st = rec.verification_status as VerificationStatus;
+            verBreakdown[st] = (verBreakdown[st] ?? 0) + 1;
+            overallVerSummary[st] = (overallVerSummary[st] ?? 0) + 1;
+            const meta = (rec.source_metadata as Record<string, unknown>) || {};
+            const idCol =
+              cat === "startups"
+                ? "startup_id"
+                : cat === "products"
+                ? "product_id"
+                : cat === "research_papers"
+                ? "paper_id"
+                : cat === "jobs"
+                ? "job_id"
+                : "news_id";
+            const nameCol =
+              cat === "research_papers" ? "title" : cat === "jobs" ? "title" : cat === "news" ? "headline" : "name";
+            const supported = (rec.supported_fields as string[]) || [];
+            const issues = (meta.audit_issues as string[]) || [];
+            const reasonParts = [`Verified status assessed as '${st}'`];
+            if (supported.length > 0) reasonParts.push(`supported fields: ${supported.join(", ")}`);
+            if (issues.length > 0) reasonParts.push(`detected issues: ${issues.join(", ")}`);
+            if (rec.rejection_reason) reasonParts.push(`reason: ${String(rec.rejection_reason)}`);
+
+            auditEntries.push({
+              category: cat,
+              record_id: String(rec[idCol]),
+              record_name: String(rec[nameCol] ?? ""),
+              previous_status: null,
+              new_status: st,
+              issues,
+              source_url: String(rec.source_url),
+              source_title: (rec.source_title as string | null) ?? null,
+              evidence_excerpt: (meta.source_evidence_excerpt as string | null) ?? null,
+              reason: reasonParts.join("; "),
+              checked_at: checkedAtIso,
+            });
+          }
+          this.db.recordAuditEntries(auditEntries);
+
+          const nextCursor = batch.hasMore ? `page:${safePage + 1}` : `page:${safePage}`;
+          this.db.saveCheckpoint(`pipeline:${cat}`, cat, nextCursor, verified.length);
+
+          const persistedCounts = this.db.countRecords();
+          const persistedTotal = persistedCounts[cat] ?? 0;
+          const targetMin =
+            cat === "startups"
+              ? this.config.targetStartups
+              : cat === "products"
+              ? this.config.targetProducts
+              : cat === "research_papers"
+              ? this.config.targetResearchPapers
+              : null;
+
+          categoryQuality[cat] = {
+            discovered: batch.records.length,
+            extracted: batch.records.length,
+            validated: working.length,
+            rejected: rejectedCount,
+            duplicates,
+            persisted_total: persistedTotal,
+            target_minimum: targetMin,
+            target_met: targetMin !== null ? persistedTotal >= targetMin : null,
+            verification_breakdown: verBreakdown,
+            missing_fields: missingFields,
+            source_distribution: sourceDistribution,
+            freshness: freshnessStats,
+            sample_rejection_reasons: rejectionSamples,
+          };
+          log(`[${cat}] Persisted ${verified.length} records (total in DB: ${persistedTotal}).`);
+        }
+
+        this.db.upsertCanonicalEntities(resolver.getEntities());
+        this.db.upsertEntityMappingLogs(resolver.getLogs());
+
+        const qualityReport = this.writeSyncedQualityReport(categoryQuality, unavailableSources);
+
+        const csvSummary = this.exportAllCsv();
+        this.db.checkpointWal("PASSIVE");
+        log("Refreshed CSV exports across all 6 datasets and checkpointed SQLite WAL.");
+
+        let sheetsSync: SheetsSyncResult | null = null;
+        if (!opts.skipAutoSheetsSync && this.sheets.isConfigured()) {
+          log("Synchronizing collected records to Google Sheets (incremental mode)...");
+          sheetsSync = await this.sheets.exportOrSync("incremental");
+          if (sheetsSync.success) {
+            log(
+              `Google Sheets synced (+${sheetsSync.rowsAdded} added, ${sheetsSync.rowsUpdated} updated, ${sheetsSync.rowsUnchanged} unchanged).`
+            );
+          } else {
+            log(`Google Sheets sync failed: ${sheetsSync.error ?? "unknown error"}`);
+          }
+        }
+
+        const finalHistorical = this.db.countRecords();
+        const finalFresh24h = this.db.countFresh24h(this.config.freshnessWindowHours);
+        const failedOutcomes = allSourceOutcomes.filter((s) => s.status === "failed");
+        const okOrEmptyOutcomes = allSourceOutcomes.filter((s) => s.status !== "failed");
+        const hasErrors = failedOutcomes.length > 0 || collectorErrors.length > 0 || Boolean(sheetsSync && !sheetsSync.success);
+        const allSourcesFailed =
+          allSourceOutcomes.length > 0 && okOrEmptyOutcomes.length === 0 && totalPersistedThisRun === 0;
+        const runStatus: "completed" | "partial" | "failed" = allSourcesFailed
+          ? "failed"
+          : hasErrors
+          ? "partial"
+          : "completed";
+        const completedAt = new Date().toISOString();
+        const summaryText =
+          runStatus === "completed"
+            ? `Completed cleanly (${totalPersistedThisRun} rows processed across ${opts.categories.length} dataset(s)).`
+            : runStatus === "partial"
+            ? `Partial collection (${totalPersistedThisRun} rows processed; ${failedOutcomes.length} source error(s)).`
+            : `Collection failed (${collectorErrors.length} error(s)); historical DB records preserved.`;
+
+        this.db.completePipelineRun({
+          runId,
+          completedAt,
+          status: runStatus,
+          historicalCounts: finalHistorical,
+          fresh24hCounts: finalFresh24h,
+          errors: collectorErrors,
+          sourceOutcomes: allSourceOutcomes,
+          summary: summaryText,
         });
+
+        const sched = this.ensureSchedulerInitialized();
+        this.db.saveSchedulerState({
+          ...sched,
+          last_run_at: completedAt,
+          last_success_at: runStatus === "completed" ? completedAt : sched.last_success_at,
+          updated_at: completedAt,
+        });
+
+        return {
+          runId,
+          runStatus,
+          databaseCounts: finalHistorical,
+          freshCounts24h: finalFresh24h,
+          verificationCounts: this.db.getVerificationCounts(),
+          collectorErrors,
+          sourceOutcomes: allSourceOutcomes,
+          qualityReport,
+          csvExportDir: csvSummary.outputDir,
+          sheetsSync,
+        };
+      } catch (fatalErr) {
+        const msg = fatalErr instanceof Error ? fatalErr.message : String(fatalErr);
+        const completedAt = new Date().toISOString();
+        this.db.completePipelineRun({
+          runId,
+          completedAt,
+          status: "failed",
+          historicalCounts: this.db.countRecords(),
+          fresh24hCounts: this.db.countFresh24h(this.config.freshnessWindowHours),
+          errors: [...collectorErrors, { source: "pipeline", error: msg }],
+          sourceOutcomes: allSourceOutcomes,
+          summary: `Fatal error: ${msg}`,
+        });
+        throw fatalErr;
       }
-      // Keep audit inserts fast by sampling/bounding for huge batches if needed, or batch insert all
-      this.db.recordAuditEntries(auditEntries);
-
-      const nextCursor = batch.hasMore ? `page:${safePage + 1}` : `page:${safePage}`;
-      this.db.saveCheckpoint(`pipeline:${cat}`, cat, nextCursor, verified.length);
-
-      const persistedCounts = this.db.countRecords();
-      const persistedTotal = persistedCounts[cat] ?? 0;
-      const targetMin =
-        cat === "startups"
-          ? this.config.targetStartups
-          : cat === "products"
-          ? this.config.targetProducts
-          : cat === "research_papers"
-          ? this.config.targetResearchPapers
-          : null;
-
-      categoryQuality[cat] = {
-        discovered: batch.records.length,
-        extracted: batch.records.length,
-        validated: working.length,
-        rejected: rejectedCount,
-        duplicates,
-        persisted_total: persistedTotal,
-        target_minimum: targetMin,
-        target_met: targetMin !== null ? persistedTotal >= targetMin : null,
-        verification_breakdown: verBreakdown,
-        missing_fields: missingFields,
-        source_distribution: sourceDistribution,
-        freshness: freshnessStats,
-        sample_rejection_reasons: rejectionSamples,
-      };
-      log(`[${cat}] Persisted ${verified.length} records (total in DB: ${persistedTotal}).`);
-    }
-
-    this.db.upsertCanonicalEntities(resolver.getEntities());
-    this.db.upsertEntityMappingLogs(resolver.getLogs());
-
-    const qualityReport = this.writeSyncedQualityReport(categoryQuality, unavailableSources);
-
-    const csvSummary = this.exportAllCsv();
-    log("Refreshed CSV exports across all 6 datasets.");
-
-    let sheetsSync: SheetsSyncResult | null = null;
-    if (!opts.skipAutoSheetsSync && this.sheets.isConfigured()) {
-      log("Synchronizing collected records to Google Sheets (incremental mode)...");
-      sheetsSync = await this.sheets.exportOrSync("incremental");
-      if (sheetsSync.success) {
-        log(
-          `Google Sheets synced (+${sheetsSync.rowsAdded} added, ${sheetsSync.rowsUpdated} updated, ${sheetsSync.rowsUnchanged} unchanged).`
-        );
-      } else {
-        log(`Google Sheets sync failed: ${sheetsSync.error ?? "unknown error"}`);
-      }
-    }
-
-    return {
-      databaseCounts: this.db.countRecords(),
-      verificationCounts: this.db.getVerificationCounts(),
-      collectorErrors,
-      qualityReport,
-      csvExportDir: csvSummary.outputDir,
-      sheetsSync,
     };
+
+    try {
+      return await execute();
+    } finally {
+      if (this.runInFlight === lockPromise) {
+        this.runInFlight = null;
+      }
+      releaseLock();
+    }
   }
 
   public async auditExisting(opts: {
@@ -4592,7 +5810,10 @@ export class AtlasBackendService {
 
       // Backfill GitHub star metrics_updated_at & stars for research_papers with github_repository
       if (opts.liveCheck && cat === "research_papers") {
-        const ghHeaders: Record<string, string> = { Accept: "application/vnd.github+json" };
+        const ghHeaders: Record<string, string> = {
+          Accept: "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+        };
         if (this.config.githubToken) ghHeaders.Authorization = `Bearer ${this.config.githubToken}`;
         const slugToPapers = new Map<string, RawRecord[]>();
         for (const rec of parsedRows) {
@@ -4618,6 +5839,7 @@ export class AtlasBackendService {
               meta.github_metrics = {
                 stars: rec.github_stars ?? null,
                 metrics_status: rec.github_stars !== null ? "cached_rate_limited" : "rate_limited",
+                authenticated: Boolean(this.config.githubToken),
                 metrics_updated_at: ts,
               };
               rec.source_metadata = meta;
@@ -4629,6 +5851,12 @@ export class AtlasBackendService {
             timeoutMs: 8000,
             maxAttempts: 1,
           });
+          const rlRemaining = ghRes.headers["x-ratelimit-remaining"] ?? null;
+          const rlLimit = ghRes.headers["x-ratelimit-limit"] ?? null;
+          const rlResetRaw = ghRes.headers["x-ratelimit-reset"];
+          const rlResetIso =
+            rlResetRaw && /^\d+$/.test(rlResetRaw.trim()) ? new Date(Number(rlResetRaw) * 1000).toISOString() : null;
+
           if (ghRes.status === 403 || ghRes.status === 429) {
             rateLimited = true;
             for (const rec of slugToPapers.get(slug) ?? []) {
@@ -4636,6 +5864,10 @@ export class AtlasBackendService {
               meta.github_metrics = {
                 stars: rec.github_stars ?? null,
                 metrics_status: rec.github_stars !== null ? `cached_hf_rate_limited_${ghRes.status}` : `rate_limited_http_${ghRes.status}`,
+                rate_limit_remaining: rlRemaining !== null ? Number(rlRemaining) : 0,
+                rate_limit_limit: rlLimit !== null ? Number(rlLimit) : null,
+                rate_limit_reset_at: rlResetIso,
+                authenticated: Boolean(this.config.githubToken),
                 metrics_updated_at: ts,
               };
               rec.source_metadata = meta;
@@ -4654,6 +5886,10 @@ export class AtlasBackendService {
                 language: ghJson.language ?? null,
                 updated_at: ghJson.updated_at ?? null,
                 metrics_updated_at: ts,
+                rate_limit_remaining: rlRemaining !== null ? Number(rlRemaining) : null,
+                rate_limit_limit: rlLimit !== null ? Number(rlLimit) : null,
+                rate_limit_reset_at: rlResetIso,
+                authenticated: Boolean(this.config.githubToken),
                 metrics_status: "verified_github_api",
               };
               for (const rec of slugToPapers.get(slug) ?? []) {
@@ -4664,6 +5900,19 @@ export class AtlasBackendService {
               }
             } catch {
               // Ignore parse failure
+            }
+          } else {
+            for (const rec of slugToPapers.get(slug) ?? []) {
+              const meta = (rec.source_metadata as Record<string, unknown>) || {};
+              meta.github_metrics = {
+                stars: rec.github_stars ?? null,
+                metrics_status: redactSecrets(ghRes.error || `http_${ghRes.status || 0}`),
+                rate_limit_remaining: rlRemaining !== null ? Number(rlRemaining) : null,
+                rate_limit_reset_at: rlResetIso,
+                authenticated: Boolean(this.config.githubToken),
+                metrics_updated_at: ts,
+              };
+              rec.source_metadata = meta;
             }
           }
         });
@@ -4755,6 +6004,7 @@ export class AtlasBackendService {
     this.writeSyncedQualityReport();
 
     this.exportAllCsv();
+    this.db.checkpointWal("PASSIVE");
 
     return {
       auditedCategories,

@@ -69,7 +69,9 @@ export interface CheckpointRow {
 
 export interface RunJobState {
   id: string;
-  status: "idle" | "running" | "completed" | "failed";
+  status: "idle" | "running" | "completed" | "partial" | "failed";
+  triggerType?: "manual" | "scheduled" | "daily_24h";
+  mode?: "full" | "daily_24h";
   categories: string[];
   limit: number;
   page?: number;
@@ -77,6 +79,43 @@ export interface RunJobState {
   finishedAt: string | null;
   logs?: string[];
   error?: string | null;
+}
+
+export interface SourceOutcomeItem {
+  category: string;
+  source: string;
+  url: string;
+  status: "ok" | "empty" | "failed";
+  discoveredCount: number;
+  freshCount?: number;
+  retried: boolean;
+  attempts: number;
+  httpStatus?: number | null;
+  error: string | null;
+}
+
+export interface PipelineRunRow {
+  run_id: string;
+  trigger_type: "manual" | "scheduled" | "daily_24h";
+  mode: "full" | "daily_24h";
+  categories: string[];
+  started_at: string;
+  completed_at: string | null;
+  status: "running" | "completed" | "partial" | "failed";
+  historical_counts: Record<string, number>;
+  fresh_24h_counts: Record<string, number>;
+  errors: Array<Record<string, unknown>>;
+  source_outcomes: SourceOutcomeItem[];
+  summary: string | null;
+}
+
+export interface SchedulerState {
+  enabled: boolean;
+  utc_time: string;
+  last_run_at: string | null;
+  last_success_at: string | null;
+  next_run_at: string | null;
+  updated_at: string;
 }
 
 export interface StartupVerificationReport {
@@ -163,11 +202,42 @@ export interface SheetsStatusPayload {
   lastError: string | null;
 }
 
+export type IntegrationConnectionStatus = "Configured" | "Not Configured" | "Connection Failed";
+
+export interface IntegrationHealthItem {
+  id: "sqlite" | "gemini" | "groq" | "llama3" | "deepseek" | "github" | "google_sheets";
+  label: string;
+  envKey: string;
+  status: IntegrationConnectionStatus;
+  detail: string;
+  error: string | null;
+  latencyMs: number | null;
+  checkedAt: string | null;
+  tested: boolean;
+}
+
+export interface IntegrationHealthSummary {
+  checkedAt: string | null;
+  items: IntegrationHealthItem[];
+  byId: Record<string, IntegrationHealthItem>;
+}
+
 export interface AtlasStatusResponse {
   counts: Record<DatasetCategory, number>;
+  freshCounts24h?: {
+    jobs: number;
+    news: number;
+    research_papers: number;
+  };
   verificationCounts?: VerificationCountsPayload;
   auditTrail?: AuditTrailEntry[];
   failureCount: number;
+  pipelineRuns?: PipelineRunRow[];
+  scheduler?: SchedulerState;
+  lastSuccessfulRunAt?: string | null;
+  lastCollectionAt?: string | null;
+  latestRunStatus?: "completed" | "partial" | "failed" | null;
+  lastSourceOutcomes?: SourceOutcomeItem[];
   targets: {
     startups: number;
     products: number;
@@ -186,10 +256,12 @@ export interface AtlasStatusResponse {
     googleSheetsConfigured: boolean;
     googleSheetsSpreadsheetId: boolean;
   };
+  integrationHealth?: IntegrationHealthSummary;
   sheetsStatus?: SheetsStatusPayload;
   storage: {
     backend: string;
     sqlitePath: string | null;
+    integrityCheck?: string;
   };
   checkpoints: CheckpointRow[];
   qualityReport: QualityReport | null;
@@ -241,6 +313,7 @@ export interface ResearchPaperRow extends TraceabilityFields {
   abstract: string | null;
   authors_json: string;
   publication_date: string | null;
+  published_at?: string | null;
   doi: string | null;
   arxiv_id: string | null;
   github_repository: string | null;

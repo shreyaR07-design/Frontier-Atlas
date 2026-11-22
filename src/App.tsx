@@ -54,6 +54,7 @@ export default function App() {
   const [statusError, setStatusError] = useState<string | null>(null);
 
   const [datasetRows, setDatasetRows] = useState<AnyDatasetRow[]>([]);
+  const [datasetWindow, setDatasetWindow] = useState<"all" | "24h">("all");
   const [datasetLoading, setDatasetLoading] = useState(false);
   const [datasetError, setDatasetError] = useState<string | null>(null);
   const datasetRequestSeqRef = useRef(0);
@@ -71,11 +72,13 @@ export default function App() {
 
   const [runModalOpen, setRunModalOpen] = useState(false);
   const [auditing, setAuditing] = useState(false);
+  const [schedulerUpdating, setSchedulerUpdating] = useState(false);
   const [sheetsExporting, setSheetsExporting] = useState(false);
   const [sheetsSyncing, setSheetsSyncing] = useState(false);
   const [sheetsConfirmMode, setSheetsConfirmMode] = useState<"full" | "incremental" | null>(null);
   const [targetSpreadsheetId, setTargetSpreadsheetId] = useState("");
   const [googleSigningIn, setGoogleSigningIn] = useState(false);
+  const [testingIntegrations, setTestingIntegrations] = useState(false);
   const [googleUserEmail, setGoogleUserEmail] = useState<string | null>(null);
   const [googleHasToken, setGoogleHasToken] = useState(false);
   const [sheetsFeedback, setSheetsFeedback] = useState<{
@@ -117,12 +120,14 @@ export default function App() {
     }
   }, []);
 
-  const loadDataset = useCallback(async (category: DatasetCategory) => {
+  const loadDataset = useCallback(async (category: DatasetCategory, win: "all" | "24h" = "all") => {
     const seq = ++datasetRequestSeqRef.current;
     setDatasetLoading(true);
     setDatasetError(null);
     try {
-      const resp = await fetch(`/api/atlas/datasets/${category}?limit=1500`);
+      const supportsWin = category === "jobs" || category === "news" || category === "research_papers";
+      const query = supportsWin ? `?limit=1500&window=${win}` : `?limit=1500`;
+      const resp = await fetch(`/api/atlas/datasets/${category}${query}`);
       const data = await resp.json();
       if (seq !== datasetRequestSeqRef.current) return;
       if (!resp.ok) {
@@ -145,6 +150,7 @@ export default function App() {
       datasetRequestSeqRef.current += 1;
       setDatasetRows([]);
       setDatasetError(null);
+      setDatasetWindow("all");
       setDatasetLoading(nextSection !== "overview");
       setActiveSection(nextSection);
     }
@@ -177,9 +183,9 @@ export default function App() {
 
   useEffect(() => {
     if (activeSection !== "overview") {
-      void loadDataset(activeSection);
+      void loadDataset(activeSection, datasetWindow);
     }
-  }, [activeSection, loadDataset]);
+  }, [activeSection, datasetWindow, loadDataset]);
 
   useEffect(() => {
     if (runState.status !== "running") return;
@@ -194,7 +200,7 @@ export default function App() {
             void loadStatus();
             void loadFailures();
             if (activeSection !== "overview") {
-              void loadDataset(activeSection);
+              void loadDataset(activeSection, datasetWindow);
             }
           }
         }
@@ -203,7 +209,7 @@ export default function App() {
       }
     }, 1500);
     return () => window.clearInterval(timer);
-  }, [runState.status, activeSection, loadStatus, loadFailures, loadDataset]);
+  }, [runState.status, activeSection, datasetWindow, loadStatus, loadFailures, loadDataset]);
 
   const handleStartRun = async (categories: string[], limit: number, page = 1) => {
     setRunModalOpen(false);
@@ -217,7 +223,7 @@ export default function App() {
       if (!resp.ok) {
         setRunState((prev) => ({
           ...prev,
-          status: "failed",
+          status: resp.status === 409 ? prev.status : "failed",
           error: data.error || `HTTP ${resp.status}`,
         }));
         return;
@@ -231,6 +237,57 @@ export default function App() {
         status: "failed",
         error: err instanceof Error ? err.message : String(err),
       }));
+    }
+  };
+
+  const handleRefresh24h = async () => {
+    setSheetsFeedback(null);
+    try {
+      const resp = await fetch("/api/atlas/refresh-24h", { method: "POST" });
+      const data = await resp.json();
+      if (!resp.ok) {
+        setSheetsFeedback({
+          success: false,
+          message: data.error || `HTTP ${resp.status}`,
+        });
+        return;
+      }
+      if (data.run) {
+        setRunState(data.run);
+      }
+    } catch (err) {
+      setSheetsFeedback({
+        success: false,
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  };
+
+  const handleUpdateScheduler = async (opts: { enabled?: boolean; utcTime?: string }) => {
+    setSchedulerUpdating(true);
+    setSheetsFeedback(null);
+    try {
+      const resp = await fetch("/api/atlas/scheduler", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(opts),
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        throw new Error(data.error || `HTTP ${resp.status}`);
+      }
+      await loadStatus();
+      setSheetsFeedback({
+        success: true,
+        message: `Daily UTC collection schedule updated (${data.scheduler?.enabled ? `Enabled at ${data.scheduler?.utc_time} UTC` : "Paused"}).`,
+      });
+    } catch (err) {
+      setSheetsFeedback({
+        success: false,
+        message: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setSchedulerUpdating(false);
     }
   };
 
@@ -250,7 +307,7 @@ export default function App() {
       await loadStatus();
       await loadFailures();
       if (activeSection !== "overview") {
-        void loadDataset(activeSection);
+        void loadDataset(activeSection, datasetWindow);
       }
       const totals = data.verificationCounts?.totals;
       const logged = Number(data.auditEntriesLogged ?? 0);
@@ -272,16 +329,40 @@ export default function App() {
     }
   };
 
+  const handleTestIntegrations = useCallback(async (overrideToken?: string | null) => {
+    setTestingIntegrations(true);
+    try {
+      const token = overrideToken !== undefined ? overrideToken : getGoogleAccessToken();
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (token) {
+        headers.Authorization = `Bearer ${token}`;
+      }
+      const resp = await fetch("/api/atlas/integrations/test", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          spreadsheetId: targetSpreadsheetId.trim() || undefined,
+        }),
+      });
+      if (resp.ok) {
+        await loadStatus();
+      }
+    } finally {
+      setTestingIntegrations(false);
+    }
+  }, [loadStatus, targetSpreadsheetId]);
+
   const handleGoogleSignIn = async () => {
     setGoogleSigningIn(true);
     setSheetsFeedback(null);
     try {
-      const { user } = await googleSignIn();
+      const { user, accessToken } = await googleSignIn();
       setGoogleUserEmail(user.email || user.displayName || "Google Account");
       setGoogleHasToken(true);
+      await handleTestIntegrations(accessToken);
       setSheetsFeedback({
         success: true,
-        message: `Connected Google account (${user.email || "authenticated"}). You can now export or sync directly to Google Sheets.`,
+        message: `Verified Google Workspace OAuth access for ${user.email || "your account"}. You can now export or sync to Google Sheets.`,
       });
     } catch (err) {
       setSheetsFeedback({
@@ -297,6 +378,7 @@ export default function App() {
     await googleSignOut();
     setGoogleUserEmail(null);
     setGoogleHasToken(false);
+    await handleTestIntegrations(null);
     setSheetsFeedback({
       success: true,
       message: "Signed out of Google Workspace session.",
@@ -446,7 +528,7 @@ export default function App() {
     void loadStatus();
     void loadFailures();
     if (activeSection !== "overview") {
-      void loadDataset(activeSection);
+      void loadDataset(activeSection, datasetWindow);
     }
   };
 
@@ -516,6 +598,7 @@ export default function App() {
               failures={failures}
               runState={runState}
               auditing={auditing}
+              schedulerUpdating={schedulerUpdating}
               sheetsExporting={sheetsExporting}
               sheetsSyncing={sheetsSyncing}
               sheetsFeedback={sheetsFeedback}
@@ -526,8 +609,14 @@ export default function App() {
               onTargetSpreadsheetIdChange={setTargetSpreadsheetId}
               onGoogleSignIn={handleGoogleSignIn}
               onGoogleSignOut={handleGoogleSignOut}
+              testingIntegrations={testingIntegrations}
+              onTestIntegrations={() => {
+                void handleTestIntegrations();
+              }}
               onSelectSection={handleSelectSection}
               onOpenRunModal={() => setRunModalOpen(true)}
+              onRefresh24h={handleRefresh24h}
+              onUpdateScheduler={handleUpdateScheduler}
               onAuditRecords={handleAuditRecords}
               onExportSheets={handleExportSheets}
               onSyncSheets={handleSyncSheets}
@@ -545,8 +634,10 @@ export default function App() {
               hasCsvExport={Boolean(
                 status?.csvExports.includes(DATASET_CSV_NAMES[activeSection])
               )}
+              windowMode={datasetWindow}
+              onWindowModeChange={setDatasetWindow}
               onSelectCategory={handleSelectSection}
-              onRetry={() => loadDataset(activeSection)}
+              onRetry={() => loadDataset(activeSection, datasetWindow)}
               onOpenRunModal={() => setRunModalOpen(true)}
             />
           )}
@@ -557,6 +648,7 @@ export default function App() {
         open={runModalOpen}
         running={runState.status === "running"}
         credentials={status?.credentials ?? null}
+        integrationHealth={status?.integrationHealth ?? null}
         onClose={() => setRunModalOpen(false)}
         onStartRun={handleStartRun}
       />

@@ -6,6 +6,7 @@ interface RunCollectionModalProps {
   open: boolean;
   running: boolean;
   credentials?: AtlasStatusResponse["credentials"] | null;
+  integrationHealth?: AtlasStatusResponse["integrationHealth"] | null;
   onClose: () => void;
   onStartRun: (categories: string[], limit: number, page: number) => void;
 }
@@ -22,6 +23,7 @@ export function RunCollectionModal({
   open,
   running,
   credentials,
+  integrationHealth,
   onClose,
   onStartRun,
 }: RunCollectionModalProps) {
@@ -44,10 +46,33 @@ export function RunCollectionModal({
   };
 
   const missingNotices: string[] = [];
-  if (credentials && !credentials.githubTokenConfigured) {
+  const githubHealth = integrationHealth?.byId?.github;
+  if (githubHealth) {
+    if (githubHealth.status === "Not Configured") {
+      missingNotices.push("GITHUB_TOKEN is unset (GitHub API uses unauthenticated 60 req/hr limit).");
+    } else if (githubHealth.status === "Connection Failed") {
+      missingNotices.push(`GitHub API check failed (${githubHealth.error || githubHealth.detail}).`);
+    }
+  } else if (credentials && !credentials.githubTokenConfigured) {
     missingNotices.push("GITHUB_TOKEN is unset (GitHub API uses unauthenticated 60 req/hr limit).");
   }
-  if (credentials && !credentials.geminiConfigured) {
+
+  const llmIds = ["gemini", "groq", "llama3", "deepseek"] as const;
+  if (integrationHealth?.byId) {
+    const anyConfigured = llmIds.some((id) => integrationHealth.byId[id]?.status === "Configured");
+    const failedLlm = llmIds
+      .map((id) => integrationHealth.byId[id])
+      .filter((item) => item?.status === "Connection Failed");
+    if (!anyConfigured && failedLlm.length > 0) {
+      missingNotices.push(
+        `No LLM provider currently passed health check (${failedLlm.map((i) => i.label).join(", ")} returned Connection Failed; structured public APIs still run).`
+      );
+    } else if (!anyConfigured) {
+      missingNotices.push(
+        "No LLM API keys configured (unstructured LLM HTML fallback is disabled; structured public APIs still run)."
+      );
+    }
+  } else if (credentials && !credentials.geminiConfigured) {
     missingNotices.push("GEMINI_API_KEY is unset (unstructured LLM HTML fallback is disabled; structured public APIs still run).");
   }
 

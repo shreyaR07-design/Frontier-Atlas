@@ -9,11 +9,8 @@ import {
 import firebaseConfig from "../../firebase-applet-config.json";
 
 export const GOOGLE_WORKSPACE_SCOPES = [
-  "https://www.googleapis.com/auth/drive",
   "https://www.googleapis.com/auth/drive.file",
-  "https://www.googleapis.com/auth/drive.readonly",
   "https://www.googleapis.com/auth/spreadsheets",
-  "https://www.googleapis.com/auth/spreadsheets.readonly",
 ];
 
 const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);

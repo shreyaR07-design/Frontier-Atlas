@@ -21,6 +21,8 @@ interface DatasetViewProps {
   loading: boolean;
   error: string | null;
   hasCsvExport: boolean;
+  windowMode?: "all" | "24h";
+  onWindowModeChange?: (mode: "all" | "24h") => void;
   onSelectCategory?: (category: DatasetCategory) => void;
   onRetry: () => void;
   onOpenRunModal: () => void;
@@ -51,17 +53,17 @@ const CATEGORY_INFO: Record<
   },
   research_papers: {
     title: "Research Papers",
-    subtitle: "Academic preprints and publications from arXiv, OpenAlex, and Crossref with GitHub stars.",
+    subtitle: "Historical academic archive (1,000+ target) plus separate rolling 24h UTC fresh feed from arXiv, HF Daily Papers, OpenAlex & Crossref.",
     csvFilename: "research_papers.csv",
   },
   jobs: {
-    title: "Jobs (Last 24h UTC)",
-    subtitle: "Accessible technical job postings verified within a strict 24-hour UTC publication window.",
+    title: "Jobs",
+    subtitle: "AI technical job postings across 9 boards. Toggle between rolling 24h UTC and historical archive.",
     csvFilename: "jobs.csv",
   },
   news: {
-    title: "News (Last 24h UTC)",
-    subtitle: "Tech and AI articles from RSS/Atom feeds and Hacker News published within the last 24 hours.",
+    title: "News",
+    subtitle: "AI articles from 12+ RSS feeds and Hacker News. Toggle between rolling 24h UTC and historical archive.",
     csvFilename: "news.csv",
   },
   entity_mapping_log: {
@@ -201,6 +203,8 @@ export function DatasetView({
   loading,
   error,
   hasCsvExport,
+  windowMode = "all",
+  onWindowModeChange,
   onSelectCategory,
   onRetry,
   onOpenRunModal,
@@ -398,6 +402,33 @@ export function DatasetView({
             </select>
           )}
 
+          {(category === "research_papers" || category === "jobs" || category === "news") && onWindowModeChange && (
+            <div className="flex items-center gap-1 p-1 rounded-lg bg-[#070D1A] border border-slate-800 shrink-0">
+              <button
+                type="button"
+                onClick={() => onWindowModeChange("all")}
+                className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${
+                  windowMode === "all"
+                    ? "bg-sky-600 text-white"
+                    : "text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                All Historical
+              </button>
+              <button
+                type="button"
+                onClick={() => onWindowModeChange("24h")}
+                className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${
+                  windowMode === "24h"
+                    ? "bg-emerald-600 text-white"
+                    : "text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                Last 24h UTC
+              </button>
+            </div>
+          )}
+
           {category === "research_papers" && (
             <button
               type="button"
@@ -498,15 +529,30 @@ export function DatasetView({
       ) : filteredRows.length === 0 && filteredCategoryFailures.length === 0 ? (
         <div className="rounded-xl bg-[#0E172B] border border-slate-800/80 p-8 text-center space-y-3">
           <h2 className="font-display text-base font-semibold text-slate-200">
-            {rows.length === 0 ? `No ${info.title} collected yet` : "No matching records"}
+            {rows.length === 0
+              ? windowMode === "24h"
+                ? `No ${info.title} in the rolling 24h UTC window`
+                : `No ${info.title} collected yet`
+              : "No matching records"}
           </h2>
           <p className="text-sm text-slate-400 max-w-xl mx-auto">
             {rows.length === 0
-              ? "FrontierAtlas never displays fabricated placeholder records. Run a live collection cycle to populate this dataset from verified public sources."
+              ? windowMode === "24h"
+                ? "Switch back to All Historical to browse preserved historical records, or run Refresh 24h Feeds to collect newly published items."
+                : "FrontierAtlas never displays fabricated placeholder records. Run a live collection cycle to populate this dataset from verified public sources."
               : "Adjust your search query or active verification/source filters to see collected rows."}
           </p>
           {rows.length === 0 && (
-            <div className="pt-2">
+            <div className="pt-2 flex flex-wrap justify-center gap-2">
+              {windowMode === "24h" && onWindowModeChange && (
+                <button
+                  type="button"
+                  onClick={() => onWindowModeChange("all")}
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm font-medium transition-colors"
+                >
+                  <span>View All Historical</span>
+                </button>
+              )}
               <button
                 type="button"
                 onClick={onOpenRunModal}
@@ -817,7 +863,9 @@ export function DatasetView({
                             : "—"}
                         </td>
                         <td className="py-3 px-4 text-right font-mono text-xs tabular-nums whitespace-nowrap">
-                          <div className="text-slate-300">{r.publication_date ?? "—"}</div>
+                          <div className="text-slate-300">
+                            {r.published_at ? formatUtc(r.published_at) : r.publication_date ?? "—"}
+                          </div>
                           <div className="text-[11px] text-slate-500">
                             {formatUtc(r.last_checked_at || r.collected_at)}
                           </div>
