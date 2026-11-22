@@ -25,9 +25,14 @@ import type {
   AnyDatasetRow,
   AtlasStatusResponse,
   DatasetCategory,
+  ExportScope,
+  ExportStepStatus,
   FailureLogRow,
+  PublicAccessStatus,
   RunJobState,
   SectionId,
+  SheetsFallbackExportSummary,
+  SheetsFeedbackState,
 } from "./types/atlas";
 
 const SECTION_LABELS: Record<SectionId, string> = {
@@ -96,6 +101,7 @@ export default function App() {
   const [sheetsExporting, setSheetsExporting] = useState(false);
   const [sheetsSyncing, setSheetsSyncing] = useState(false);
   const [sheetsConfirmMode, setSheetsConfirmMode] = useState<"full" | "incremental" | null>(null);
+  const [sheetsExportScope, setSheetsExportScope] = useState<ExportScope>("all");
   const [targetSpreadsheetId, setTargetSpreadsheetId] = useState("");
   const hasInitializedSheetIdRef = useRef(false);
   const [googleSigningIn, setGoogleSigningIn] = useState(false);
@@ -103,12 +109,7 @@ export default function App() {
   const [testingGoogleConnection, setTestingGoogleConnection] = useState(false);
   const [googleUserEmail, setGoogleUserEmail] = useState<string | null>(null);
   const [googleHasToken, setGoogleHasToken] = useState(false);
-  const [sheetsFeedback, setSheetsFeedback] = useState<{
-    success: boolean;
-    message: string;
-    url?: string | null;
-    needsReauth?: boolean;
-  } | null>(null);
+  const [sheetsFeedback, setSheetsFeedback] = useState<SheetsFeedbackState | null>(null);
 
   const loadStatus = useCallback(async () => {
     setStatusLoading(true);
@@ -467,6 +468,51 @@ export default function App() {
     [googleUserEmail, loadStatus, targetSpreadsheetId]
   );
 
+  const prepareFallbackSummary = useCallback(
+    async (reason: string, scope: ExportScope): Promise<SheetsFallbackExportSummary | null> => {
+      try {
+        const resp = await fetch("/api/atlas/export/csv", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ scope }),
+        });
+        const data = await readJsonSafe<{
+          rowCounts?: Record<string, number>;
+          totalRows?: number;
+          datasets?: Array<{
+            tabName: string;
+            filename: string;
+            rowCount: number;
+            downloadUrl: string;
+          }>;
+        }>(resp);
+        if (!resp.ok || !Array.isArray(data.datasets)) return null;
+        const scopeQuery = scope === "qualified_24h" ? "?scope=qualified" : "";
+        return {
+          ready: true,
+          reason,
+          zipFilename:
+            scope === "qualified_24h"
+              ? "frontier-atlas-qualified-24h.zip"
+              : "frontier-atlas-datasets.zip",
+          zipUrl: `/api/atlas/download/csv-bundle.zip${scopeQuery}`,
+          zipByteSize: 0,
+          rowCounts: data.rowCounts ?? {},
+          totalRows: Number(data.totalRows ?? 0),
+          datasets: data.datasets.map((d) => ({
+            tabName: d.tabName,
+            filename: d.filename,
+            rowCount: d.rowCount,
+            downloadUrl: d.downloadUrl,
+          })),
+        };
+      } catch {
+        return null;
+      }
+    },
+    []
+  );
+
   const handleGoogleSignIn = async (selectAccount = false) => {
     setGoogleSigningIn(true);
     setSheetsFeedback(null);
@@ -478,11 +524,16 @@ export default function App() {
     } catch (err) {
       setGoogleHasToken(isGoogleTokenValid());
       const formatted = formatGoogleAuthError(err);
+      const blocked = isGoogleOAuthBlockedMessage(formatted);
+      const fallbackExport = blocked
+        ? await prepareFallbackSummary(formatted, sheetsExportScope)
+        : null;
       setSheetsFeedback({
         success: false,
         message: formatted,
         url: null,
-        needsReauth: !isGoogleOAuthBlockedMessage(formatted),
+        needsReauth: !blocked,
+        fallbackExport,
       });
     } finally {
       setGoogleSigningIn(false);
@@ -510,17 +561,6 @@ export default function App() {
 
     try {
       const token = getGoogleAccessToken();
-      if (!token && !status?.credentials.googleSheetsConfigured) {
-        setGoogleHasToken(false);
-        setSheetsFeedback({
-          success: false,
-          message:
-            "Google OAuth session expired or missing. Click 'Sign in with Google' to authorize before exporting.",
-          url: null,
-          needsReauth: true,
-        });
-        return;
-      }
       const headers: Record<string, string> = { "Content-Type": "application/json" };
       if (token) {
         headers.Authorization = `Bearer ${token}`;
@@ -531,6 +571,7 @@ export default function App() {
         body: JSON.stringify({
           spreadsheetId: targetSpreadsheetId.trim() || undefined,
           createNew: targetSpreadsheetId.trim() === "",
+          exportScope: sheetsExportScope,
         }),
       });
       const data = await readJsonSafe<Record<string, unknown>>(resp);
@@ -548,6 +589,19 @@ export default function App() {
       const allTabsVerified = requiredTabs.every(
         (tab) => tabStatuses?.[tab]?.status === "success"
       );
+      const steps = Array.isArray(data.steps) ? (data.steps as ExportStepStatus[]) : undefined;
+      const fallbackExport =
+        (data.fallbackExport as SheetsFallbackExportSummary | null | undefined) ?? null;
+      const publicAccessStatus = (data.publicAccessStatus as PublicAccessStatus | undefined) ?? "unknown";
+      const publicViewerVerified = Boolean(data.publicViewerVerified);
+      const publicAccessError =
+        typeof data.publicAccessError === "string" ? data.publicAccessError : null;
+      const countsSummary = {
+        inserted: Number(data.rowsAdded ?? 0),
+        updated: Number(data.rowsUpdated ?? 0),
+        skipped: Number(data.rowsSkipped ?? 0),
+        failed: Number(data.rowsFailed ?? 0),
+      };
 
       if (data.success && allTabsVerified && typeof data.spreadsheetUrl === "string" && data.spreadsheetUrl) {
         if (data.spreadsheetId) {
@@ -558,6 +612,11 @@ export default function App() {
         const perTabText = requiredTabs
           .map((t) => `${t}: ${Number(verifiedMap[t] ?? 0).toLocaleString()}`)
           .join(" · ");
+        const sharingNote = publicViewerVerified
+          ? " Public link verified ('Anyone with the link — Viewer')."
+          : publicAccessStatus === "policy_blocked"
+          ? " Spreadsheet saved, but public link sharing is blocked by Workspace policy (download CSV/ZIP fallback below if needed for external reviewers)."
+          : " Public sharing not confirmed.";
         if (isFull) {
           const verifiedTotal = Object.values(verifiedMap).reduce(
             (a: number, b: unknown) => a + Number(b || 0),
@@ -565,14 +624,24 @@ export default function App() {
           );
           setSheetsFeedback({
             success: true,
-            message: `Export Successful — verified across all 6 worksheets (${verifiedTotal.toLocaleString()} total rows — ${perTabText}).`,
+            message: `Export Successful — verified across all 6 worksheets (${verifiedTotal.toLocaleString()} rows — ${perTabText}).${sharingNote}`,
             url: data.spreadsheetUrl,
+            publicAccessStatus,
+            publicViewerVerified,
+            publicAccessError,
+            steps,
+            countsSummary,
           });
         } else {
           setSheetsFeedback({
             success: true,
-            message: `Google Sheets incremental sync verified across all 6 worksheets (+${Number(data.rowsAdded ?? 0).toLocaleString()} added, ${Number(data.rowsUpdated ?? 0).toLocaleString()} updated, ${Number(data.rowsUnchanged ?? 0).toLocaleString()} unchanged — ${perTabText}).`,
+            message: `Google Sheets incremental sync verified across all 6 worksheets (+${countsSummary.inserted.toLocaleString()} inserted, ~${countsSummary.updated.toLocaleString()} updated, ${countsSummary.skipped.toLocaleString()} skipped — ${perTabText}).${sharingNote}`,
             url: data.spreadsheetUrl,
+            publicAccessStatus,
+            publicViewerVerified,
+            publicAccessError,
+            steps,
+            countsSummary,
           });
         }
       } else {
@@ -591,18 +660,29 @@ export default function App() {
           clearGoogleAccessToken();
           setGoogleHasToken(false);
         }
+        const resolvedFallback =
+          fallbackExport ?? (await prepareFallbackSummary(errMsg, sheetsExportScope));
         setSheetsFeedback({
           success: false,
           message: errMsg,
           url: null,
           needsReauth,
+          publicAccessStatus,
+          publicViewerVerified: false,
+          publicAccessError,
+          steps,
+          fallbackExport: resolvedFallback,
+          countsSummary,
         });
       }
     } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const fallbackExport = await prepareFallbackSummary(msg, sheetsExportScope);
       setSheetsFeedback({
         success: false,
-        message: err instanceof Error ? err.message : String(err),
+        message: msg,
         url: null,
+        fallbackExport,
       });
     } finally {
       if (isFull) setSheetsExporting(false);
@@ -612,6 +692,10 @@ export default function App() {
 
   const startSheetsFlow = async (mode: "full" | "incremental") => {
     setSheetsFeedback(null);
+    // Protect already-saved permanent spreadsheets from full batchClear overwrites:
+    // use non-destructive incremental merge whenever updating an existing spreadsheetId.
+    const effectiveMode: "full" | "incremental" =
+      mode === "full" && targetSpreadsheetId.trim() !== "" ? "incremental" : mode;
     const token = getGoogleAccessToken();
     const serviceAccountReady = Boolean(status?.credentials.googleSheetsConfigured);
     if (!token && !serviceAccountReady) {
@@ -623,11 +707,12 @@ export default function App() {
         setGoogleHasToken(true);
         const verified = await handleTestGoogleConnection(accessToken);
         if (verified) {
-          setSheetsConfirmMode(mode);
+          setSheetsConfirmMode(effectiveMode);
         }
       } catch (err) {
         const formatted = formatGoogleAuthError(err);
-        const blocked = isGoogleOAuthBlockedMessage(formatted);
+        const blocked = isGoogleOAuthBlockedMessage(err) || isGoogleOAuthBlockedMessage(formatted);
+        const fallbackExport = await prepareFallbackSummary(formatted, sheetsExportScope);
         setSheetsFeedback({
           success: false,
           message: blocked
@@ -635,13 +720,23 @@ export default function App() {
             : `Google sign-in is required to create or write spreadsheets: ${formatted}`,
           url: null,
           needsReauth: !blocked,
+          fallbackExport,
+          steps: [
+            {
+              step: 1,
+              key: "auth",
+              label: "Connect or configure Google access",
+              status: blocked ? "blocked" : "failed",
+              detail: formatted,
+            },
+          ],
         });
       } finally {
         setGoogleSigningIn(false);
       }
       return;
     }
-    setSheetsConfirmMode(mode);
+    setSheetsConfirmMode(effectiveMode);
   };
 
   const handleExportSheets = () => {
@@ -791,6 +886,8 @@ export default function App() {
               schedulerUpdating={schedulerUpdating}
               sheetsExporting={sheetsExporting}
               sheetsSyncing={sheetsSyncing}
+              sheetsExportScope={sheetsExportScope}
+              onSheetsExportScopeChange={setSheetsExportScope}
               sheetsFeedback={sheetsFeedback}
               googleUserEmail={googleUserEmail}
               googleHasToken={googleHasToken}
@@ -864,8 +961,9 @@ export default function App() {
 
       <SheetsConfirmModal
         mode={sheetsConfirmMode}
+        exportScope={sheetsExportScope}
         spreadsheetId={targetSpreadsheetId}
-        counts={status?.counts ?? null}
+        status={status}
         googleEmail={googleHasToken ? googleUserEmail : null}
         onCancel={() => setSheetsConfirmMode(null)}
         onConfirm={() => {

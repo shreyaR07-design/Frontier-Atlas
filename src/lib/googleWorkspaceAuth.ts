@@ -65,15 +65,59 @@ export function initGoogleAuth(
   });
 }
 
+export interface OAuthSetupDiagnostics {
+  currentHostname: string;
+  currentOrigin: string;
+  previewHostnames: string[];
+  firebaseProjectId: string;
+  firebaseAuthDomain: string;
+  firebaseRedirectUri: string;
+  oauthClientId: string;
+}
+
+const KNOWN_PREVIEW_HOSTNAMES = [
+  "ais-dev-2lxnn5ax4d6w4sxglutuue-910587750641.asia-northeast1.run.app",
+  "ais-pre-2lxnn5ax4d6w4sxglutuue-910587750641.asia-northeast1.run.app",
+];
+
+export function getOAuthSetupDiagnostics(): OAuthSetupDiagnostics {
+  const currentHostname =
+    typeof window !== "undefined" && window.location?.hostname
+      ? window.location.hostname
+      : "localhost";
+  const currentOrigin =
+    typeof window !== "undefined" && window.location?.origin
+      ? window.location.origin
+      : `https://${currentHostname}`;
+  const previewHostnames = Array.from(
+    new Set([currentHostname, ...KNOWN_PREVIEW_HOSTNAMES].filter((h) => Boolean(h && h !== "localhost")))
+  );
+  const firebaseAuthDomain = firebaseConfig.authDomain;
+  return {
+    currentHostname,
+    currentOrigin,
+    previewHostnames,
+    firebaseProjectId: firebaseConfig.projectId,
+    firebaseAuthDomain,
+    firebaseRedirectUri: `https://${firebaseAuthDomain}/__/auth/handler`,
+    oauthClientId: firebaseConfig.oAuthClientId || "",
+  };
+}
+
 export function isGoogleOAuthBlockedMessage(messageOrErr: unknown): boolean {
+  const code =
+    messageOrErr && typeof messageOrErr === "object" && "code" in messageOrErr
+      ? String((messageOrErr as { code?: unknown }).code ?? "")
+      : "";
   const raw =
     messageOrErr instanceof Error
       ? messageOrErr.message
       : typeof messageOrErr === "string"
       ? messageOrErr
       : JSON.stringify(messageOrErr ?? "");
-  return /access_denied|403|unverified|verification|org_internal|not completed google|testing|disallowed|unauthorized-client/i.test(
-    raw
+  const combined = `${code} ${raw}`;
+  return /access_denied|403|unverified|verification|org_internal|not completed google|testing|disallowed|unauthorized-client|unauthorized-domain|auth\/unauthorized-domain|not authorized in firebase auth/i.test(
+    combined
   );
 }
 
@@ -90,6 +134,10 @@ export function formatGoogleAuthError(err: unknown): string {
   const rawMsg = err instanceof Error ? err.message : String(err);
   const combined = `${code} ${rawMsg} ${customMsg}`.trim();
 
+  if (code === "auth/unauthorized-domain" || /unauthorized-domain/i.test(combined)) {
+    const diag = getOAuthSetupDiagnostics();
+    return `Domain (${diag.currentHostname}) is not authorized in Firebase Auth OAuth settings (auth/unauthorized-domain). Add ${diag.currentHostname} to Firebase Console -> Authentication -> Settings -> Authorized domains (project ${diag.firebaseProjectId}) and to GCP OAuth Client Authorized JavaScript origins (redirect URI: ${diag.firebaseRedirectUri}), or use a backend Service Account / Download ZIP below.`;
+  }
   if (
     /access_denied|\b403\b|unverified|verification process|not completed.*verification|org_internal|disallowed_useragent|unauthorized-client/i.test(
       combined
@@ -102,10 +150,6 @@ export function formatGoogleAuthError(err: unknown): string {
   }
   if (code === "auth/popup-closed-by-user" || code === "auth/cancelled-popup-request") {
     return "Google Sign-In popup was closed before completing authorization. Click 'Sign in with Google' to retry, or use the CSV / ZIP download workflow below.";
-  }
-  if (code === "auth/unauthorized-domain") {
-    const origin = typeof window !== "undefined" ? window.location.origin : "this origin";
-    return `Domain (${origin}) is not authorized in Firebase Auth OAuth settings (auth/unauthorized-domain). Add the preview hostname to Firebase Authentication -> Authorized domains, or use the CSV / ZIP download workflow below.`;
   }
   if (code === "auth/network-request-failed") {
     return "Network error during Google Sign-In. Check your connection and try again, or use the CSV / ZIP download workflow below.";

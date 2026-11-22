@@ -1,16 +1,18 @@
 import { useEffect } from "react";
-import { AlertTriangle, FileSpreadsheet, X } from "lucide-react";
+import { AlertTriangle, FileSpreadsheet, Globe, X } from "lucide-react";
+import type { AtlasStatusResponse, ExportScope } from "../types/atlas";
 
 interface SheetsConfirmModalProps {
   mode: "full" | "incremental" | null;
+  exportScope: ExportScope;
   spreadsheetId: string;
-  counts: Record<string, number> | null;
+  status: AtlasStatusResponse | null;
   googleEmail: string | null;
   onCancel: () => void;
   onConfirm: () => void;
 }
 
-const TAB_MAPPING: Array<{ key: string; tab: string }> = [
+const TAB_MAPPING: Array<{ key: keyof AtlasStatusResponse["counts"]; tab: string }> = [
   { key: "startups", tab: "Startups" },
   { key: "products", tab: "Products" },
   { key: "research_papers", tab: "Research Papers" },
@@ -21,8 +23,9 @@ const TAB_MAPPING: Array<{ key: string; tab: string }> = [
 
 export function SheetsConfirmModal({
   mode,
+  exportScope,
   spreadsheetId,
-  counts,
+  status,
   googleEmail,
   onCancel,
   onConfirm,
@@ -39,7 +42,21 @@ export function SheetsConfirmModal({
   if (!mode) return null;
 
   const isFull = mode === "full";
-  const totalRows = TAB_MAPPING.reduce((acc, item) => acc + (counts?.[item.key] ?? 0), 0);
+  const isQualified = exportScope === "qualified_24h";
+
+  const getTabEstimatedCount = (key: keyof AtlasStatusResponse["counts"]): number => {
+    if (!status) return 0;
+    if (!isQualified) {
+      return status.counts[key] ?? 0;
+    }
+    if (key === "jobs") return status.freshCounts24h?.jobs ?? 0;
+    if (key === "news") return status.freshCounts24h?.news ?? 0;
+    const total = status.counts[key] ?? 0;
+    const rejected = status.verificationCounts?.byCategory?.[key]?.Rejected ?? 0;
+    return key === "entity_mapping_log" ? total : Math.max(0, total - rejected);
+  };
+
+  const totalRows = TAB_MAPPING.reduce((acc, item) => acc + getTabEstimatedCount(item.key), 0);
 
   return (
     <div
@@ -72,8 +89,18 @@ export function SheetsConfirmModal({
           <div className="space-y-1">
             <p className="font-medium text-amber-300">
               {isFull
-                ? "This operation clears existing cell contents across the 6 target tabs and writes all SQLite rows."
-                : "This operation updates modified rows in place and appends unseen records by stable ID."}
+                ? spreadsheetId.trim()
+                  ? "Populates all 6 tabs on the target spreadsheet with batched records from SQLite."
+                  : "Creates ONE permanent 6-tab Google Spreadsheet in Google Drive and writes all batched SQLite records."
+                : "Preserves existing sheet history: updates modified rows in place and appends unseen records by stable ID without clearing tabs."}
+            </p>
+            <p className="text-amber-200/85">
+              Scope:{" "}
+              <span className="font-semibold text-amber-100">
+                {isQualified
+                  ? "Qualified Valid Records + Last 24h UTC Jobs & News"
+                  : "Full SQLite Archive (All Rows)"}
+              </span>
             </p>
             <p className="text-amber-200/80">
               Target:{" "}
@@ -85,9 +112,17 @@ export function SheetsConfirmModal({
           </div>
         </div>
 
+        <div className="rounded-lg bg-[#070D1A] border border-slate-800 p-3 text-xs text-slate-300 flex items-start gap-2">
+          <Globe className="w-4 h-4 text-sky-400 shrink-0 mt-0.5" />
+          <span>
+            After tab row verification, FrontierAtlas requests{" "}
+            <strong className="text-slate-100">Anyone with the link — Viewer</strong> permission via the Google Drive API and confirms it via read-back. If sharing is policy-blocked, it reports that honestly.
+          </span>
+        </div>
+
         <div className="space-y-1.5">
           <div className="text-xs font-medium text-slate-300">
-            Database records to write ({totalRows.toLocaleString()} total across 6 tabs):
+            Estimated records to write ({totalRows.toLocaleString()} total across 6 tabs):
           </div>
           <div className="grid grid-cols-2 gap-2 text-xs">
             {TAB_MAPPING.map((item) => (
@@ -97,7 +132,7 @@ export function SheetsConfirmModal({
               >
                 <span className="text-slate-300 truncate">{item.tab}</span>
                 <span className="font-mono text-slate-100 tabular-nums">
-                  {(counts?.[item.key] ?? 0).toLocaleString()}
+                  {getTabEstimatedCount(item.key).toLocaleString()}
                 </span>
               </div>
             ))}
@@ -124,3 +159,4 @@ export function SheetsConfirmModal({
     </div>
   );
 }
+

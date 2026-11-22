@@ -216,6 +216,11 @@ const SCHEMA_DDL_STATEMENTS: string[] = [
     rows_added INTEGER NOT NULL DEFAULT 0,
     rows_updated INTEGER NOT NULL DEFAULT 0,
     rows_unchanged INTEGER NOT NULL DEFAULT 0,
+    rows_skipped INTEGER NOT NULL DEFAULT 0,
+    rows_failed INTEGER NOT NULL DEFAULT 0,
+    public_access_status TEXT NOT NULL DEFAULT 'unknown',
+    public_viewer_verified INTEGER NOT NULL DEFAULT 0,
+    public_access_error TEXT,
     last_error TEXT
   );`,
   `CREATE TABLE IF NOT EXISTS pipeline_runs (
@@ -518,6 +523,21 @@ export class AtlasDatabase {
       const sheetsCols = new Set(sheetsInfoRows.map((r) => String(r.name)));
       if (!sheetsCols.has("tab_statuses_json")) {
         conn.exec("ALTER TABLE sheets_sync_state ADD COLUMN tab_statuses_json TEXT NOT NULL DEFAULT '{}';");
+      }
+      if (!sheetsCols.has("rows_skipped")) {
+        conn.exec("ALTER TABLE sheets_sync_state ADD COLUMN rows_skipped INTEGER NOT NULL DEFAULT 0;");
+      }
+      if (!sheetsCols.has("rows_failed")) {
+        conn.exec("ALTER TABLE sheets_sync_state ADD COLUMN rows_failed INTEGER NOT NULL DEFAULT 0;");
+      }
+      if (!sheetsCols.has("public_access_status")) {
+        conn.exec("ALTER TABLE sheets_sync_state ADD COLUMN public_access_status TEXT NOT NULL DEFAULT 'unknown';");
+      }
+      if (!sheetsCols.has("public_viewer_verified")) {
+        conn.exec("ALTER TABLE sheets_sync_state ADD COLUMN public_viewer_verified INTEGER NOT NULL DEFAULT 0;");
+      }
+      if (!sheetsCols.has("public_access_error")) {
+        conn.exec("ALTER TABLE sheets_sync_state ADD COLUMN public_access_error TEXT;");
       }
 
       const paperInfoRows = conn.prepare("PRAGMA table_info(research_papers);").all() as Array<{ name: string }>;
@@ -1498,6 +1518,11 @@ export class AtlasDatabase {
     rowsAdded: number;
     rowsUpdated: number;
     rowsUnchanged: number;
+    rowsSkipped: number;
+    rowsFailed: number;
+    publicAccessStatus: "public_viewer" | "policy_blocked" | "not_configured" | "unknown";
+    publicViewerVerified: boolean;
+    publicAccessError: string | null;
     lastError: string | null;
   } | null {
     this.initializeSchema();
@@ -1527,6 +1552,13 @@ export class AtlasDatabase {
     const rawStatus = String(row.status ?? "Not Connected");
     const status =
       rawStatus === "Connected" || rawStatus === "Sync Failed" ? rawStatus : "Not Connected";
+    const rawPubStatus = String(row.public_access_status ?? "unknown");
+    const publicAccessStatus =
+      rawPubStatus === "public_viewer" ||
+      rawPubStatus === "policy_blocked" ||
+      rawPubStatus === "not_configured"
+        ? rawPubStatus
+        : "unknown";
     return {
       status,
       spreadsheetId: (row.spreadsheet_id as string | null) ?? null,
@@ -1539,6 +1571,11 @@ export class AtlasDatabase {
       rowsAdded: Number(row.rows_added ?? 0),
       rowsUpdated: Number(row.rows_updated ?? 0),
       rowsUnchanged: Number(row.rows_unchanged ?? 0),
+      rowsSkipped: Number(row.rows_skipped ?? 0),
+      rowsFailed: Number(row.rows_failed ?? 0),
+      publicAccessStatus,
+      publicViewerVerified: Number(row.public_viewer_verified ?? 0) === 1,
+      publicAccessError: (row.public_access_error as string | null) ?? null,
       lastError: (row.last_error as string | null) ?? null,
     };
   }
@@ -1556,6 +1593,11 @@ export class AtlasDatabase {
     rowsAdded: number;
     rowsUpdated: number;
     rowsUnchanged: number;
+    rowsSkipped?: number;
+    rowsFailed?: number;
+    publicAccessStatus?: "public_viewer" | "policy_blocked" | "not_configured" | "unknown";
+    publicViewerVerified?: boolean;
+    publicAccessError?: string | null;
     lastError: string | null;
   }): void {
     this.initializeSchema();
@@ -1571,8 +1613,9 @@ export class AtlasDatabase {
         `INSERT INTO sheets_sync_state (
           id, status, spreadsheet_id, spreadsheet_url, last_sync_mode,
           last_attempt_at, last_success_at, tab_row_counts_json, tab_statuses_json,
-          rows_added, rows_updated, rows_unchanged, last_error
-        ) VALUES ('default', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          rows_added, rows_updated, rows_unchanged, rows_skipped, rows_failed,
+          public_access_status, public_viewer_verified, public_access_error, last_error
+        ) VALUES ('default', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           status = excluded.status,
           spreadsheet_id = ${spreadsheetIdSql},
@@ -1588,6 +1631,11 @@ export class AtlasDatabase {
           rows_added = excluded.rows_added,
           rows_updated = excluded.rows_updated,
           rows_unchanged = excluded.rows_unchanged,
+          rows_skipped = excluded.rows_skipped,
+          rows_failed = excluded.rows_failed,
+          public_access_status = excluded.public_access_status,
+          public_viewer_verified = excluded.public_viewer_verified,
+          public_access_error = excluded.public_access_error,
           last_error = excluded.last_error;`
       )
       .run(
@@ -1602,6 +1650,11 @@ export class AtlasDatabase {
         state.rowsAdded,
         state.rowsUpdated,
         state.rowsUnchanged,
+        state.rowsSkipped ?? 0,
+        state.rowsFailed ?? 0,
+        state.publicAccessStatus ?? "unknown",
+        state.publicViewerVerified ? 1 : 0,
+        state.publicAccessError ?? null,
         state.lastError
       );
   }

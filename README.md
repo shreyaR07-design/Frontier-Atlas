@@ -90,10 +90,10 @@ Set variables in `.env` (or `frontier-atlas/.env`; never commit credentials to g
 
 | Variable | Description | Default |
 |---|---|---|
-| `GOOGLE_SHEETS_CREDENTIALS_PATH` | Path to Google Service Account JSON file | *(empty)* |
+| `GOOGLE_SHEETS_CREDENTIALS_PATH` | Path to Google Service Account JSON file (also checks `GOOGLE_APPLICATION_CREDENTIALS`) | *(empty)* |
 | `GOOGLE_SHEETS_CREDENTIALS_JSON` | Inline JSON or base64-encoded Service Account JSON (alternative to file path) | *(empty)* |
 | `GOOGLE_SHEETS_SPREADSHEET_ID` | Existing Google Spreadsheet ID (leave blank to auto-create) | *(empty)* |
-| `GOOGLE_SHEETS_SPREADSHEET_NAME` | Title used when creating a new spreadsheet | `FrontierAtlas Intelligence` |
+| `GOOGLE_SHEETS_SPREADSHEET_NAME` | Title used when creating a new spreadsheet (also checks `GOOGLE_SHEETS_SPREADSHEET_TITLE`) | `FrontierAtlas Intelligence` |
 | `GEMINI_API_KEY` | Tier-1 primary LLM API key (`@google/genai`, injected via AI Studio Secrets) | *(empty)* |
 | `GEMINI_MODEL` | Gemini Flash model ID | `gemini-4-hydrogen` |
 | `GROQ_API_KEY` | Tier-2 LLM fallback key (OpenAI-compatible) | *(empty)* |
@@ -114,29 +114,35 @@ Set variables in `.env` (or `frontier-atlas/.env`; never commit credentials to g
 
 ---
 
-## Google Sheets Configuration
+## Google Sheets Configuration & Public Sharing
 
-FrontierAtlas supports **two** authentication methods for writing to Google Sheets:
+FrontierAtlas supports **two** authentication paths for writing to Google Sheets, plus an **automatic 6-CSV + ZIP fallback**:
 
-### Option A — Interactive "Sign in with Google" (Browser OAuth)
+### Option A — Backend Service Account (Recommended for Reliable Evaluator Links)
+Because unverified Google OAuth apps return `Error 403: access_denied` to external Google accounts not added as OAuth Test Users, a **Google Cloud Service Account** is the most reliable server-side method:
+1. In Google Cloud Console, enable **both** the **Google Sheets API** (`sheets.googleapis.com`) and the **Google Drive API** (`drive.googleapis.com`).
+2. Create a **Service Account** and generate a JSON private key.
+3. Provide the credentials **strictly on the backend** via environment variables (never in frontend code):
+   - File path: `GOOGLE_SHEETS_CREDENTIALS_PATH=./secrets/google-service-account.json` (or `GOOGLE_APPLICATION_CREDENTIALS`)
+   - Or inline JSON / base64: `GOOGLE_SHEETS_CREDENTIALS_JSON='{...}'`
+4. Either leave `GOOGLE_SHEETS_SPREADSHEET_ID` blank (FrontierAtlas will create a new workbook) **or** share an existing spreadsheet with the Service Account's `client_email` as **Editor** and set `GOOGLE_SHEETS_SPREADSHEET_ID=<spreadsheet_id>`.
+5. After exporting and verifying all 6 tabs, FrontierAtlas calls the Google Drive v3 Permissions API (`POST /drive/v3/files/{id}/permissions`) to grant `"Anyone with the link — Viewer"` (`type: "anyone"`, `role: "reader"`) and verifies the permission via a read-back `GET`. If a Google Workspace domain policy blocks public link sharing (`403`/`400`), the UI honestly reports `Restricted / Policy Blocked` without claiming public access.
+
+### Option B — Interactive "Sign in with Google" (Browser OAuth)
 1. Click **Sign in with Google** in the Overview dashboard's Google Sheets Sync panel (powered by `firebase-applet-config.json` with Drive & Sheets OAuth scopes).
-2. Optionally paste an existing target Spreadsheet ID (or leave blank to auto-create `FrontierAtlas Intelligence` in your Google Drive).
-3. Click **Export Google Sheets** (full export) or **Sync Google Sheets** (incremental sync) and confirm the target sheet details in the confirmation dialog. Your access token stays strictly in memory (never persisted to `localStorage`/`sessionStorage`).
+2. Note: Until Google OAuth App Verification is completed in Google Cloud Console, only approved Test Users can complete popup sign-in; other users see `Error 403: access_denied`.
+3. Your in-session access token remains strictly in memory and is passed via `Authorization: Bearer <token>` to the backend.
 
-### Option B — Backend Service Account (Automated / Headless)
-1. In Google Cloud Console, enable the **Google Sheets API** (`sheets.googleapis.com`).
-2. Create a **Service Account** and download a JSON private key.
-3. Configure credentials strictly on the backend using **either**:
-   - File path: `GOOGLE_SHEETS_CREDENTIALS_PATH=./secrets/google-service-account.json`
-   - Inline env var: `GOOGLE_SHEETS_CREDENTIALS_JSON='{...}'` (raw JSON or base64)
-4. Share your target Google Spreadsheet with the Service Account's `client_email` as **Editor** and set `GOOGLE_SHEETS_SPREADSHEET_ID=<spreadsheet_id>` (or leave `GOOGLE_SHEETS_SPREADSHEET_ID` blank so FrontierAtlas creates a new workbook via the Sheets API and persists its ID).
-
-### Sheet Synchronization Behavior
+### Sheet Synchronization Behavior & Automatic CSV/ZIP Fallback
 
 - **Six Exact Tabs**: `Startups`, `Products`, `Research Papers`, `Jobs`, `News`, `Entity Mapping Log`.
-- **Full Export (`POST /api/atlas/export/sheets` / "Export Google Sheets" button)**: Ensures all 6 tabs exist with styled frozen headers, clears data ranges cleanly, writes database records in payload-bounded `values:batchUpdate` batches, and verifies row counts by reading back Row 1 headers + Column A record IDs.
-- **Incremental Sync (`POST /api/atlas/sync/sheets` / "Sync Google Sheets" button & auto-sync after runs)**: Reads existing Column A record IDs + row values from each tab, updates modified rows in place, appends only unseen stable IDs (`startup_id`, `product_id`, `paper_id`, `job_id`, `news_id`, `mapping_id`), and repairs duplicate IDs if any existed on the sheet.
-- **Connection Status (`Connected` / `Not Connected` / `Sync Failed`)**: Tracked in `sheets_sync_state` and displayed in the Overview dashboard along with last sync timestamp, sync delta (`+added / ~updated / =unchanged`), and per-tab verification statuses. Never claims `Connected` unless all 6 tabs pass write + Column A read-back verification.
+- **Qualified + 24h vs Full SQLite Export Scope**:
+  - `qualified_24h` *(default)*: Excludes `Rejected` rows across datasets and restricts `Jobs` and `News` to qualifying records within the last `FRESHNESS_WINDOW_HOURS` (24h UTC), while preserving `Startups` (1,150+), `Products` (1,140+), and `Research Papers` (1,580+) above the 1,000-record threshold.
+  - `all`: Exports the entire SQLite archive for every table.
+- **Payload & Rate-Limit Resilience**: Writes are chunked into byte- and row-bounded `values:batchUpdate` batches with automatic recursive batch/range splitting on HTTP `413` and exponential backoff + `Retry-After` handling on HTTP `429`/`5xx`.
+- **Full Export (`POST /api/atlas/export/sheets`)**: Ensures all 6 tabs exist with frozen bold headers, clears old ranges cleanly, writes batches, verifies Row 1 headers + Column A unique IDs on all 6 tabs, and configures/verifies public Viewer access.
+- **Incremental Sync (`POST /api/atlas/sync/sheets`)**: Reads existing Column A record IDs + cells from each tab, updates modified rows in place, appends unseen stable IDs (`startup_id`, `product_id`, `paper_id`, `job_id`, `news_id`, `mapping_id`), repairs sheet duplicates if found, and reports `inserted / updated / skipped / failed` counts.
+- **Automatic Fallback Export**: Whenever Google Sheets authentication or API sync fails, FrontierAtlas automatically builds all 6 CSV datasets + `frontier-atlas-datasets.zip` directly from SQLite and returns ready download links, explicitly labeled as a fallback (never a false Sheets success).
 
 ---
 

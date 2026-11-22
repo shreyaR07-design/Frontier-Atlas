@@ -308,12 +308,12 @@ export class GeminiLLMProvider implements LLMProvider {
   constructor(
     apiKey: string | null,
     model: string,
-    timeoutMs = 25_000,
+    timeoutMs = 45_000,
     fallbackModel?: string | null
   ) {
     this.apiKey = apiKey;
     this.model = model;
-    this.timeoutMs = timeoutMs;
+    this.timeoutMs = Math.max(15_000, timeoutMs);
     this.fallbackModel = fallbackModel && fallbackModel.trim() && fallbackModel.trim() !== model
       ? fallbackModel.trim()
       : null;
@@ -382,8 +382,15 @@ export class GeminiLLMProvider implements LLMProvider {
       }
       const msg = redactSecrets(err instanceof Error ? err.message : String(err));
       const lower = msg.toLowerCase();
-      if (err instanceof Error && err.name === "AbortError") {
-        throw new TransientProviderError(`gemini (${modelName}) request timeout after ${effectiveTimeoutMs}ms`);
+      if (
+        (err instanceof Error && err.name === "AbortError") ||
+        lower.includes("504") ||
+        lower.includes("deadline") ||
+        lower.includes("deadline_exceeded") ||
+        lower.includes("etimedout") ||
+        lower.includes("timed out")
+      ) {
+        throw new TransientProviderError(`gemini (${modelName}) deadline expired / timeout (504): ${msg}`);
       }
       if (lower.includes("413") || lower.includes("token") || lower.includes("context") || lower.includes("too large")) {
         throw new PayloadTooLargeError(`gemini context/payload limit: ${msg}`);
@@ -392,13 +399,17 @@ export class GeminiLLMProvider implements LLMProvider {
         throw new RateLimitError(`gemini rate limit (429): ${msg}`);
       }
       if (
+        lower.includes("500") ||
+        lower.includes("502") ||
         lower.includes("503") ||
         lower.includes("unavailable") ||
         lower.includes("high demand") ||
         lower.includes("overloaded") ||
-        lower.includes("service unavailable")
+        lower.includes("service unavailable") ||
+        lower.includes("econnreset") ||
+        lower.includes("socket hang up")
       ) {
-        throw new TransientProviderError(`gemini service unavailable (503) on ${modelName}: ${msg}`);
+        throw new TransientProviderError(`gemini transient upstream error on ${modelName}: ${msg}`);
       }
       if (
         lower.includes("401") ||
@@ -420,7 +431,7 @@ export class GeminiLLMProvider implements LLMProvider {
   public async generateJson(
     prompt: string,
     systemInstruction = SYSTEM_INSTRUCTION,
-    opts?: { timeoutMs?: number }
+    opts?: { timeoutMs?: number; skipFallback?: boolean }
   ): Promise<Record<string, unknown>> {
     if (!this.isConfigured()) {
       throw new FatalProviderError("GEMINI_API_KEY is not configured");
@@ -430,6 +441,7 @@ export class GeminiLLMProvider implements LLMProvider {
       return await this.generateWithModel(this.model, prompt, systemInstruction, effectiveTimeoutMs);
     } catch (primaryErr) {
       if (
+        !opts?.skipFallback &&
         this.fallbackModel &&
         (primaryErr instanceof TransientProviderError || primaryErr instanceof RateLimitError)
       ) {
@@ -438,7 +450,7 @@ export class GeminiLLMProvider implements LLMProvider {
             this.fallbackModel,
             prompt,
             systemInstruction,
-            effectiveTimeoutMs
+            Math.min(effectiveTimeoutMs, 25_000)
           );
         } catch (fallbackErr) {
           if (fallbackErr instanceof FatalProviderError) {
@@ -728,7 +740,7 @@ export class LLMRouter {
     opts: { maxInputTokens?: number; overlapTokens?: number } = {}
   ) {
     this.providers = providers;
-    this.maxInputTokens = opts.maxInputTokens ?? 5500;
+    this.maxInputTokens = opts.maxInputTokens ?? 3200;
     this.overlapTokens = opts.overlapTokens ?? 180;
   }
 
@@ -745,7 +757,7 @@ export class LLMRouter {
   }
 
   public async probeProviders(opts?: { timeoutMs?: number }): Promise<LLMProviderProbeResult[]> {
-    const timeoutMs = opts?.timeoutMs ?? 12_000;
+    const timeoutMs = opts?.timeoutMs ?? 15_000;
     const probePrompt = 'Return JSON {"ok": true} only.';
     const probeSystem = 'Return valid JSON object {"ok": true} only.';
 
@@ -817,6 +829,7 @@ export class LLMRouter {
     const errors: string[] = [];
     const attemptedProviders: string[] = [];
     const fallbackLog: string[] = [];
+    let sawTimeoutOrTransient = false;
     for (let idx = 0; idx < configured.length; idx++) {
       const provider = configured[idx];
       attemptedProviders.push(provider.providerName);
@@ -836,6 +849,9 @@ export class LLMRouter {
           onLog?.(splitMsg);
           throw err;
         }
+        if (err instanceof TransientProviderError) {
+          sawTimeoutOrTransient = true;
+        }
         const safeReason = redactSecrets(err instanceof Error ? err.message : String(err));
         errors.push(`${provider.providerName}: ${safeReason}`);
         const nextProvider = configured[idx + 1]?.providerName;
@@ -846,7 +862,11 @@ export class LLMRouter {
         onLog?.(failMsg);
       }
     }
-    throw new Error(`All configured LLM providers failed: ${errors.join("; ")}`);
+    const aggregateMsg = `All configured LLM providers failed: ${errors.join("; ")}`;
+    if (sawTimeoutOrTransient) {
+      throw new TransientProviderError(aggregateMsg);
+    }
+    throw new Error(aggregateMsg);
   }
 
   private async extractChunkRecursive(
@@ -879,35 +899,46 @@ export class LLMRouter {
         errors: [],
       };
     } catch (err) {
-      if (err instanceof PayloadTooLargeError && depth < 4 && tokenBudget > 250) {
-        const nextBudget = Math.max(250, Math.floor(tokenBudget / 2));
+      const shouldSplitOnPayload = err instanceof PayloadTooLargeError && depth < 4 && tokenBudget > 250;
+      const shouldSplitOnTimeout =
+        err instanceof TransientProviderError &&
+        depth < 3 &&
+        tokenBudget > 700 &&
+        /timeout|deadline|504|503|502|500|aborted/i.test(err.message);
+      if (shouldSplitOnPayload || shouldSplitOnTimeout) {
+        const nextBudget = Math.max(shouldSplitOnTimeout ? 500 : 250, Math.floor(tokenBudget / 2));
         const subChunks = chunkText(text, {
           maxTokens: nextBudget,
           overlapTokens: Math.min(100, this.overlapTokens),
         });
-        const merged: Array<Record<string, unknown>> = [];
-        const subErrors: string[] = [];
-        const fallbackLogs: string[] = [];
-        const attemptedSet = new Set<string>();
-        let lastProvider: string | null = null;
-        let totalSplits = 1;
-        for (const sub of subChunks) {
-          const res = await this.extractChunkRecursive(category, sourceUrl, sub.text, nextBudget, depth + 1, onLog);
-          merged.push(...res.rawRecords);
-          subErrors.push(...res.errors);
-          fallbackLogs.push(...res.fallbackLog);
-          for (const p of res.attemptedProviders) attemptedSet.add(p);
-          totalSplits += res.subSplits;
-          if (res.providerUsed) lastProvider = res.providerUsed;
+        if (subChunks.length > 1) {
+          onLog?.(
+            `[LLMRouter] Splitting ${tokenBudget}-token chunk into ${subChunks.length} x ~${nextBudget}-token sub-chunks after ${shouldSplitOnPayload ? "payload limit" : "timeout/504"}.`
+          );
+          const merged: Array<Record<string, unknown>> = [];
+          const subErrors: string[] = [];
+          const fallbackLogs: string[] = [];
+          const attemptedSet = new Set<string>();
+          let lastProvider: string | null = null;
+          let totalSplits = 1;
+          for (const sub of subChunks) {
+            const res = await this.extractChunkRecursive(category, sourceUrl, sub.text, nextBudget, depth + 1, onLog);
+            merged.push(...res.rawRecords);
+            subErrors.push(...res.errors);
+            fallbackLogs.push(...res.fallbackLog);
+            for (const p of res.attemptedProviders) attemptedSet.add(p);
+            totalSplits += res.subSplits;
+            if (res.providerUsed) lastProvider = res.providerUsed;
+          }
+          return {
+            rawRecords: merged,
+            providerUsed: lastProvider,
+            attemptedProviders: Array.from(attemptedSet),
+            fallbackLog: fallbackLogs,
+            subSplits: totalSplits,
+            errors: subErrors,
+          };
         }
-        return {
-          rawRecords: merged,
-          providerUsed: lastProvider,
-          attemptedProviders: Array.from(attemptedSet),
-          fallbackLog: fallbackLogs,
-          subSplits: totalSplits,
-          errors: subErrors,
-        };
       }
       return {
         rawRecords: [],

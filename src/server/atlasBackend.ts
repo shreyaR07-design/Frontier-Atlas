@@ -18,9 +18,11 @@ import {
 } from "./atlasDb.ts";
 import {
   EXPORT_SPECS,
+  type ExportScope,
   type ExportSpec,
   GoogleSheetsService,
   type SheetsConnectionStatus,
+  type SheetsFallbackExportSummary,
   type SheetsSyncResult,
   formatExportCell,
 } from "./googleSheets.ts";
@@ -160,11 +162,16 @@ export function loadAtlasConfig(atlasDir: string): AtlasConfig {
     deepseekApiKey: process.env.DEEPSEEK_API_KEY?.trim() || null,
     deepseekModel: process.env.DEEPSEEK_MODEL?.trim() || "deepseek-chat",
     githubToken: process.env.GITHUB_TOKEN?.trim() || null,
-    googleSheetsCredentialsPath: process.env.GOOGLE_SHEETS_CREDENTIALS_PATH?.trim() || null,
+    googleSheetsCredentialsPath:
+      process.env.GOOGLE_SHEETS_CREDENTIALS_PATH?.trim() ||
+      process.env.GOOGLE_APPLICATION_CREDENTIALS?.trim() ||
+      null,
     googleSheetsCredentialsJson: process.env.GOOGLE_SHEETS_CREDENTIALS_JSON?.trim() || null,
     googleSheetsSpreadsheetId: process.env.GOOGLE_SHEETS_SPREADSHEET_ID?.trim() || null,
     googleSheetsSpreadsheetName:
-      process.env.GOOGLE_SHEETS_SPREADSHEET_NAME?.trim() || "FrontierAtlas Intelligence",
+      process.env.GOOGLE_SHEETS_SPREADSHEET_NAME?.trim() ||
+      process.env.GOOGLE_SHEETS_SPREADSHEET_TITLE?.trim() ||
+      "FrontierAtlas Intelligence",
   };
 }
 
@@ -454,7 +461,7 @@ export function createLLMRouter(config: AtlasConfig): LLMRouter {
     new GeminiLLMProvider(
       config.geminiApiKey,
       config.geminiModel,
-      config.requestTimeoutMs,
+      Math.max(config.requestTimeoutMs, 45_000),
       config.geminiFallbackModel
     ),
     new OpenAICompatibleLLMProvider({
@@ -2530,33 +2537,42 @@ async function collectStartups(
     });
   }
 
-  // Optional polite LLM enrichment for small runs when records lack descriptions
+  // Optional polite LLM enrichment for small runs when records lack descriptions (never fails batch on transient LLM timeout)
   if (llmRouter.isConfigured() && limit <= 25) {
     const incomplete = records.filter((r) => (!r.description || r.industry === "Unknown") && r.website).slice(0, 3);
     for (const rec of incomplete) {
-      const siteUrl = String(rec.website);
-      const pageRes = await http.fetch(siteUrl, { timeoutMs: 7000, maxAttempts: 1, deduplicate: true });
-      if (!pageRes.ok || !pageRes.content) continue;
-      const text = stripHtmlToText(pageRes.content).slice(0, 12000);
-      if (text.length < 100) continue;
-      const llmRes = await llmRouter.extractStructured({
-        category: "startups",
-        sourceUrl: siteUrl,
-        sourceName: "yc_oss_directory_llm",
-        sourceText: text,
-        onLog,
-      });
-      const hit = llmRes.records[0];
-      if (hit) {
-        if (!rec.description && typeof hit.description === "string" && hit.description.trim()) {
-          rec.description = hit.description.trim().slice(0, 3500);
+      try {
+        const siteUrl = String(rec.website);
+        const pageRes = await http.fetch(siteUrl, { timeoutMs: 7000, maxAttempts: 1, deduplicate: true });
+        if (!pageRes.ok || !pageRes.content) continue;
+        const text = stripHtmlToText(pageRes.content).slice(0, 12000);
+        if (text.length < 100) continue;
+        const llmRes = await llmRouter.extractStructured({
+          category: "startups",
+          sourceUrl: siteUrl,
+          sourceName: "yc_oss_directory_llm",
+          sourceText: text,
+          onLog,
+        });
+        const hit = llmRes.records[0];
+        if (hit) {
+          if (!rec.description && typeof hit.description === "string" && hit.description.trim()) {
+            rec.description = hit.description.trim().slice(0, 3500);
+          }
+          if (rec.industry === "Unknown" && typeof hit.industry === "string" && hit.industry.trim()) {
+            rec.industry = normalizeUnknownText(hit.industry);
+          }
+          const meta = (rec.source_metadata as Record<string, unknown>) || {};
+          meta.llm_enrichment_provider = llmRes.providerUsed;
+          rec.source_metadata = meta;
+        } else if (llmRes.errors.length > 0) {
+          const meta = (rec.source_metadata as Record<string, unknown>) || {};
+          meta.llm_enrichment_warning = llmRes.errors[0];
+          rec.source_metadata = meta;
         }
-        if (rec.industry === "Unknown" && typeof hit.industry === "string" && hit.industry.trim()) {
-          rec.industry = normalizeUnknownText(hit.industry);
-        }
-        const meta = (rec.source_metadata as Record<string, unknown>) || {};
-        meta.llm_enrichment_provider = llmRes.providerUsed;
-        rec.source_metadata = meta;
+      } catch (llmErr) {
+        const safeErr = redactSecrets(llmErr instanceof Error ? llmErr.message : String(llmErr));
+        onLog?.(`[startups] Optional LLM enrichment skipped after error: ${safeErr}`);
       }
     }
   }
@@ -2672,9 +2688,12 @@ async function collectProducts(
     }
   };
 
-  // Source B: GitHub Repositories Search (respects 403/429 gracefully)
+  // Source B: GitHub Repositories Search (respects X-RateLimit-Remaining & 403/429 gracefully)
   const fetchGithubProducts = async () => {
-    const ghHeaders: Record<string, string> = { Accept: "application/vnd.github+json" };
+    const ghHeaders: Record<string, string> = {
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+    };
     if (config.githubToken) ghHeaders.Authorization = `Bearer ${config.githubToken}`;
     const seenUrls = new Set<string>();
     const queries = [
@@ -2683,12 +2702,16 @@ async function collectProducts(
       "topic:developer-tools stars:>200",
       "topic:machine-learning stars:>200",
     ];
-    let hitRateLimit = false;
+    let hitRateLimit = isGithubRateLimitedNow();
     const tel = srcTelemetry.get("github_repositories")!;
     for (const query of queries) {
       if (hitRateLimit || ghRecords.length >= Math.max(ghTarget, limit * 0.45)) break;
       let curPage = safePage;
       while (ghRecords.length < Math.max(ghTarget, limit * 0.45) && curPage < safePage + 4) {
+        if (isGithubRateLimitedNow()) {
+          hitRateLimit = true;
+          break;
+        }
         const url = `https://api.github.com/search/repositories?q=${encodeURIComponent(query)}&sort=stars&order=desc&per_page=100&page=${curPage}`;
         const res = await http.fetch(url, {
           headers: ghHeaders,
@@ -2698,9 +2721,10 @@ async function collectProducts(
         });
         tel.attempts = Math.max(tel.attempts, res.attempts);
         tel.httpStatus = res.status || tel.httpStatus;
+        const rlState = updateGithubRateLimitFromHeaders(res.status, res.headers);
         if (!res.ok) {
           errors.push({ source: "github_search", url, error: res.error || "fetch_failed" });
-          if (res.status === 403 || res.status === 429) hitRateLimit = true;
+          if (res.status === 403 || res.status === 429 || rlState.exhausted) hitRateLimit = true;
           break;
         }
         verifier.seedSnapshot(url, res.status, res.content, res.contentType);
@@ -2735,6 +2759,10 @@ async function collectProducts(
                 full_name: repo.full_name ?? null,
               },
             });
+          }
+          if (rlState.exhausted) {
+            hitRateLimit = true;
+            break;
           }
           if (items.length < 100) break;
           curPage++;
@@ -3334,7 +3362,7 @@ async function collectResearchPapers(
 
   const limited = all.slice(0, limit);
 
-  // Enrich associated GitHub repository metrics & stars concurrently (respects rate limits cleanly)
+  // Enrich associated GitHub repository metrics & stars concurrently with TTL cache + rate-limit header awareness
   const slugToRecords = new Map<string, RawRecord[]>();
   for (const rec of limited) {
     if (!rec.github_repository) continue;
@@ -3348,119 +3376,12 @@ async function collectResearchPapers(
   }
 
   const maxSlugsToEnrich = config.githubToken ? 200 : 40;
-  const slugsToEnrich = Array.from(slugToRecords.keys()).slice(0, maxSlugsToEnrich);
-  let ghRateLimited = false;
-  await mapConcurrent(slugsToEnrich, 4, async (slug) => {
-    const metricsCheckedAt = new Date().toISOString();
-    if (ghRateLimited) {
-      for (const rec of slugToRecords.get(slug) ?? []) {
-        const meta = (rec.source_metadata as Record<string, unknown>) || {};
-        if (!meta.github_metrics) {
-          meta.github_metrics = {
-            stars: rec.github_stars ?? null,
-            metrics_status: "rate_limited",
-            metrics_updated_at: metricsCheckedAt,
-          };
-          rec.source_metadata = meta;
-        }
-      }
-      return;
-    }
-    const headers: Record<string, string> = {
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-    };
-    if (config.githubToken) headers.Authorization = `Bearer ${config.githubToken}`;
-    const ghRes = await http.fetch(`https://api.github.com/repos/${slug}`, {
-      headers,
-      timeoutMs: 8000,
-      maxAttempts: 1,
-      checkRobots: false,
-    });
-    const rlRemaining = ghRes.headers["x-ratelimit-remaining"] ?? null;
-    const rlLimit = ghRes.headers["x-ratelimit-limit"] ?? null;
-    const rlResetRaw = ghRes.headers["x-ratelimit-reset"];
-    const rlResetIso =
-      rlResetRaw && /^\d+$/.test(rlResetRaw.trim()) ? new Date(Number(rlResetRaw) * 1000).toISOString() : null;
-
-    if (ghRes.status === 403 || ghRes.status === 429) {
-      ghRateLimited = true;
-      for (const rec of slugToRecords.get(slug) ?? []) {
-        const meta = (rec.source_metadata as Record<string, unknown>) || {};
-        meta.github_metrics = {
-          ...(typeof meta.github_metrics === "object" && meta.github_metrics ? meta.github_metrics : {}),
-          stars: rec.github_stars ?? null,
-          metrics_status: `rate_limited_http_${ghRes.status}`,
-          rate_limit_remaining: rlRemaining !== null ? Number(rlRemaining) : 0,
-          rate_limit_limit: rlLimit !== null ? Number(rlLimit) : null,
-          rate_limit_reset_at: rlResetIso,
-          authenticated: Boolean(config.githubToken),
-          metrics_updated_at: metricsCheckedAt,
-        };
-        rec.source_metadata = meta;
-      }
-      return;
-    }
-    if (!ghRes.ok) {
-      for (const rec of slugToRecords.get(slug) ?? []) {
-        const meta = (rec.source_metadata as Record<string, unknown>) || {};
-        meta.github_metrics = {
-          ...(typeof meta.github_metrics === "object" && meta.github_metrics ? meta.github_metrics : {}),
-          stars: rec.github_stars ?? null,
-          metrics_status: redactSecrets(ghRes.error || `http_${ghRes.status || 0}`),
-          rate_limit_remaining: rlRemaining !== null ? Number(rlRemaining) : null,
-          rate_limit_reset_at: rlResetIso,
-          authenticated: Boolean(config.githubToken),
-          metrics_updated_at: metricsCheckedAt,
-        };
-        rec.source_metadata = meta;
-      }
-      return;
-    }
-    try {
-      const ghJson = JSON.parse(ghRes.content) as Record<string, unknown>;
-      const stars = typeof ghJson.stargazers_count === "number" ? ghJson.stargazers_count : null;
-      const metrics = {
-        stars,
-        forks: typeof ghJson.forks_count === "number" ? ghJson.forks_count : null,
-        open_issues: typeof ghJson.open_issues_count === "number" ? ghJson.open_issues_count : null,
-        watchers: typeof ghJson.subscribers_count === "number" ? ghJson.subscribers_count : null,
-        language: ghJson.language ?? null,
-        updated_at: ghJson.updated_at ?? null,
-        metrics_updated_at: metricsCheckedAt,
-        rate_limit_remaining: rlRemaining !== null ? Number(rlRemaining) : null,
-        rate_limit_limit: rlLimit !== null ? Number(rlLimit) : null,
-        rate_limit_reset_at: rlResetIso,
-        authenticated: Boolean(config.githubToken),
-        metrics_status: "verified_github_api",
-      };
-      for (const rec of slugToRecords.get(slug) ?? []) {
-        if (stars !== null && stars >= 0) rec.github_stars = stars;
-        const meta = (rec.source_metadata as Record<string, unknown>) || {};
-        meta.github_metrics = metrics;
-        rec.source_metadata = meta;
-      }
-    } catch {
-      // Ignore parse error
-    }
+  await enrichGithubRepoMap(slugToRecords, {
+    http,
+    githubToken: config.githubToken,
+    maxSlugs: maxSlugsToEnrich,
+    nowIso,
   });
-
-  // Track metrics_updated_at even for repositories beyond the per-run GitHub enrichment cap
-  const enrichedSlugsSet = new Set(slugsToEnrich);
-  for (const [slug, recs] of slugToRecords.entries()) {
-    if (enrichedSlugsSet.has(slug)) continue;
-    for (const rec of recs) {
-      const meta = (rec.source_metadata as Record<string, unknown>) || {};
-      if (!meta.github_metrics) {
-        meta.github_metrics = {
-          stars: rec.github_stars ?? null,
-          metrics_status: "deferred_rate_budget",
-          metrics_updated_at: nowIso,
-        };
-        rec.source_metadata = meta;
-      }
-    }
-  }
 
   return { records: limited, errors, hasMore: limited.length >= limit, sourceOutcomes };
 }
@@ -4343,6 +4264,229 @@ function parseVerificationStatus(raw: string | undefined): VerificationStatus {
   return "Unverified";
 }
 
+// ---------- Shared GitHub Enrichment TTL Cache & Rate-Limit Guard ----------
+
+const GITHUB_CACHE_TTL_MS = 6 * 3600_000;
+const githubRepoMetricsCache = new Map<
+  string,
+  {
+    expiresAtMs: number;
+    stars: number | null;
+    metrics: Record<string, unknown>;
+  }
+>();
+let githubRateLimitedUntilMs = 0;
+
+export function clearGithubEnrichmentCacheForTest(): void {
+  githubRepoMetricsCache.clear();
+  githubRateLimitedUntilMs = 0;
+}
+
+export function isGithubRateLimitedNow(nowMs = Date.now()): boolean {
+  return githubRateLimitedUntilMs > nowMs;
+}
+
+export function updateGithubRateLimitFromHeaders(
+  status: number,
+  headers: Record<string, string>,
+  nowMs = Date.now()
+): { exhausted: boolean; remaining: number | null; limit: number | null; resetAtIso: string | null } {
+  const rlRemainingRaw = headers["x-ratelimit-remaining"];
+  const rlLimitRaw = headers["x-ratelimit-limit"];
+  const rlResetRaw = headers["x-ratelimit-reset"];
+  const retryAfterRaw = headers["retry-after"];
+
+  const remaining =
+    rlRemainingRaw !== undefined && /^\d+$/.test(rlRemainingRaw.trim()) ? Number(rlRemainingRaw) : null;
+  const limit = rlLimitRaw !== undefined && /^\d+$/.test(rlLimitRaw.trim()) ? Number(rlLimitRaw) : null;
+  const resetMs =
+    rlResetRaw !== undefined && /^\d+$/.test(rlResetRaw.trim()) ? Number(rlResetRaw) * 1000 : null;
+  const retryAfterMs =
+    retryAfterRaw !== undefined && /^\d+$/.test(retryAfterRaw.trim())
+      ? Number(retryAfterRaw) * 1000
+      : null;
+
+  const exhausted = status === 403 || status === 429 || remaining === 0;
+  if (exhausted) {
+    const candidateUntil = retryAfterMs
+      ? nowMs + Math.min(3600_000, retryAfterMs)
+      : resetMs && resetMs > nowMs
+      ? Math.min(nowMs + 3600_000, resetMs)
+      : nowMs + 60_000;
+    githubRateLimitedUntilMs = Math.max(githubRateLimitedUntilMs, candidateUntil);
+  }
+  return {
+    exhausted,
+    remaining,
+    limit,
+    resetAtIso: resetMs ? new Date(resetMs).toISOString() : null,
+  };
+}
+
+export async function enrichGithubRepoMap(
+  slugToRecords: Map<string, Array<Record<string, unknown>>>,
+  opts: {
+    http: PoliteHttpClient;
+    githubToken: string | null;
+    maxSlugs: number;
+    nowIso: string;
+    apiBaseUrl?: string;
+    cacheTtlMs?: number;
+  }
+): Promise<{ cacheHits: number; apiFetched: number; rateLimited: boolean }> {
+  const ttlMs = opts.cacheTtlMs ?? GITHUB_CACHE_TTL_MS;
+  const cleanBase = (opts.apiBaseUrl ?? "https://api.github.com").replace(/\/+$/, "");
+  const hasToken = Boolean(opts.githubToken && opts.githubToken.trim());
+  const cacheKeyPrefix = hasToken ? "auth:" : "anon:";
+  const nowMs = Date.now();
+  let cacheHits = 0;
+  let apiFetched = 0;
+  const uncachedSlugs: string[] = [];
+
+  for (const [slug, recs] of slugToRecords.entries()) {
+    const cached = githubRepoMetricsCache.get(`${cacheKeyPrefix}${slug.toLowerCase()}`);
+    if (cached && cached.expiresAtMs > nowMs) {
+      cacheHits += 1;
+      for (const rec of recs) {
+        if (cached.stars !== null && cached.stars >= 0) rec.github_stars = cached.stars;
+        const meta = (rec.source_metadata as Record<string, unknown>) || {};
+        meta.github_metrics = {
+          ...cached.metrics,
+          metrics_status: "cached_github_api",
+        };
+        rec.source_metadata = meta;
+      }
+      continue;
+    }
+    uncachedSlugs.push(slug);
+  }
+
+  const slugsToQuery = uncachedSlugs.slice(0, Math.max(0, opts.maxSlugs));
+  const headers: Record<string, string> = {
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
+  if (hasToken) headers.Authorization = `Bearer ${opts.githubToken!.trim()}`;
+
+  await mapConcurrent(slugsToQuery, 4, async (slug) => {
+    const metricsCheckedAt = new Date().toISOString();
+    if (isGithubRateLimitedNow()) {
+      for (const rec of slugToRecords.get(slug) ?? []) {
+        const meta = (rec.source_metadata as Record<string, unknown>) || {};
+        meta.github_metrics = {
+          ...(typeof meta.github_metrics === "object" && meta.github_metrics ? meta.github_metrics : {}),
+          stars: rec.github_stars ?? null,
+          metrics_status: rec.github_stars !== null && rec.github_stars !== undefined ? "cached_rate_limited" : "rate_limited",
+          authenticated: hasToken,
+          rate_limit_reset_at: githubRateLimitedUntilMs > 0 ? new Date(githubRateLimitedUntilMs).toISOString() : null,
+          metrics_updated_at: metricsCheckedAt,
+        };
+        rec.source_metadata = meta;
+      }
+      return;
+    }
+
+    apiFetched += 1;
+    const ghRes = await opts.http.fetch(`${cleanBase}/repos/${slug}`, {
+      headers,
+      timeoutMs: 8000,
+      maxAttempts: 1,
+      checkRobots: false,
+    });
+    const rl = updateGithubRateLimitFromHeaders(ghRes.status, ghRes.headers);
+
+    if (ghRes.status === 403 || ghRes.status === 429) {
+      for (const rec of slugToRecords.get(slug) ?? []) {
+        const meta = (rec.source_metadata as Record<string, unknown>) || {};
+        meta.github_metrics = {
+          ...(typeof meta.github_metrics === "object" && meta.github_metrics ? meta.github_metrics : {}),
+          stars: rec.github_stars ?? null,
+          metrics_status:
+            rec.github_stars !== null && rec.github_stars !== undefined
+              ? `cached_hf_rate_limited_${ghRes.status}`
+              : `rate_limited_http_${ghRes.status}`,
+          rate_limit_remaining: rl.remaining ?? 0,
+          rate_limit_limit: rl.limit,
+          rate_limit_reset_at: rl.resetAtIso,
+          authenticated: hasToken,
+          metrics_updated_at: metricsCheckedAt,
+        };
+        rec.source_metadata = meta;
+      }
+      return;
+    }
+    if (!ghRes.ok) {
+      for (const rec of slugToRecords.get(slug) ?? []) {
+        const meta = (rec.source_metadata as Record<string, unknown>) || {};
+        meta.github_metrics = {
+          ...(typeof meta.github_metrics === "object" && meta.github_metrics ? meta.github_metrics : {}),
+          stars: rec.github_stars ?? null,
+          metrics_status: redactSecrets(ghRes.error || `http_${ghRes.status || 0}`),
+          rate_limit_remaining: rl.remaining,
+          rate_limit_reset_at: rl.resetAtIso,
+          authenticated: hasToken,
+          metrics_updated_at: metricsCheckedAt,
+        };
+        rec.source_metadata = meta;
+      }
+      return;
+    }
+    try {
+      const ghJson = JSON.parse(ghRes.content) as Record<string, unknown>;
+      const stars = typeof ghJson.stargazers_count === "number" ? ghJson.stargazers_count : null;
+      const metrics: Record<string, unknown> = {
+        stars,
+        forks: typeof ghJson.forks_count === "number" ? ghJson.forks_count : null,
+        open_issues: typeof ghJson.open_issues_count === "number" ? ghJson.open_issues_count : null,
+        watchers: typeof ghJson.subscribers_count === "number" ? ghJson.subscribers_count : null,
+        language: ghJson.language ?? null,
+        updated_at: ghJson.updated_at ?? null,
+        metrics_updated_at: metricsCheckedAt,
+        rate_limit_remaining: rl.remaining,
+        rate_limit_limit: rl.limit,
+        rate_limit_reset_at: rl.resetAtIso,
+        authenticated: hasToken,
+        metrics_status: "verified_github_api",
+      };
+      githubRepoMetricsCache.set(`${cacheKeyPrefix}${slug.toLowerCase()}`, {
+        expiresAtMs: Date.now() + ttlMs,
+        stars,
+        metrics,
+      });
+      for (const rec of slugToRecords.get(slug) ?? []) {
+        if (stars !== null && stars >= 0) rec.github_stars = stars;
+        const meta = (rec.source_metadata as Record<string, unknown>) || {};
+        meta.github_metrics = metrics;
+        rec.source_metadata = meta;
+      }
+    } catch {
+      // Ignore parse failure without fabricating metrics
+    }
+  });
+
+  const queriedSet = new Set(slugsToQuery);
+  for (const slug of uncachedSlugs) {
+    if (queriedSet.has(slug)) continue;
+    for (const rec of slugToRecords.get(slug) ?? []) {
+      const meta = (rec.source_metadata as Record<string, unknown>) || {};
+      if (!meta.github_metrics) {
+        meta.github_metrics = {
+          stars: rec.github_stars ?? null,
+          source: rec.source_name ?? "unknown",
+          metrics_status:
+            rec.github_stars !== null && rec.github_stars !== undefined
+              ? "cached_source_budget_cap"
+              : "deferred_rate_budget",
+          metrics_updated_at: opts.nowIso,
+        };
+        rec.source_metadata = meta;
+      }
+    }
+  }
+
+  return { cacheHits, apiFetched, rateLimited: isGithubRateLimitedNow() };
+}
+
 // ---------- Main Backend Service ----------
 
 export interface IntegrationHealthItem {
@@ -4518,6 +4662,7 @@ export class AtlasBackendService {
         credentialsJson: this.config.googleSheetsCredentialsJson,
         spreadsheetId: this.config.googleSheetsSpreadsheetId,
         spreadsheetName: this.config.googleSheetsSpreadsheetName,
+        freshnessWindowHours: this.config.freshnessWindowHours,
       },
       this.db
     );
@@ -5035,7 +5180,7 @@ export class AtlasBackendService {
       const totalDbRows = Object.values(dbHealth.tableCounts).reduce((s, n) => s + n, 0);
 
       const [llmProbes, githubProbe, sheetsProbe] = await Promise.all([
-        this.llmRouter.probeProviders({ timeoutMs: 12_000 }),
+        this.llmRouter.probeProviders({ timeoutMs: 15_000 }),
         probeGithubApi(this.http, this.config.githubToken),
         this.sheets.probeHealth(opts),
       ]);
@@ -5281,9 +5426,28 @@ export class AtlasBackendService {
     return { entries, count: entries.length };
   }
 
+  private parseCsvFreshnessMs(row: Record<string, unknown>, tableName: string): number | null {
+    const raw =
+      tableName === "jobs"
+        ? row.posted_at
+        : tableName === "news" || tableName === "research_papers"
+        ? row.published_at
+        : null;
+    if (typeof raw !== "string" || !raw.trim()) return null;
+    const s = raw.trim();
+    const hasTz = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(s);
+    const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(s)
+      ? `${s.replace(" ", "T")}${hasTz ? "" : "Z"}`
+      : s;
+    const parsed = Date.parse(normalized);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
   private buildCsvForSpec(
     spec: ExportSpec,
-    canonicalNames: Map<string, string>
+    canonicalNames: Map<string, string>,
+    scope: ExportScope = "all",
+    refNow: Date = new Date()
   ): {
     tableName: string;
     tabName: string;
@@ -5295,11 +5459,26 @@ export class AtlasBackendService {
     const seenIds = new Set<string>();
     const lines: string[] = [spec.columns.map(csvEscape).join(",")];
     let count = 0;
+    const refMs = refNow.getTime();
+    const minMs = refMs - this.config.freshnessWindowHours * 3600_000;
+    const maxMs = refMs + 5 * 60_000;
 
     for (const row of rawRows) {
       const rowId = String(row[spec.idColumn] ?? "");
       if (!rowId || seenIds.has(rowId)) continue;
       seenIds.add(rowId);
+
+      if (scope === "qualified_24h" && spec.tableName !== "entity_mapping_log") {
+        if (String(row.verification_status ?? "") === "Rejected") {
+          continue;
+        }
+        if (spec.tableName === "jobs" || spec.tableName === "news") {
+          const tsMs = this.parseCsvFreshnessMs(row, spec.tableName);
+          if (tsMs === null || tsMs < minMs || tsMs > maxMs) {
+            continue;
+          }
+        }
+      }
 
       const enrichedRow: Record<string, unknown> = { ...row };
       if (spec.tableName === "startups" || spec.tableName === "products") {
@@ -5324,7 +5503,7 @@ export class AtlasBackendService {
     };
   }
 
-  public buildAllCsvDatasets(): {
+  public buildAllCsvDatasets(scope: ExportScope = "all"): {
     datasets: Array<{
       tableName: string;
       tabName: string;
@@ -5337,6 +5516,7 @@ export class AtlasBackendService {
     totalRows: number;
   } {
     const canonicalNames = this.db.fetchCanonicalNameMap();
+    const refNow = new Date();
     const datasets: Array<{
       tableName: string;
       tabName: string;
@@ -5349,7 +5529,7 @@ export class AtlasBackendService {
     let totalRows = 0;
 
     for (const spec of EXPORT_SPECS) {
-      const built = this.buildCsvForSpec(spec, canonicalNames);
+      const built = this.buildCsvForSpec(spec, canonicalNames, scope, refNow);
       const byteSize = Buffer.byteLength(built.content, "utf-8");
       datasets.push({ ...built, byteSize });
       rowCounts[spec.tabName] = built.rowCount;
@@ -5359,7 +5539,7 @@ export class AtlasBackendService {
     return { datasets, rowCounts, totalRows };
   }
 
-  public exportSingleCsv(csvFilename: string): {
+  public exportSingleCsv(csvFilename: string, scope: ExportScope = "all"): {
     tableName: string;
     tabName: string;
     csvFilename: string;
@@ -5372,18 +5552,21 @@ export class AtlasBackendService {
       throw new Error(`Unsupported CSV filename: ${csvFilename}`);
     }
     const canonicalNames = this.db.fetchCanonicalNameMap();
-    const built = this.buildCsvForSpec(spec, canonicalNames);
+    const built = this.buildCsvForSpec(spec, canonicalNames, scope);
     fs.mkdirSync(this.config.exportsDir, { recursive: true });
     const targetFile = path.resolve(this.config.exportsDir, spec.csvFilename);
-    fs.writeFileSync(targetFile, built.content, "utf-8");
+    if (scope === "all") {
+      fs.writeFileSync(targetFile, built.content, "utf-8");
+    }
     return {
       ...built,
       filePath: targetFile,
     };
   }
 
-  public exportAllCsv(): {
+  public exportAllCsv(scope: ExportScope = "all"): {
     outputDir: string;
+    scope: ExportScope;
     rowCounts: Record<string, number>;
     files: Record<string, string>;
     totalRows: number;
@@ -5397,7 +5580,7 @@ export class AtlasBackendService {
     }>;
   } {
     fs.mkdirSync(this.config.exportsDir, { recursive: true });
-    const built = this.buildAllCsvDatasets();
+    const built = this.buildAllCsvDatasets(scope);
     const files: Record<string, string> = {};
     const datasetSummaries: Array<{
       tableName: string;
@@ -5407,10 +5590,13 @@ export class AtlasBackendService {
       byteSize: number;
       downloadUrl: string;
     }> = [];
+    const scopeQuery = scope === "qualified_24h" ? "?scope=qualified" : "";
 
     for (const ds of built.datasets) {
       const targetFile = path.resolve(this.config.exportsDir, ds.csvFilename);
-      fs.writeFileSync(targetFile, ds.content, "utf-8");
+      if (scope === "all") {
+        fs.writeFileSync(targetFile, ds.content, "utf-8");
+      }
       files[ds.tabName] = targetFile;
       datasetSummaries.push({
         tableName: ds.tableName,
@@ -5418,12 +5604,13 @@ export class AtlasBackendService {
         filename: ds.csvFilename,
         rowCount: ds.rowCount,
         byteSize: ds.byteSize,
-        downloadUrl: `/api/atlas/download/csv/${ds.csvFilename}`,
+        downloadUrl: `/api/atlas/download/csv/${ds.csvFilename}${scopeQuery}`,
       });
     }
 
     return {
       outputDir: this.config.exportsDir,
+      scope,
       rowCounts: built.rowCounts,
       files,
       totalRows: built.totalRows,
@@ -5431,21 +5618,23 @@ export class AtlasBackendService {
     };
   }
 
-  public buildCsvZipBundle(): {
+  public async buildCsvZipBundle(scope: ExportScope = "all"): Promise<{
     filename: string;
     buffer: Buffer;
     rowCounts: Record<string, number>;
     fileSizes: Record<string, number>;
     totalRows: number;
-  } {
+  }> {
     fs.mkdirSync(this.config.exportsDir, { recursive: true });
-    const built = this.buildAllCsvDatasets();
+    const built = this.buildAllCsvDatasets(scope);
     const fileSizes: Record<string, number> = {};
     const modifiedAt = new Date();
 
     const entries = built.datasets.map((ds) => {
-      const targetFile = path.resolve(this.config.exportsDir, ds.csvFilename);
-      fs.writeFileSync(targetFile, ds.content, "utf-8");
+      if (scope === "all") {
+        const targetFile = path.resolve(this.config.exportsDir, ds.csvFilename);
+        fs.writeFileSync(targetFile, ds.content, "utf-8");
+      }
       fileSizes[ds.csvFilename] = ds.byteSize;
       return {
         filename: ds.csvFilename,
@@ -5454,13 +5643,36 @@ export class AtlasBackendService {
       };
     });
 
-    const buffer = createZipArchive(entries);
+    const buffer = await createZipArchive(entries);
     return {
-      filename: "frontier-atlas-datasets.zip",
+      filename: scope === "qualified_24h" ? "frontier-atlas-qualified-24h.zip" : "frontier-atlas-datasets.zip",
       buffer,
       rowCounts: built.rowCounts,
       fileSizes,
       totalRows: built.totalRows,
+    };
+  }
+
+  public async buildFallbackExportSummary(
+    reason: string,
+    scope: ExportScope = "all"
+  ): Promise<SheetsFallbackExportSummary> {
+    const bundle = await this.buildCsvZipBundle(scope);
+    const scopeQuery = scope === "qualified_24h" ? "?scope=qualified" : "";
+    return {
+      ready: true,
+      reason,
+      zipFilename: bundle.filename,
+      zipUrl: `/api/atlas/download/csv-bundle.zip${scopeQuery}`,
+      zipByteSize: bundle.buffer.length,
+      rowCounts: bundle.rowCounts,
+      totalRows: bundle.totalRows,
+      datasets: EXPORT_SPECS.map((spec) => ({
+        tabName: spec.tabName,
+        filename: spec.csvFilename,
+        rowCount: bundle.rowCounts[spec.tabName] ?? 0,
+        downloadUrl: `/api/atlas/download/csv/${spec.csvFilename}${scopeQuery}`,
+      })),
     };
   }
 
@@ -5510,9 +5722,20 @@ export class AtlasBackendService {
     oauthAccessToken?: string | null;
     spreadsheetId?: string | null;
     createNew?: boolean;
+    exportScope?: ExportScope;
   }): Promise<SheetsSyncResult> {
     const res = await this.sheets.exportOrSync("full", opts);
     this.syncSheetsHealthFromStatus(this.sheets.getStatus());
+    if (!res.success && !res.fallbackExport) {
+      try {
+        res.fallbackExport = await this.buildFallbackExportSummary(
+          res.error || "Google Sheets export failed.",
+          opts?.exportScope ?? res.exportScope ?? "all"
+        );
+      } catch {
+        // Non-blocking fallback build
+      }
+    }
     return res;
   }
 
@@ -5520,9 +5743,20 @@ export class AtlasBackendService {
     oauthAccessToken?: string | null;
     spreadsheetId?: string | null;
     createNew?: boolean;
+    exportScope?: ExportScope;
   }): Promise<SheetsSyncResult> {
     const res = await this.sheets.exportOrSync("incremental", opts);
     this.syncSheetsHealthFromStatus(this.sheets.getStatus());
+    if (!res.success && !res.fallbackExport) {
+      try {
+        res.fallbackExport = await this.buildFallbackExportSummary(
+          res.error || "Google Sheets sync failed.",
+          opts?.exportScope ?? res.exportScope ?? "all"
+        );
+      } catch {
+        // Non-blocking fallback build
+      }
+    }
     return res;
   }
 
@@ -6242,13 +6476,8 @@ export class AtlasBackendService {
         });
       }
 
-      // Backfill GitHub star metrics_updated_at & stars for research_papers with github_repository
+      // Backfill GitHub star metrics_updated_at & stars for research_papers with github_repository using shared cache & rate-limit tracker
       if (opts.liveCheck && cat === "research_papers") {
-        const ghHeaders: Record<string, string> = {
-          Accept: "application/vnd.github+json",
-          "X-GitHub-Api-Version": "2022-11-28",
-        };
-        if (this.config.githubToken) ghHeaders.Authorization = `Bearer ${this.config.githubToken}`;
         const slugToPapers = new Map<string, RawRecord[]>();
         for (const rec of parsedRows) {
           if (!rec.github_repository) continue;
@@ -6256,116 +6485,28 @@ export class AtlasBackendService {
           if (!slug) continue;
           const meta = (rec.source_metadata as Record<string, unknown>) || {};
           const existingGh = meta.github_metrics as Record<string, unknown> | undefined;
-          if (!existingGh?.metrics_updated_at || rec.github_stars === null || rec.github_stars === undefined) {
+          const updatedAtMs =
+            typeof existingGh?.metrics_updated_at === "string"
+              ? Date.parse(existingGh.metrics_updated_at)
+              : Number.NaN;
+          const isFreshExisting =
+            Number.isFinite(updatedAtMs) &&
+            Date.now() - updatedAtMs < GITHUB_CACHE_TTL_MS &&
+            existingGh?.metrics_status === "verified_github_api" &&
+            rec.github_stars !== null &&
+            rec.github_stars !== undefined;
+          if (!isFreshExisting) {
             const list = slugToPapers.get(slug) ?? [];
             list.push(rec);
             slugToPapers.set(slug, list);
           }
         }
-        const maxBackfillSlugs = this.config.githubToken ? 120 : 40;
-        const slugsToQuery = Array.from(slugToPapers.keys()).slice(0, maxBackfillSlugs);
-        let rateLimited = false;
-        await mapConcurrent(slugsToQuery, 4, async (slug) => {
-          const ts = new Date().toISOString();
-          if (rateLimited) {
-            for (const rec of slugToPapers.get(slug) ?? []) {
-              const meta = (rec.source_metadata as Record<string, unknown>) || {};
-              meta.github_metrics = {
-                stars: rec.github_stars ?? null,
-                metrics_status: rec.github_stars !== null ? "cached_rate_limited" : "rate_limited",
-                authenticated: Boolean(this.config.githubToken),
-                metrics_updated_at: ts,
-              };
-              rec.source_metadata = meta;
-            }
-            return;
-          }
-          const ghRes = await this.http.fetch(`https://api.github.com/repos/${slug}`, {
-            headers: ghHeaders,
-            timeoutMs: 8000,
-            maxAttempts: 1,
-          });
-          const rlRemaining = ghRes.headers["x-ratelimit-remaining"] ?? null;
-          const rlLimit = ghRes.headers["x-ratelimit-limit"] ?? null;
-          const rlResetRaw = ghRes.headers["x-ratelimit-reset"];
-          const rlResetIso =
-            rlResetRaw && /^\d+$/.test(rlResetRaw.trim()) ? new Date(Number(rlResetRaw) * 1000).toISOString() : null;
-
-          if (ghRes.status === 403 || ghRes.status === 429) {
-            rateLimited = true;
-            for (const rec of slugToPapers.get(slug) ?? []) {
-              const meta = (rec.source_metadata as Record<string, unknown>) || {};
-              meta.github_metrics = {
-                stars: rec.github_stars ?? null,
-                metrics_status: rec.github_stars !== null ? `cached_hf_rate_limited_${ghRes.status}` : `rate_limited_http_${ghRes.status}`,
-                rate_limit_remaining: rlRemaining !== null ? Number(rlRemaining) : 0,
-                rate_limit_limit: rlLimit !== null ? Number(rlLimit) : null,
-                rate_limit_reset_at: rlResetIso,
-                authenticated: Boolean(this.config.githubToken),
-                metrics_updated_at: ts,
-              };
-              rec.source_metadata = meta;
-            }
-            return;
-          }
-          if (ghRes.ok) {
-            try {
-              const ghJson = JSON.parse(ghRes.content) as Record<string, unknown>;
-              const stars = typeof ghJson.stargazers_count === "number" ? ghJson.stargazers_count : null;
-              const metrics = {
-                stars,
-                forks: typeof ghJson.forks_count === "number" ? ghJson.forks_count : null,
-                open_issues: typeof ghJson.open_issues_count === "number" ? ghJson.open_issues_count : null,
-                watchers: typeof ghJson.subscribers_count === "number" ? ghJson.subscribers_count : null,
-                language: ghJson.language ?? null,
-                updated_at: ghJson.updated_at ?? null,
-                metrics_updated_at: ts,
-                rate_limit_remaining: rlRemaining !== null ? Number(rlRemaining) : null,
-                rate_limit_limit: rlLimit !== null ? Number(rlLimit) : null,
-                rate_limit_reset_at: rlResetIso,
-                authenticated: Boolean(this.config.githubToken),
-                metrics_status: "verified_github_api",
-              };
-              for (const rec of slugToPapers.get(slug) ?? []) {
-                if (stars !== null && stars >= 0) rec.github_stars = stars;
-                const meta = (rec.source_metadata as Record<string, unknown>) || {};
-                meta.github_metrics = metrics;
-                rec.source_metadata = meta;
-              }
-            } catch {
-              // Ignore parse failure
-            }
-          } else {
-            for (const rec of slugToPapers.get(slug) ?? []) {
-              const meta = (rec.source_metadata as Record<string, unknown>) || {};
-              meta.github_metrics = {
-                stars: rec.github_stars ?? null,
-                metrics_status: redactSecrets(ghRes.error || `http_${ghRes.status || 0}`),
-                rate_limit_remaining: rlRemaining !== null ? Number(rlRemaining) : null,
-                rate_limit_reset_at: rlResetIso,
-                authenticated: Boolean(this.config.githubToken),
-                metrics_updated_at: ts,
-              };
-              rec.source_metadata = meta;
-            }
-          }
+        await enrichGithubRepoMap(slugToPapers, {
+          http: this.http,
+          githubToken: this.config.githubToken,
+          maxSlugs: this.config.githubToken ? 120 : 40,
+          nowIso: checkedAtIso,
         });
-        const queriedSet = new Set(slugsToQuery);
-        for (const [slug, recs] of slugToPapers.entries()) {
-          if (queriedSet.has(slug)) continue;
-          for (const rec of recs) {
-            const meta = (rec.source_metadata as Record<string, unknown>) || {};
-            if (!meta.github_metrics) {
-              meta.github_metrics = {
-                stars: rec.github_stars ?? null,
-                source: rec.source_name ?? "unknown",
-                metrics_status: rec.github_stars !== null ? "cached_source_budget_cap" : "deferred_rate_budget",
-                metrics_updated_at: checkedAtIso,
-              };
-              rec.source_metadata = meta;
-            }
-          }
-        }
       }
 
       const verified = await mapConcurrent(parsedRows, this.config.maxConcurrency, (rec) => {

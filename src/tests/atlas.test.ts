@@ -5,14 +5,17 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import zlib from "node:zlib";
+import JSZip from "jszip";
 import {
   AtlasBackendService,
   classifyJobRoleFamily,
+  clearGithubEnrichmentCacheForTest,
   computeNextUtcRunIso,
   createLLMRouter,
   detectJobRemoteEligibility,
+  enrichGithubRepoMap,
   EntityResolver,
+  isGithubRateLimitedNow,
   isWithinFreshnessWindow,
   LiveSourceVerifier,
   loadAtlasConfig,
@@ -22,6 +25,7 @@ import {
   parseUtcDatetime,
   parseUtcDatetimeWithMeta,
   probeGithubApi,
+  updateGithubRateLimitFromHeaders,
 } from "../server/atlasBackend.ts";
 import { AtlasDatabase } from "../server/atlasDb.ts";
 import { EXPORT_SPECS, GoogleSheetsService } from "../server/googleSheets.ts";
@@ -36,8 +40,10 @@ import {
   TransientProviderError,
   type LLMProvider,
 } from "../server/llmRouter.ts";
+import { createZipArchive, validateZipArchive } from "../server/zipArchive.ts";
 import {
   formatGoogleAuthError,
+  getOAuthSetupDiagnostics,
   GOOGLE_WORKSPACE_SCOPES,
   isGoogleOAuthBlockedMessage,
 } from "../lib/googleWorkspaceAuth.ts";
@@ -621,7 +627,7 @@ test("SQLite storage + 6-tab Google Sheets full export, incremental sync, and re
       db
     );
 
-    const fullRes = await sheets.exportOrSync("full");
+    const fullRes = await sheets.exportOrSync("full", { exportScope: "all" });
     assert.equal(fullRes.success, true, fullRes.error ?? undefined);
     assert.equal(fullRes.status, "Connected");
     assert.deepEqual(Object.keys(fullRes.verifiedTabRowCounts), [
@@ -636,7 +642,7 @@ test("SQLite storage + 6-tab Google Sheets full export, incremental sync, and re
       assert.equal(fullRes.verifiedTabRowCounts[spec.tabName], 1);
     }
 
-    const incRes = await sheets.exportOrSync("incremental");
+    const incRes = await sheets.exportOrSync("incremental", { exportScope: "all" });
     assert.equal(incRes.success, true, incRes.error ?? undefined);
     assert.equal(incRes.rowsAdded, 0);
     assert.equal(incRes.rowsUpdated, 0);
@@ -2873,32 +2879,19 @@ test("GoogleSheetsService honors createNew=true by ignoring persisted spreadshee
   }
 });
 
-function readZipEntriesForTest(zipBuf: Buffer): Map<string, string> {
+async function readZipEntriesForTest(zipBuf: Buffer): Promise<Map<string, string>> {
+  assert.equal(zipBuf.subarray(0, 4).toString("binary"), "PK\x03\x04", "ZIP must start with local file header PK\\x03\\x04");
+  const loaded = await JSZip.loadAsync(zipBuf);
   const files = new Map<string, string>();
-  let offset = 0;
-  while (offset + 30 <= zipBuf.length) {
-    const sig = zipBuf.readUInt32LE(offset);
-    if (sig !== 0x04034b50) break;
-    const method = zipBuf.readUInt16LE(offset + 8);
-    const expectedCrc = zipBuf.readUInt32LE(offset + 14);
-    const compSize = zipBuf.readUInt32LE(offset + 18);
-    const uncompSize = zipBuf.readUInt32LE(offset + 22);
-    const nameLen = zipBuf.readUInt16LE(offset + 26);
-    const extraLen = zipBuf.readUInt16LE(offset + 28);
-    const nameStart = offset + 30;
-    const filename = zipBuf.subarray(nameStart, nameStart + nameLen).toString("utf-8");
-    const dataStart = nameStart + nameLen + extraLen;
-    const compBuf = zipBuf.subarray(dataStart, dataStart + compSize);
-    const rawBuf = method === 8 ? zlib.inflateRawSync(compBuf) : compBuf;
-    assert.equal(rawBuf.length, uncompSize, `Size mismatch for ${filename}`);
-    assert.equal(zlib.crc32(rawBuf) >>> 0, expectedCrc, `CRC32 mismatch for ${filename}`);
-    files.set(filename, rawBuf.toString("utf-8"));
-    offset = dataStart + compSize;
+  for (const [name, entry] of Object.entries(loaded.files)) {
+    if (!entry.dir) {
+      files.set(name, await entry.async("string"));
+    }
   }
   return files;
 }
 
-test("All 6 SQLite CSV exports and ZIP bundle preserve canonical names, timestamps, GitHub metrics, URLs, and verification statuses", () => {
+test("All 6 SQLite CSV exports and ZIP bundle preserve canonical names, timestamps, GitHub metrics, URLs, and verification statuses", async () => {
   const tmpAtlasDir = fs.mkdtempSync(path.join(os.tmpdir(), "atlas-csv-zip-test-"));
   const dataDir = path.join(tmpAtlasDir, "data");
   fs.mkdirSync(dataDir, { recursive: true });
@@ -3053,10 +3046,10 @@ test("All 6 SQLite CSV exports and ZIP bundle preserve canonical names, timestam
     assert.equal(csvRes.totalRows, 6);
     assert.equal(csvRes.datasets.length, 6);
 
-    const zipBundle = svc.buildCsvZipBundle();
+    const zipBundle = await svc.buildCsvZipBundle();
     assert.equal(zipBundle.filename, "frontier-atlas-datasets.zip");
     assert.equal(zipBundle.totalRows, 6);
-    const extracted = readZipEntriesForTest(zipBundle.buffer);
+    const extracted = await readZipEntriesForTest(zipBundle.buffer);
     assert.deepEqual(
       Array.from(extracted.keys()),
       [
@@ -3110,7 +3103,7 @@ test("All 6 SQLite CSV exports and ZIP bundle preserve canonical names, timestam
   }
 });
 
-test("Google OAuth error formatter explicitly detects Error 403 access_denied blocks", () => {
+test("Google OAuth error formatter explicitly detects Error 403 access_denied and auth/unauthorized-domain blocks", () => {
   const err403 = Object.assign(new Error("Firebase: Error 403 (access_denied) app has not completed Google verification"), {
     code: "auth/oauth-error",
   });
@@ -3120,6 +3113,985 @@ test("Google OAuth error formatter explicitly detects Error 403 access_denied bl
   assert.equal(isGoogleOAuthBlockedMessage(msg), true);
   assert.equal(isGoogleOAuthBlockedMessage(err403), true);
   assert.equal(isGoogleOAuthBlockedMessage("Export Successful"), false);
+
+  const errDomain = Object.assign(
+    new Error("Firebase: Error (auth/unauthorized-domain)."),
+    { code: "auth/unauthorized-domain" }
+  );
+  const domainMsg = formatGoogleAuthError(errDomain);
+  assert.ok(domainMsg.includes("auth/unauthorized-domain"));
+  assert.ok(domainMsg.includes("gen-lang-client-0062316160"));
+  assert.ok(domainMsg.includes("/__/auth/handler"));
+  assert.equal(isGoogleOAuthBlockedMessage(errDomain), true);
+  assert.equal(isGoogleOAuthBlockedMessage(domainMsg), true);
+
+  const diag = getOAuthSetupDiagnostics();
+  assert.equal(diag.firebaseProjectId, "gen-lang-client-0062316160");
+  assert.ok(
+    diag.previewHostnames.includes("ais-dev-2lxnn5ax4d6w4sxglutuue-910587750641.asia-northeast1.run.app")
+  );
 });
+
+test("GoogleSheetsService qualified_24h scope excludes Rejected and stale >24h rows and handles 413 splitting, 429 retries, and Drive public Viewer read-back", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "atlas-sheets-e2e-"));
+  const dbPath = path.join(tmpDir, "e2e.db");
+  const { privateKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const pem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+
+  const sheetValues = new Map<string, string[][]>();
+  const sheetProps = EXPORT_SPECS.map((s, idx) => ({
+    properties: {
+      sheetId: idx + 1,
+      title: s.tabName,
+      gridProperties: { rowCount: 200, columnCount: s.columns.length },
+    },
+  }));
+
+  let simulated413Pending = true;
+  let simulated429Pending = true;
+  let blockDriveShare = false;
+  const permissions: Array<{ id: string; type: string; role: string; allowFileDiscovery?: boolean }> = [];
+
+  const mockServer = await withHttpServer((req, res, body) => {
+    res.setHeader("Content-Type", "application/json");
+    const urlPath = (req.url ?? "").split("?")[0];
+
+    if (urlPath === "/oauth/token" && req.method === "POST") {
+      res.writeHead(200);
+      res.end(JSON.stringify({ access_token: "mock-e2e-token", expires_in: 3600 }));
+      return;
+    }
+
+    if (urlPath === "/v4/spreadsheets" && req.method === "POST") {
+      res.writeHead(200);
+      res.end(
+        JSON.stringify({
+          spreadsheetId: "sheet-e2e-01",
+          spreadsheetUrl: "https://docs.google.com/spreadsheets/d/sheet-e2e-01",
+          sheets: sheetProps,
+        })
+      );
+      return;
+    }
+
+    if (urlPath === "/v4/spreadsheets/sheet-e2e-01" && req.method === "GET") {
+      res.writeHead(200);
+      res.end(
+        JSON.stringify({
+          spreadsheetId: "sheet-e2e-01",
+          spreadsheetUrl: "https://docs.google.com/spreadsheets/d/sheet-e2e-01",
+          sheets: sheetProps,
+        })
+      );
+      return;
+    }
+
+    if (urlPath === "/v4/spreadsheets/sheet-e2e-01:batchUpdate" && req.method === "POST") {
+      res.writeHead(200);
+      res.end(JSON.stringify({ replies: [] }));
+      return;
+    }
+
+    if (urlPath === "/v4/spreadsheets/sheet-e2e-01/values:batchClear" && req.method === "POST") {
+      sheetValues.clear();
+      res.writeHead(200);
+      res.end(JSON.stringify({ clearedRanges: [] }));
+      return;
+    }
+
+    if (urlPath === "/v4/spreadsheets/sheet-e2e-01/values:batchUpdate" && req.method === "POST") {
+      if (simulated429Pending) {
+        simulated429Pending = false;
+        res.setHeader("Retry-After", "0");
+        res.writeHead(429);
+        res.end(JSON.stringify({ error: { message: "Rate Limit Exceeded" } }));
+        return;
+      }
+      const payload = JSON.parse(body) as { data?: Array<{ range: string; values: unknown[][] }> };
+      const totalPayloadRows = (payload.data ?? []).reduce((sum, e) => sum + e.values.length, 0);
+      if (simulated413Pending && totalPayloadRows > 2) {
+        simulated413Pending = false;
+        res.writeHead(413);
+        res.end(JSON.stringify({ error: { message: "Payload Too Large" } }));
+        return;
+      }
+      for (const entry of payload.data ?? []) {
+        const tabMatch = entry.range.match(/^'([^']+)'!A(\d+)/);
+        if (!tabMatch) continue;
+        const tabName = tabMatch[1];
+        const startRow = Number(tabMatch[2]);
+        const existing = sheetValues.get(tabName) ?? [];
+        for (let i = 0; i < entry.values.length; i++) {
+          existing[startRow - 1 + i] = entry.values[i].map((v) => String(v ?? ""));
+        }
+        sheetValues.set(tabName, existing);
+      }
+      res.writeHead(200);
+      res.end(JSON.stringify({ responses: [] }));
+      return;
+    }
+
+    const clearMatch = urlPath.match(/^\/v4\/spreadsheets\/sheet-e2e-01\/values\/([^/]+):clear$/);
+    if (clearMatch && req.method === "POST") {
+      const rangeDecoded = decodeURIComponent(clearMatch[1]);
+      const tabMatch = rangeDecoded.match(/^'([^']+)'/);
+      if (tabMatch?.[1]) {
+        sheetValues.delete(tabMatch[1]);
+      }
+      res.writeHead(200);
+      res.end(JSON.stringify({ clearedRange: rangeDecoded }));
+      return;
+    }
+
+    const readMatch = urlPath.match(/^\/v4\/spreadsheets\/sheet-e2e-01\/values\/([^/]+)$/);
+    if (readMatch && req.method === "GET") {
+      const rangeDecoded = decodeURIComponent(readMatch[1]);
+      const tabMatch = rangeDecoded.match(/^'([^']+)'!/);
+      const tabName = tabMatch?.[1] ?? "";
+      const rows = sheetValues.get(tabName) ?? [];
+      if (rangeDecoded.endsWith("!A:A")) {
+        res.writeHead(200);
+        res.end(JSON.stringify({ values: rows.map((r) => [r[0] ?? ""]) }));
+        return;
+      }
+      res.writeHead(200);
+      res.end(JSON.stringify({ values: rows }));
+      return;
+    }
+
+    if (urlPath === "/drive/files/sheet-e2e-01/permissions" && req.method === "GET") {
+      res.writeHead(200);
+      res.end(JSON.stringify({ permissions }));
+      return;
+    }
+
+    if (urlPath === "/drive/files/sheet-e2e-01/permissions" && req.method === "POST") {
+      if (blockDriveShare) {
+        res.writeHead(403);
+        res.end(
+          JSON.stringify({
+            error: { message: "Domain policy forbids sharing outside organization." },
+          })
+        );
+        return;
+      }
+      const reqBody = JSON.parse(body) as { type: string; role: string; allowFileDiscovery?: boolean };
+      permissions.push({
+        id: "anyoneWithLink",
+        type: reqBody.type,
+        role: reqBody.role,
+        allowFileDiscovery: reqBody.allowFileDiscovery,
+      });
+      res.writeHead(200);
+      res.end(JSON.stringify({ id: "anyoneWithLink", type: reqBody.type, role: reqBody.role }));
+      return;
+    }
+
+    res.writeHead(404);
+    res.end(JSON.stringify({ error: { message: `Unhandled mock route: ${req.method} ${req.url}` } }));
+  });
+
+  try {
+    const db = new AtlasDatabase(dbPath);
+    db.initializeSchema();
+    const freshIso = new Date(Date.now() - 2 * 3600_000).toISOString();
+    const staleIso = new Date(Date.now() - 72 * 3600_000).toISOString();
+
+    // Seed 3 Startups: 2 qualified + 1 Rejected (forces multi-row batch so 413 split is exercised on A1..A3)
+    db.upsertStartups([
+      {
+        startup_id: "stp_q1",
+        name: "Alpha AI",
+        description: "Valid startup 1",
+        website: "https://alpha.ai",
+        official_website: "https://alpha.ai",
+        industry: "AI",
+        location: "SF",
+        founding_date: "2025-01-01",
+        source_name: "yc_oss",
+        source_url: "https://yc.example/alpha",
+        source_title: "Alpha AI",
+        collected_at: freshIso,
+        last_checked_at: freshIso,
+        supported_fields: ["name"],
+        verification_status: "Verified",
+        rejection_reason: null,
+        canonical_entity_id: null,
+        source_metadata: {},
+      },
+      {
+        startup_id: "stp_q2",
+        name: "Beta AI",
+        description: "Valid startup 2",
+        website: "https://beta.ai",
+        official_website: "https://beta.ai",
+        industry: "AI",
+        location: "NYC",
+        founding_date: "2025-02-01",
+        source_name: "yc_oss",
+        source_url: "https://yc.example/beta",
+        source_title: "Beta AI",
+        collected_at: freshIso,
+        last_checked_at: freshIso,
+        supported_fields: ["name"],
+        verification_status: "Verified",
+        rejection_reason: null,
+        canonical_entity_id: null,
+        source_metadata: {},
+      },
+      {
+        startup_id: "stp_rej",
+        name: "Spam Startup",
+        description: "Rejected placeholder",
+        website: null,
+        official_website: null,
+        industry: "AI",
+        location: "Unknown",
+        founding_date: null,
+        source_name: "yc_oss",
+        source_url: "https://yc.example/spam",
+        source_title: "Spam",
+        collected_at: freshIso,
+        last_checked_at: freshIso,
+        supported_fields: [],
+        verification_status: "Rejected",
+        rejection_reason: "placeholder",
+        canonical_entity_id: null,
+        source_metadata: {},
+      },
+    ]);
+
+    db.upsertProducts([
+      {
+        product_id: "prd_q1",
+        name: "Alpha Studio",
+        description: "Valid product",
+        website: "https://alpha.ai/studio",
+        official_website: "https://alpha.ai/studio",
+        category: "Agents",
+        company_name: "Alpha AI",
+        source_name: "github",
+        source_url: "https://github.com/alpha/studio",
+        source_title: "Alpha Studio",
+        collected_at: freshIso,
+        last_checked_at: freshIso,
+        supported_fields: ["name"],
+        verification_status: "Verified",
+        rejection_reason: null,
+        canonical_entity_id: null,
+        source_metadata: {},
+      },
+    ]);
+
+    db.upsertResearchPapers([
+      {
+        paper_id: "pap_q1",
+        title: "Sparse Reasoning",
+        abstract: "Reasoning benchmark.",
+        authors: ["Grace Hopper"],
+        publication_date: "2026-11-22",
+        published_at: freshIso,
+        doi: null,
+        arxiv_id: "2611.12345",
+        github_repository: "https://github.com/alpha/sparse",
+        github_stars: 120,
+        official_website: null,
+        source_name: "arxiv",
+        source_url: "https://arxiv.org/abs/2611.12345",
+        source_title: "Sparse Reasoning",
+        collected_at: freshIso,
+        last_checked_at: freshIso,
+        supported_fields: ["title"],
+        verification_status: "Verified",
+        rejection_reason: null,
+        source_metadata: {},
+      },
+    ]);
+
+    db.upsertJobs([
+      {
+        job_id: "job_fresh",
+        title: "AI Engineer",
+        company: "Alpha AI",
+        location: "Remote",
+        employment_type: "Full-Time",
+        description: "Build models",
+        posted_at: freshIso,
+        application_url: "https://alpha.ai/jobs/1",
+        official_website: null,
+        source_name: "ashby:alpha",
+        source_url: "https://alpha.ai/jobs/1",
+        source_title: "AI Engineer",
+        collected_at: freshIso,
+        last_checked_at: freshIso,
+        supported_fields: ["title"],
+        verification_status: "Verified",
+        rejection_reason: null,
+        canonical_company_id: null,
+        source_metadata: {},
+      },
+      {
+        job_id: "job_stale",
+        title: "Old AI Engineer",
+        company: "Alpha AI",
+        location: "Remote",
+        employment_type: "Full-Time",
+        description: "Stale posting",
+        posted_at: staleIso,
+        application_url: "https://alpha.ai/jobs/old",
+        official_website: null,
+        source_name: "ashby:alpha",
+        source_url: "https://alpha.ai/jobs/old",
+        source_title: "Old AI Engineer",
+        collected_at: freshIso,
+        last_checked_at: freshIso,
+        supported_fields: ["title"],
+        verification_status: "Verified",
+        rejection_reason: null,
+        canonical_company_id: null,
+        source_metadata: {},
+      },
+    ]);
+
+    db.upsertNews([
+      {
+        news_id: "nws_fresh",
+        headline: "Alpha AI Launches",
+        summary: "Launch summary",
+        publisher: "Wire",
+        published_at: freshIso,
+        article_url: "https://wire.example/alpha",
+        official_website: null,
+        category: "AI",
+        source_name: "wire",
+        source_url: "https://wire.example/rss",
+        source_title: "Alpha AI Launches",
+        collected_at: freshIso,
+        last_checked_at: freshIso,
+        supported_fields: ["headline"],
+        verification_status: "Verified",
+        rejection_reason: null,
+        source_metadata: {},
+      },
+      {
+        news_id: "nws_stale",
+        headline: "Old AI News",
+        summary: "Stale summary",
+        publisher: "Wire",
+        published_at: staleIso,
+        article_url: "https://wire.example/old",
+        official_website: null,
+        category: "AI",
+        source_name: "wire",
+        source_url: "https://wire.example/rss",
+        source_title: "Old AI News",
+        collected_at: freshIso,
+        last_checked_at: freshIso,
+        supported_fields: ["headline"],
+        verification_status: "Verified",
+        rejection_reason: null,
+        source_metadata: {},
+      },
+    ]);
+
+    db.upsertEntityMappingLogs([
+      {
+        mapping_id: "map_q1",
+        raw_name: "Alpha AI",
+        normalized_name: "alpha ai",
+        canonical_name: "Alpha AI",
+        canonical_id: "ent_alpha",
+        source_url: "https://yc.example/alpha",
+        match_method: "exact_alias",
+        confidence: 1.0,
+        decision: "new_entity",
+        timestamp: freshIso,
+        entity_type: "startup",
+        match_reason: "Exact match",
+      },
+    ]);
+
+    const sheets = new GoogleSheetsService(
+      {
+        atlasDir: tmpDir,
+        rootDir: tmpDir,
+        credentialsPath: null,
+        credentialsJson: JSON.stringify({
+          client_email: "atlas-e2e@example.iam.gserviceaccount.com",
+          private_key: pem,
+        }),
+        spreadsheetId: null,
+        spreadsheetName: "FrontierAtlas E2E",
+        freshnessWindowHours: 24,
+        apiBaseUrl: `${mockServer.baseUrl}/v4`,
+        driveApiBaseUrl: `${mockServer.baseUrl}/drive`,
+        oauthTokenUrl: `${mockServer.baseUrl}/oauth/token`,
+      },
+      db
+    );
+
+    // 1. Export in qualified_24h mode -> verifies 429 retry + 413 single-range split + 24h & Rejected filtering + Drive Viewer permission
+    const res = await sheets.exportOrSync("full", { exportScope: "qualified_24h" });
+    assert.equal(res.success, true, res.error ?? undefined);
+    assert.equal(res.verifiedTabRowCounts.Startups, 2);
+    assert.equal(res.verifiedTabRowCounts.Products, 1);
+    assert.equal(res.verifiedTabRowCounts["Research Papers"], 1);
+    assert.equal(res.verifiedTabRowCounts.Jobs, 1);
+    assert.equal(res.verifiedTabRowCounts.News, 1);
+    assert.equal(res.verifiedTabRowCounts["Entity Mapping Log"], 1);
+    assert.equal(res.skippedBreakdown.rejected, 1);
+    assert.equal(res.skippedBreakdown.stale24h, 2);
+    assert.equal(res.rowsSkipped, 3);
+    assert.equal(res.publicAccessStatus, "public_viewer");
+    assert.equal(res.publicViewerVerified, true);
+    assert.equal(res.steps.length, 7);
+    assert.equal(simulated413Pending, false, "Should have recovered from 413 via single-range splitting");
+    assert.equal(simulated429Pending, false, "Should have recovered from 429 via Retry-After backoff");
+
+    // 2. Policy-blocked Drive sharing still preserves written data and reports policy_blocked honestly
+    permissions.length = 0;
+    blockDriveShare = true;
+    const policyRes = await sheets.exportOrSync("incremental", { exportScope: "qualified_24h" });
+    assert.equal(policyRes.success, true, policyRes.error ?? undefined);
+    assert.equal(policyRes.publicAccessStatus, "policy_blocked");
+    assert.equal(policyRes.publicViewerVerified, false);
+    assert.ok(policyRes.publicAccessError?.includes("blocked"));
+
+    db.close();
+  } finally {
+    await mockServer.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("AtlasBackendService automatically attaches 6-CSV ZIP fallback when Google Sheets export fails", async () => {
+  const tmpAtlasDir = fs.mkdtempSync(path.join(os.tmpdir(), "atlas-fallback-test-"));
+  const dataDir = path.join(tmpAtlasDir, "data");
+  fs.mkdirSync(dataDir, { recursive: true });
+  const prevDbUrl = process.env.DATABASE_URL;
+  const prevCredJson = process.env.GOOGLE_SHEETS_CREDENTIALS_JSON;
+  const prevCredPath = process.env.GOOGLE_SHEETS_CREDENTIALS_PATH;
+  const prevGac = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+  delete process.env.DATABASE_URL;
+  delete process.env.GOOGLE_SHEETS_CREDENTIALS_JSON;
+  delete process.env.GOOGLE_SHEETS_CREDENTIALS_PATH;
+  delete process.env.GOOGLE_APPLICATION_CREDENTIALS;
+
+  try {
+    const svc = new AtlasBackendService(tmpAtlasDir);
+    const db = (svc as unknown as { db: AtlasDatabase }).db;
+    const freshIso = new Date().toISOString();
+
+    db.upsertStartups([
+      {
+        startup_id: "stp_fb_1",
+        name: "Fallback AI",
+        description: "Preserved startup",
+        website: "https://fallback.ai",
+        official_website: "https://fallback.ai",
+        industry: "AI",
+        location: "SF",
+        founding_date: "2025-01-01",
+        source_name: "yc_oss",
+        source_url: "https://yc.example/fallback",
+        source_title: "Fallback AI",
+        collected_at: freshIso,
+        last_checked_at: freshIso,
+        supported_fields: ["name"],
+        verification_status: "Verified",
+        rejection_reason: null,
+        canonical_entity_id: null,
+        source_metadata: {},
+      },
+    ]);
+
+    const res = await svc.exportGoogleSheets({ exportScope: "qualified_24h" });
+    assert.equal(res.success, false);
+    assert.equal(res.status, "Not Connected");
+    assert.equal(res.authRequired, true);
+    assert.ok(res.fallbackExport?.ready, "Should automatically build 6-CSV + ZIP fallback");
+    assert.equal(res.fallbackExport?.datasets.length, 6);
+    assert.equal(res.fallbackExport?.rowCounts.Startups, 1);
+
+    svc.close();
+  } finally {
+    if (prevDbUrl !== undefined) process.env.DATABASE_URL = prevDbUrl;
+    if (prevCredJson !== undefined) process.env.GOOGLE_SHEETS_CREDENTIALS_JSON = prevCredJson;
+    if (prevCredPath !== undefined) process.env.GOOGLE_SHEETS_CREDENTIALS_PATH = prevCredPath;
+    if (prevGac !== undefined) process.env.GOOGLE_APPLICATION_CREDENTIALS = prevGac;
+    fs.rmSync(tmpAtlasDir, { recursive: true, force: true });
+  }
+});
+
+test("createZipArchive handles UTF-8 Unicode, quotes, newlines, empty CSVs, and >5,000-row datasets cleanly", async () => {
+  const largeLines = ["id,name,notes"];
+  for (let i = 0; i < 5200; i++) {
+    largeLines.push(`${i},"Company ""#${i}"" — café 日本語","line1\nline2, €${i}"`);
+  }
+  const zipBuf = await createZipArchive([
+    { filename: "empty.csv", content: "id,name\n" },
+    { filename: "large_unicode.csv", content: `${largeLines.join("\n")}\n` },
+  ]);
+  const extracted = await readZipEntriesForTest(zipBuf);
+  assert.equal(extracted.get("empty.csv"), "id,name\n");
+  const largeContent = extracted.get("large_unicode.csv") ?? "";
+  assert.ok(largeContent.includes('Company ""#5199"" — café 日本語'));
+  assert.ok(largeContent.includes("line1\nline2, €5199"));
+});
+
+test("LLMRouter adaptively splits oversized chunks on 504 Deadline expired without failing partial extraction", async () => {
+  const seenLengths: number[] = [];
+  const timeoutThenOkProvider: LLMProvider = {
+    providerName: "gemini",
+    isConfigured: () => true,
+    async generateJson(prompt: string) {
+      seenLengths.push(prompt.length);
+      if (prompt.length > 3200) {
+        throw new TransientProviderError("Gemini deadline exceeded (504 Deadline expired)");
+      }
+      const records: Array<Record<string, unknown>> = [];
+      if (prompt.includes("AlphaItem")) {
+        records.push({ title: "AlphaItem", evidence_quote: "AlphaItem adaptive split record" });
+      }
+      if (prompt.includes("BetaItem")) {
+        records.push({ title: "BetaItem", evidence_quote: "BetaItem adaptive split record" });
+      }
+      return { records };
+    },
+  };
+
+  const router = new LLMRouter([timeoutThenOkProvider], { maxInputTokens: 1200, overlapTokens: 40 });
+  const bigInput = [
+    `AlphaItem adaptive split record ${"a".repeat(2000)}`,
+    `BetaItem adaptive split record ${"b".repeat(2000)}`,
+  ].join("\n\n");
+
+  const result = await router.extractStructured({
+    category: "research_papers",
+    sourceUrl: "https://arxiv.org/list/cs.AI/recent",
+    sourceName: "arxiv",
+    sourceText: bigInput,
+  });
+
+  assert.ok(seenLengths.some((len) => len > 3200), "Should initially attempt large chunk");
+  assert.ok(seenLengths.some((len) => len <= 3200), "Should split chunk after 504 timeout");
+  assert.ok(result.subChunksSplit >= 1, "Should record adaptive chunk split");
+  assert.ok(
+    result.records.some((r) => r.title === "AlphaItem") &&
+      result.records.some((r) => r.title === "BetaItem"),
+    "Both halves should succeed after adaptive chunk splitting"
+  );
+});
+
+test("GitHub enrichment works without GITHUB_TOKEN, caches verified metrics, and halts on X-RateLimit-Remaining: 0", async () => {
+  clearGithubEnrichmentCacheForTest();
+  let apiCalls = 0;
+  let forceExhausted = false;
+
+  const mockGh = await withHttpServer((req, res) => {
+    apiCalls += 1;
+    res.setHeader("Content-Type", "application/json");
+    if (forceExhausted) {
+      res.setHeader("X-RateLimit-Limit", "60");
+      res.setHeader("X-RateLimit-Remaining", "0");
+      res.setHeader("X-RateLimit-Reset", String(Math.floor(Date.now() / 1000) + 1800));
+      res.writeHead(403);
+      res.end(JSON.stringify({ message: "API rate limit exceeded" }));
+      return;
+    }
+    res.setHeader("X-RateLimit-Limit", "60");
+    res.setHeader("X-RateLimit-Remaining", "58");
+    res.writeHead(200);
+    res.end(
+      JSON.stringify({
+        stargazers_count: 421,
+        forks_count: 37,
+        open_issues_count: 4,
+        language: "TypeScript",
+        pushed_at: "2026-11-22T01:00:00Z",
+        archived: false,
+      })
+    );
+  });
+
+  try {
+    const httpClient = new PoliteHttpClient({
+      userAgent: "FrontierAtlasTest/1.0",
+      timeoutMs: 5000,
+      rateLimitPerSecond: 100,
+      respectRobotsTxt: false,
+      defaultMaxAttempts: 1,
+    });
+
+    const map1 = new Map<string, Array<Record<string, unknown>>>([
+      ["org/repo-one", [{ paper_id: "p1", github_stars: null, source_metadata: {} }]],
+    ]);
+    const res1 = await enrichGithubRepoMap(map1, {
+      http: httpClient,
+      githubToken: null,
+      maxSlugs: 5,
+      nowIso: new Date().toISOString(),
+      apiBaseUrl: mockGh.baseUrl,
+    });
+    assert.equal(res1.apiFetched, 1);
+    assert.equal(res1.cacheHits, 0);
+    assert.equal(map1.get("org/repo-one")![0].github_stars, 421);
+
+    // Repeat call for same repo hits TTL cache -> 0 new API calls
+    const map2 = new Map<string, Array<Record<string, unknown>>>([
+      ["org/repo-one", [{ paper_id: "p2", github_stars: null, source_metadata: {} }]],
+    ]);
+    const res2 = await enrichGithubRepoMap(map2, {
+      http: httpClient,
+      githubToken: null,
+      maxSlugs: 5,
+      nowIso: new Date().toISOString(),
+      apiBaseUrl: mockGh.baseUrl,
+    });
+    assert.equal(res2.apiFetched, 0);
+    assert.equal(res2.cacheHits, 1);
+    assert.equal(apiCalls, 1);
+    assert.equal(map2.get("org/repo-one")![0].github_stars, 421);
+
+    // Exhausted rate limit header stops subsequent slugs without fabricating star counts
+    forceExhausted = true;
+    const map3 = new Map<string, Array<Record<string, unknown>>>([
+      ["org/repo-two", [{ paper_id: "p3", github_stars: null, source_metadata: {} }]],
+      ["org/repo-three", [{ paper_id: "p4", github_stars: null, source_metadata: {} }]],
+    ]);
+    const res3 = await enrichGithubRepoMap(map3, {
+      http: httpClient,
+      githubToken: null,
+      maxSlugs: 5,
+      nowIso: new Date().toISOString(),
+      apiBaseUrl: mockGh.baseUrl,
+    });
+    assert.equal(res3.rateLimited, true);
+    assert.equal(isGithubRateLimitedNow(), true);
+    assert.equal(map3.get("org/repo-two")![0].github_stars, null);
+
+    // Verify helper handles remaining === 0 on 200 status too
+    clearGithubEnrichmentCacheForTest();
+    const rl = updateGithubRateLimitFromHeaders(200, { "x-ratelimit-remaining": "0" });
+    assert.equal(rl.exhausted, true);
+    assert.equal(isGithubRateLimitedNow(), true);
+  } finally {
+    clearGithubEnrichmentCacheForTest();
+    await mockGh.close();
+  }
+});
+
+test("GoogleSheetsService incremental mode preserves existing historical rows and retains saved spreadsheetUrl on transient sync failure", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "atlas-sheets-preserve-"));
+  const dbPath = path.join(tmpDir, "preserve.db");
+  const { privateKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const pem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+
+  const sheetValues = new Map<string, string[][]>();
+  // Pre-seed Startups tab with header + 1 legacy historical row no longer in local DB
+  sheetValues.set("Startups", [
+    EXPORT_SPECS[0].columns,
+    EXPORT_SPECS[0].columns.map((c) => (c === "startup_id" ? "legacy_stp_01" : "Legacy Value")),
+  ]);
+  for (const spec of EXPORT_SPECS.slice(1)) {
+    sheetValues.set(spec.tabName, [spec.columns]);
+  }
+  const sheetProps = EXPORT_SPECS.map((s, idx) => ({
+    properties: {
+      sheetId: idx + 1,
+      title: s.tabName,
+      gridProperties: { rowCount: 200, columnCount: s.columns.length },
+    },
+  }));
+
+  let failReads = false;
+  const mockServer = await withHttpServer((req, res, body) => {
+    res.setHeader("Content-Type", "application/json");
+    const urlPath = (req.url ?? "").split("?")[0];
+
+    if (urlPath === "/oauth/token") {
+      res.writeHead(200);
+      res.end(JSON.stringify({ access_token: "mock-preserve-token", expires_in: 3600 }));
+      return;
+    }
+    if (urlPath === "/v4/spreadsheets/perm-sheet-01" && req.method === "GET") {
+      res.writeHead(200);
+      res.end(
+        JSON.stringify({
+          spreadsheetId: "perm-sheet-01",
+          spreadsheetUrl: "https://docs.google.com/spreadsheets/d/perm-sheet-01",
+          sheets: sheetProps,
+        })
+      );
+      return;
+    }
+    if (urlPath === "/v4/spreadsheets/perm-sheet-01:batchUpdate") {
+      res.writeHead(200);
+      res.end(JSON.stringify({ replies: [] }));
+      return;
+    }
+    if (urlPath === "/v4/spreadsheets/perm-sheet-01/values:batchUpdate") {
+      const payload = JSON.parse(body) as { data?: Array<{ range: string; values: unknown[][] }> };
+      for (const entry of payload.data ?? []) {
+        const tabMatch = entry.range.match(/^'([^']+)'!A(\d+)/);
+        if (!tabMatch) continue;
+        const tabName = tabMatch[1];
+        const startRow = Number(tabMatch[2]);
+        const existing = sheetValues.get(tabName) ?? [];
+        for (let i = 0; i < entry.values.length; i++) {
+          existing[startRow - 1 + i] = entry.values[i].map((v) => String(v ?? ""));
+        }
+        sheetValues.set(tabName, existing);
+      }
+      res.writeHead(200);
+      res.end(JSON.stringify({ responses: [] }));
+      return;
+    }
+    const readMatch = urlPath.match(/^\/v4\/spreadsheets\/perm-sheet-01\/values\/([^/]+)$/);
+    if (readMatch && req.method === "GET") {
+      if (failReads) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: { message: "Simulated read rejection" } }));
+        return;
+      }
+      const rangeDecoded = decodeURIComponent(readMatch[1]);
+      const tabMatch = rangeDecoded.match(/^'([^']+)'!/);
+      const tabName = tabMatch?.[1] ?? "";
+      const rows = sheetValues.get(tabName) ?? [];
+      res.writeHead(200);
+      res.end(
+        JSON.stringify({
+          values: rangeDecoded.endsWith("!A:A") ? rows.map((r) => [r[0] ?? ""]) : rows,
+        })
+      );
+      return;
+    }
+    if (urlPath === "/drive/files/perm-sheet-01/permissions") {
+      res.writeHead(200);
+      res.end(
+        JSON.stringify({
+          permissions: [{ id: "anyoneWithLink", type: "anyone", role: "reader" }],
+        })
+      );
+      return;
+    }
+    res.writeHead(404);
+    res.end(JSON.stringify({ error: { message: "unhandled" } }));
+  });
+
+  try {
+    const db = new AtlasDatabase(dbPath);
+    db.initializeSchema();
+    const nowIso = new Date().toISOString();
+    db.upsertStartups([
+      {
+        startup_id: "new_stp_02",
+        name: "New Startup",
+        description: "Merged startup",
+        website: "https://newstartup.ai",
+        official_website: "https://newstartup.ai",
+        industry: "AI",
+        location: "SF",
+        founding_date: "2026-01-01",
+        source_name: "yc_oss",
+        source_url: "https://yc.example/new",
+        source_title: "New Startup",
+        collected_at: nowIso,
+        last_checked_at: nowIso,
+        supported_fields: ["name"],
+        verification_status: "Verified",
+        rejection_reason: null,
+        canonical_entity_id: null,
+        source_metadata: {},
+      },
+    ]);
+
+    const sheets = new GoogleSheetsService(
+      {
+        atlasDir: tmpDir,
+        rootDir: tmpDir,
+        credentialsPath: null,
+        credentialsJson: JSON.stringify({
+          client_email: "atlas-preserve@example.iam.gserviceaccount.com",
+          private_key: pem,
+        }),
+        spreadsheetId: "perm-sheet-01",
+        spreadsheetName: "FrontierAtlas Preserve",
+        freshnessWindowHours: 24,
+        apiBaseUrl: `${mockServer.baseUrl}/v4`,
+        driveApiBaseUrl: `${mockServer.baseUrl}/drive`,
+        oauthTokenUrl: `${mockServer.baseUrl}/oauth/token`,
+      },
+      db
+    );
+
+    const incRes = await sheets.exportOrSync("incremental");
+    assert.equal(incRes.success, true, incRes.error ?? undefined);
+    // Startups tab should now contain BOTH legacy_stp_01 AND new_stp_02 (verifiedRows = 2 >= expected 1)
+    assert.equal(incRes.verifiedTabRowCounts.Startups, 2);
+    assert.equal(sheetValues.get("Startups")?.length, 3); // header + 2 data rows
+    assert.equal(sheetValues.get("Startups")?.[1]?.[0], "legacy_stp_01");
+
+    // Transient sync failure retains previously confirmed spreadsheetId & spreadsheetUrl
+    failReads = true;
+    const failedRes = await sheets.exportOrSync("incremental");
+    assert.equal(failedRes.success, false);
+    assert.equal(failedRes.spreadsheetId, "perm-sheet-01");
+    assert.equal(failedRes.spreadsheetUrl, "https://docs.google.com/spreadsheets/d/perm-sheet-01");
+    assert.equal(sheets.getStatus().spreadsheetUrl, "https://docs.google.com/spreadsheets/d/perm-sheet-01");
+
+    db.close();
+  } finally {
+    await mockServer.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("validateZipArchive rejects truncated buffers and GoogleSheetsService verifies public Viewer via separate unauthenticated HTTP GET", async () => {
+  await assert.rejects(
+    () => validateZipArchive(Buffer.from("not a zip archive")),
+    /validation failed/i
+  );
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "atlas-anon-read-test-"));
+  const dbPath = path.join(tmpDir, "anon.db");
+  const { privateKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const pem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+
+  let simulateLoginRedirect = true;
+  const sheetProps = EXPORT_SPECS.map((s, idx) => ({
+    properties: {
+      sheetId: idx + 1,
+      title: s.tabName,
+      gridProperties: { rowCount: 100, columnCount: s.columns.length },
+    },
+  }));
+  const sheetValues = new Map<string, string[][]>();
+  for (const spec of EXPORT_SPECS) {
+    sheetValues.set(spec.tabName, [spec.columns]);
+  }
+
+  const mockServer = await withHttpServer((req, res, body) => {
+    const urlPath = (req.url ?? "").split("?")[0];
+    if (urlPath.startsWith("/public/")) {
+      // Must NOT carry Authorization header
+      assert.equal(req.headers.authorization, undefined, "Public check request must be unauthenticated");
+      if (simulateLoginRedirect) {
+        res.writeHead(302, { Location: "https://accounts.google.com/ServiceLogin?continue=..." });
+        res.end("");
+        return;
+      }
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.writeHead(200);
+      res.end("startup_id\nstp_anon_1\n");
+      return;
+    }
+    res.setHeader("Content-Type", "application/json");
+    if (urlPath === "/oauth/token") {
+      res.writeHead(200);
+      res.end(JSON.stringify({ access_token: "mock-anon-token", expires_in: 3600 }));
+      return;
+    }
+    if (urlPath === "/v4/spreadsheets/anon-sheet-01" && req.method === "GET") {
+      res.writeHead(200);
+      res.end(
+        JSON.stringify({
+          spreadsheetId: "anon-sheet-01",
+          spreadsheetUrl: "https://docs.google.com/spreadsheets/d/anon-sheet-01",
+          sheets: sheetProps,
+        })
+      );
+      return;
+    }
+    if (urlPath === "/v4/spreadsheets/anon-sheet-01:batchUpdate") {
+      res.writeHead(200);
+      res.end(JSON.stringify({ replies: [] }));
+      return;
+    }
+    if (urlPath === "/v4/spreadsheets/anon-sheet-01/values:batchClear") {
+      sheetValues.clear();
+      res.writeHead(200);
+      res.end(JSON.stringify({ clearedRanges: [] }));
+      return;
+    }
+    if (urlPath === "/v4/spreadsheets/anon-sheet-01/values:batchUpdate") {
+      const payload = JSON.parse(body) as { data?: Array<{ range: string; values: unknown[][] }> };
+      for (const entry of payload.data ?? []) {
+        const tabMatch = entry.range.match(/^'([^']+)'!A(\d+)/);
+        if (!tabMatch) continue;
+        const tabName = tabMatch[1];
+        const startRow = Number(tabMatch[2]);
+        const existing = sheetValues.get(tabName) ?? [];
+        for (let i = 0; i < entry.values.length; i++) {
+          existing[startRow - 1 + i] = entry.values[i].map((v) => String(v ?? ""));
+        }
+        sheetValues.set(tabName, existing);
+      }
+      res.writeHead(200);
+      res.end(JSON.stringify({ responses: [] }));
+      return;
+    }
+    const readMatch = urlPath.match(/^\/v4\/spreadsheets\/anon-sheet-01\/values\/([^/]+)$/);
+    if (readMatch && req.method === "GET") {
+      const rangeDecoded = decodeURIComponent(readMatch[1]);
+      const tabMatch = rangeDecoded.match(/^'([^']+)'!/);
+      const tabName = tabMatch?.[1] ?? "";
+      const rows = sheetValues.get(tabName) ?? [];
+      res.writeHead(200);
+      res.end(JSON.stringify({ values: rangeDecoded.endsWith("!A:A") ? rows.map((r) => [r[0] ?? ""]) : rows }));
+      return;
+    }
+    if (urlPath === "/drive/files/anon-sheet-01/permissions") {
+      res.writeHead(200);
+      res.end(JSON.stringify({ permissions: [{ id: "anyoneWithLink", type: "anyone", role: "reader" }] }));
+      return;
+    }
+    res.writeHead(404);
+    res.end("{}");
+  });
+
+  try {
+    const db = new AtlasDatabase(dbPath);
+    db.initializeSchema();
+    const sheets = new GoogleSheetsService(
+      {
+        atlasDir: tmpDir,
+        rootDir: tmpDir,
+        credentialsPath: null,
+        credentialsJson: JSON.stringify({
+          client_email: "atlas-anon@example.iam.gserviceaccount.com",
+          private_key: pem,
+        }),
+        spreadsheetId: "anon-sheet-01",
+        spreadsheetName: "FrontierAtlas AnonCheck",
+        apiBaseUrl: `${mockServer.baseUrl}/v4`,
+        driveApiBaseUrl: `${mockServer.baseUrl}/drive`,
+        publicCheckBaseUrl: `${mockServer.baseUrl}/public`,
+        oauthTokenUrl: `${mockServer.baseUrl}/oauth/token`,
+      },
+      db
+    );
+
+    // 1. Login redirect during unauthenticated check -> must NOT falsely claim publicViewerVerified
+    const blockedRes = await sheets.exportOrSync("full");
+    assert.equal(blockedRes.success, true);
+    assert.equal(blockedRes.publicViewerVerified, false);
+    assert.equal(blockedRes.publicAccessStatus, "policy_blocked");
+    assert.ok(blockedRes.publicAccessError?.includes("redirected to Google Sign-In"));
+
+    // 2. Unauthenticated HTTP 200 CSV -> confirms publicViewerVerified
+    simulateLoginRedirect = false;
+    const publicRes = await sheets.exportOrSync("full");
+    assert.equal(publicRes.success, true);
+    assert.equal(publicRes.publicViewerVerified, true);
+    assert.equal(publicRes.publicAccessStatus, "public_viewer");
+
+    db.close();
+  } finally {
+    await mockServer.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 
 

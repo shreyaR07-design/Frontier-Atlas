@@ -177,6 +177,58 @@ export interface AuditTrailEntry {
   checked_at: string;
 }
 
+export type ExportScope = "qualified_24h" | "all";
+export type PublicAccessStatus = "public_viewer" | "policy_blocked" | "not_configured" | "unknown";
+
+export interface ExportStepStatus {
+  step: number;
+  key:
+    | "auth"
+    | "connection"
+    | "spreadsheet"
+    | "write_tabs"
+    | "verify_tabs"
+    | "public_access"
+    | "share_url";
+  label: string;
+  status: "completed" | "failed" | "blocked" | "skipped";
+  detail: string;
+}
+
+export interface SheetsFallbackExportSummary {
+  ready: boolean;
+  reason: string;
+  zipFilename: string;
+  zipUrl: string;
+  zipByteSize: number;
+  rowCounts: Record<string, number>;
+  totalRows: number;
+  datasets: Array<{
+    tabName: string;
+    filename: string;
+    rowCount: number;
+    downloadUrl: string;
+  }>;
+}
+
+export interface SheetsFeedbackState {
+  success: boolean;
+  message: string;
+  url?: string | null;
+  needsReauth?: boolean;
+  publicAccessStatus?: PublicAccessStatus;
+  publicViewerVerified?: boolean;
+  publicAccessError?: string | null;
+  steps?: ExportStepStatus[];
+  fallbackExport?: SheetsFallbackExportSummary | null;
+  countsSummary?: {
+    inserted: number;
+    updated: number;
+    skipped: number;
+    failed: number;
+  };
+}
+
 export interface TabExportStatus {
   tabName: string;
   status: "success" | "failed";
@@ -205,6 +257,11 @@ export interface SheetsStatusPayload {
   rowsAdded: number;
   rowsUpdated: number;
   rowsUnchanged: number;
+  rowsSkipped?: number;
+  rowsFailed?: number;
+  publicAccessStatus?: PublicAccessStatus;
+  publicViewerVerified?: boolean;
+  publicAccessError?: string | null;
   lastError: string | null;
 }
 

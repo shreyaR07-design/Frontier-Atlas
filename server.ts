@@ -293,33 +293,54 @@ async function startServer(): Promise<void> {
         ? authHeader.slice(7).trim() || null
         : null;
     const rawSheetId = typeof req.body?.spreadsheetId === "string" ? req.body.spreadsheetId.trim() : "";
+    const exportScope: "qualified_24h" | "all" =
+      req.body?.exportScope === "qualified_24h" ? "qualified_24h" : "all";
     return {
       oauthAccessToken,
       spreadsheetId: rawSheetId || null,
       createNew: req.body?.createNew === true,
+      exportScope,
     };
   };
 
   app.post("/api/atlas/export/sheets", async (req, res) => {
+    const opts = extractSheetsOpts(req);
     try {
-      const result = await atlas.exportGoogleSheets(extractSheetsOpts(req));
+      const result = await atlas.exportGoogleSheets(opts);
       res.status(result.authRequired ? 401 : 200).json(result);
     } catch (err) {
+      const safeErr = redactSecrets(err instanceof Error ? err.message : String(err));
+      let fallbackExport: Awaited<ReturnType<AtlasBackendService["buildFallbackExportSummary"]>> | null = null;
+      try {
+        fallbackExport = await atlas.buildFallbackExportSummary(safeErr, opts.exportScope);
+      } catch {
+        fallbackExport = null;
+      }
       res.status(500).json({
         success: false,
-        error: redactSecrets(err instanceof Error ? err.message : String(err)),
+        error: safeErr,
+        fallbackExport,
       });
     }
   });
 
   app.post("/api/atlas/sync/sheets", async (req, res) => {
+    const opts = extractSheetsOpts(req);
     try {
-      const result = await atlas.syncGoogleSheets(extractSheetsOpts(req));
+      const result = await atlas.syncGoogleSheets(opts);
       res.status(result.authRequired ? 401 : 200).json(result);
     } catch (err) {
+      const safeErr = redactSecrets(err instanceof Error ? err.message : String(err));
+      let fallbackExport: Awaited<ReturnType<AtlasBackendService["buildFallbackExportSummary"]>> | null = null;
+      try {
+        fallbackExport = await atlas.buildFallbackExportSummary(safeErr, opts.exportScope);
+      } catch {
+        fallbackExport = null;
+      }
       res.status(500).json({
         success: false,
-        error: redactSecrets(err instanceof Error ? err.message : String(err)),
+        error: safeErr,
+        fallbackExport,
       });
     }
   });
@@ -337,22 +358,30 @@ async function startServer(): Promise<void> {
     }
   });
 
-  app.post("/api/atlas/export/csv", (_req, res) => {
+  app.post("/api/atlas/export/csv", (req, res) => {
+    const scope: "qualified_24h" | "all" =
+      req.body?.scope === "qualified" || req.body?.scope === "qualified_24h"
+        ? "qualified_24h"
+        : "all";
     try {
-      res.json(atlas.exportAllCsv());
+      res.json(atlas.exportAllCsv(scope));
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : "CSV export failed." });
     }
   });
 
-  app.get("/api/atlas/download/csv-bundle.zip", (_req, res) => {
+  app.get("/api/atlas/download/csv-bundle.zip", async (req, res) => {
+    const rawScope = String(req.query.scope ?? "all").trim().toLowerCase();
+    const scope: "qualified_24h" | "all" =
+      rawScope === "qualified" || rawScope === "qualified_24h" ? "qualified_24h" : "all";
     try {
-      const bundle = atlas.buildCsvZipBundle();
+      const bundle = await atlas.buildCsvZipBundle(scope);
       res.setHeader("Content-Type", "application/zip");
       res.setHeader("Content-Disposition", `attachment; filename="${bundle.filename}"`);
       res.setHeader("Content-Length", String(bundle.buffer.length));
+      res.setHeader("X-Content-Type-Options", "nosniff");
       res.setHeader("Cache-Control", "no-store");
-      res.status(200).send(bundle.buffer);
+      res.status(200).end(bundle.buffer);
     } catch (err) {
       res.status(500).json({
         error: err instanceof Error ? err.message : "ZIP bundle export failed.",
@@ -373,8 +402,11 @@ async function startServer(): Promise<void> {
       res.status(400).json({ error: "Invalid CSV export path." });
       return;
     }
+    const rawScope = String(req.query.scope ?? "all").trim().toLowerCase();
+    const scope: "qualified_24h" | "all" =
+      rawScope === "qualified" || rawScope === "qualified_24h" ? "qualified_24h" : "all";
     try {
-      const exported = atlas.exportSingleCsv(safeName);
+      const exported = atlas.exportSingleCsv(safeName, scope);
       res.setHeader("Content-Type", "text/csv; charset=utf-8");
       res.setHeader("Content-Disposition", `attachment; filename="${safeName}"`);
       res.setHeader("Cache-Control", "no-store");

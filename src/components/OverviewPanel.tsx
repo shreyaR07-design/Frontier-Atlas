@@ -4,26 +4,35 @@ import {
   Archive,
   ArrowRight,
   CalendarClock,
+  Check,
   CheckCircle2,
   Clock,
+  Copy,
   Database,
   Download,
   ExternalLink,
   FileSpreadsheet,
+  Globe,
+  Lock,
   Play,
   RefreshCw,
   ShieldCheck,
   XCircle,
 } from "lucide-react";
-import { isGoogleOAuthBlockedMessage } from "../lib/googleWorkspaceAuth";
+import {
+  getOAuthSetupDiagnostics,
+  isGoogleOAuthBlockedMessage,
+} from "../lib/googleWorkspaceAuth";
 import type {
   AtlasStatusResponse,
   DatasetCategory,
+  ExportScope,
   FailureLogRow,
   IntegrationConnectionStatus,
   IntegrationHealthItem,
   RunJobState,
   SectionId,
+  SheetsFeedbackState,
 } from "../types/atlas";
 
 interface OverviewPanelProps {
@@ -37,14 +46,11 @@ interface OverviewPanelProps {
   schedulerUpdating: boolean;
   sheetsExporting: boolean;
   sheetsSyncing: boolean;
+  sheetsExportScope: ExportScope;
+  onSheetsExportScopeChange: (scope: ExportScope) => void;
   testingIntegrations: boolean;
   testingGoogleConnection: boolean;
-  sheetsFeedback: {
-    success: boolean;
-    message: string;
-    url?: string | null;
-    needsReauth?: boolean;
-  } | null;
+  sheetsFeedback: SheetsFeedbackState | null;
   googleUserEmail: string | null;
   googleHasToken: boolean;
   googleSigningIn: boolean;
@@ -169,6 +175,8 @@ export function OverviewPanel({
   schedulerUpdating,
   sheetsExporting,
   sheetsSyncing,
+  sheetsExportScope,
+  onSheetsExportScopeChange,
   testingIntegrations,
   testingGoogleConnection,
   sheetsFeedback,
@@ -200,6 +208,17 @@ export function OverviewPanel({
   const [scheduleEnabledInput, setScheduleEnabledInput] = useState(
     status?.scheduler?.enabled ?? true
   );
+  const [copiedUrl, setCopiedUrl] = useState(false);
+
+  const handleCopySpreadsheetUrl = async (urlToCopy: string) => {
+    try {
+      await navigator.clipboard.writeText(urlToCopy);
+      setCopiedUrl(true);
+      window.setTimeout(() => setCopiedUrl(false), 2000);
+    } catch {
+      // Clipboard API unavailable in restricted contexts
+    }
+  };
 
   useEffect(() => {
     if (status?.scheduler) {
@@ -524,47 +543,92 @@ export function OverviewPanel({
 
         {sheetsFeedback && (
           <div
-            className={`mt-4 rounded-lg border p-3 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2 ${
+            className={`mt-4 rounded-lg border p-3.5 text-xs space-y-2.5 ${
               sheetsFeedback.success
                 ? "bg-emerald-950/30 border-emerald-800/60 text-emerald-300"
                 : "bg-rose-950/30 border-rose-800/60 text-rose-200"
             }`}
           >
-            <span>{sheetsFeedback.message}</span>
-            <div className="flex items-center gap-2.5 shrink-0">
-              {!sheetsFeedback.success &&
-                Boolean(targetSpreadsheetId.trim()) &&
-                /403|404|not found|Target Spreadsheet/i.test(sheetsFeedback.message) && (
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <span className="leading-relaxed">{sheetsFeedback.message}</span>
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                {!sheetsFeedback.success && (
                   <button
                     type="button"
-                    onClick={onClearTargetSpreadsheetId}
-                    className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium transition-colors"
+                    onClick={onExportSheets}
+                    disabled={sheetsExporting || sheetsSyncing}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-60 text-slate-100 font-medium transition-colors"
                   >
-                    Clear Target ID (Create New)
+                    <RefreshCw className={`w-3 h-3 ${sheetsExporting ? "animate-spin" : ""}`} />
+                    <span>Retry Export</span>
                   </button>
                 )}
-              {sheetsFeedback.needsReauth && (
-                <button
-                  type="button"
-                  onClick={onGoogleSignIn}
-                  disabled={googleSigningIn}
-                  className="px-2.5 py-1 rounded bg-white hover:bg-slate-100 disabled:opacity-60 text-slate-900 font-medium transition-colors"
-                >
-                  {googleSigningIn ? "Signing in..." : "Sign in with Google"}
-                </button>
-              )}
-              {sheetsFeedback.success && sheetsFeedback.url && (
-                <a
-                  href={sheetsFeedback.url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-flex items-center gap-1 font-medium underline shrink-0"
-                >
-                  <span>Open Spreadsheet</span>
-                  <ExternalLink className="w-3.5 h-3.5" />
-                </a>
-              )}
+                {!sheetsFeedback.success &&
+                  Boolean(targetSpreadsheetId.trim()) &&
+                  /403|404|not found|Target Spreadsheet/i.test(sheetsFeedback.message) && (
+                    <button
+                      type="button"
+                      onClick={onClearTargetSpreadsheetId}
+                      className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium transition-colors"
+                    >
+                      Clear Target ID (Create New)
+                    </button>
+                  )}
+                {sheetsFeedback.needsReauth && (
+                  <button
+                    type="button"
+                    onClick={onGoogleSignIn}
+                    disabled={googleSigningIn}
+                    className="px-2.5 py-1 rounded bg-white hover:bg-slate-100 disabled:opacity-60 text-slate-900 font-medium transition-colors"
+                  >
+                    {googleSigningIn ? "Signing in..." : "Sign in with Google"}
+                  </button>
+                )}
+                {sheetsFeedback.success && sheetsFeedback.url && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => void handleCopySpreadsheetUrl(sheetsFeedback.url!)}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-slate-900/80 hover:bg-slate-800 border border-emerald-700/60 text-emerald-200 font-medium transition-colors"
+                    >
+                      {copiedUrl ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                      <span>{copiedUrl ? "Copied" : "Copy Link"}</span>
+                    </button>
+                    <a
+                      href={sheetsFeedback.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 font-medium underline shrink-0"
+                    >
+                      <span>Open Spreadsheet</span>
+                      <ExternalLink className="w-3.5 h-3.5" />
+                    </a>
+                  </>
+                )}
+              </div>
             </div>
+
+            {sheetsFeedback.fallbackExport?.ready && (
+              <div className="rounded-md bg-[#070D1A] border border-amber-700/60 p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-amber-200">
+                <div>
+                  <div className="font-semibold text-amber-300">
+                    Fallback Export Ready (Not Synced to Google Sheets)
+                  </div>
+                  <div className="text-[11px] text-slate-300 mt-0.5">
+                    All 6 CSV datasets ({sheetsFeedback.fallbackExport.totalRows.toLocaleString()} live SQLite rows) were packaged into{" "}
+                    <code className="text-amber-100">{sheetsFeedback.fallbackExport.zipFilename}</code> without losing data.
+                  </div>
+                </div>
+                <a
+                  href={sheetsFeedback.fallbackExport.zipUrl}
+                  download={sheetsFeedback.fallbackExport.zipFilename}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-emerald-700 hover:bg-emerald-600 text-white font-medium transition-colors shrink-0"
+                >
+                  <Archive className="w-3.5 h-3.5" />
+                  <span>Download Fallback ZIP (6 CSVs)</span>
+                </a>
+              </div>
+            )}
           </div>
         )}
         {(unavailableSources.length > 0 || missingCredsList.length > 0 || failedIntegrations.length > 0) && (
@@ -981,32 +1045,113 @@ export function OverviewPanel({
               )}
             </div>
 
-            <div className="space-y-1">
-              <div className="flex items-center justify-between gap-2">
-                <label htmlFor="target-spreadsheet-id" className="text-xs text-slate-400 block">
-                  Target Spreadsheet ID (optional — leave blank to auto-create)
-                </label>
-                {targetSpreadsheetId.trim() !== "" && (
-                  <button
-                    type="button"
-                    onClick={onClearTargetSpreadsheetId}
-                    className="text-[11px] text-sky-400 hover:text-sky-300 underline"
-                  >
-                    Clear (auto-create new)
-                  </button>
-                )}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="space-y-1">
+                <div className="flex items-center justify-between gap-2">
+                  <label htmlFor="target-spreadsheet-id" className="text-xs text-slate-400 block">
+                    Target Spreadsheet ID (blank = create new)
+                  </label>
+                  {targetSpreadsheetId.trim() !== "" && (
+                    <button
+                      type="button"
+                      onClick={onClearTargetSpreadsheetId}
+                      className="text-[11px] text-sky-400 hover:text-sky-300 underline"
+                    >
+                      Clear (create new)
+                    </button>
+                  )}
+                </div>
+                <input
+                  id="target-spreadsheet-id"
+                  type="text"
+                  value={targetSpreadsheetId}
+                  onChange={(e) => onTargetSpreadsheetIdChange(e.target.value)}
+                  placeholder="e.g. 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"
+                  className="w-full px-3 py-1.5 rounded-lg bg-[#070D1A] border border-slate-800 text-xs font-mono text-slate-200 placeholder:text-slate-600 focus:outline-none focus:ring-2 focus:ring-sky-500"
+                />
               </div>
-              <input
-                id="target-spreadsheet-id"
-                type="text"
-                value={targetSpreadsheetId}
-                onChange={(e) => onTargetSpreadsheetIdChange(e.target.value)}
-                placeholder="e.g. 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"
-                className="w-full px-3 py-1.5 rounded-lg bg-[#070D1A] border border-slate-800 text-xs font-mono text-slate-200 placeholder:text-slate-600 focus:outline-none focus:ring-2 focus:ring-sky-500"
-              />
+
+              <div className="space-y-1">
+                <label htmlFor="sheets-export-scope" className="text-xs text-slate-400 block">
+                  Sheets Export Filter Scope
+                </label>
+                <select
+                  id="sheets-export-scope"
+                  value={sheetsExportScope}
+                  onChange={(e) =>
+                    onSheetsExportScopeChange(
+                      e.target.value === "all" ? "all" : "qualified_24h"
+                    )
+                  }
+                  className="w-full px-3 py-1.5 rounded-lg bg-[#070D1A] border border-slate-800 text-xs text-slate-200 focus:outline-none focus:ring-2 focus:ring-sky-500"
+                >
+                  <option value="all">
+                    Complete SQLite Archive (All {totalRecords.toLocaleString()} Rows — Default)
+                  </option>
+                  <option value="qualified_24h">
+                    Valid Records + Last 24h UTC Jobs &amp; News
+                  </option>
+                </select>
+              </div>
             </div>
 
-            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 text-xs">
+            {/* Public Share Link & Drive Viewer Permission Status */}
+            <div className="rounded-lg bg-[#070D1A] border border-slate-800/80 p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+              <div className="space-y-0.5 min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-slate-400">Shareable Access:</span>
+                  {sheetsStatus.publicViewerVerified ? (
+                    <span className="inline-flex items-center gap-1 text-emerald-300 font-medium">
+                      <Globe className="w-3.5 h-3.5" />
+                      <span>Anyone with the link — Viewer (Verified)</span>
+                    </span>
+                  ) : sheetsStatus.publicAccessStatus === "policy_blocked" ? (
+                    <span className="inline-flex items-center gap-1 text-amber-300 font-medium">
+                      <Lock className="w-3.5 h-3.5" />
+                      <span>Restricted (Workspace Policy Blocked Public Link)</span>
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1 text-slate-400">
+                      <Lock className="w-3.5 h-3.5" />
+                      <span>Not Verified / Not Exported</span>
+                    </span>
+                  )}
+                </div>
+                {sheetsStatus.spreadsheetUrl && sheetsStatus.status === "Connected" && (
+                  <div className="font-mono text-[11px] text-sky-300 truncate">
+                    {sheetsStatus.spreadsheetUrl}
+                  </div>
+                )}
+                {sheetsStatus.publicAccessError && (
+                  <div className="text-[11px] text-amber-300/90 leading-snug">
+                    {sheetsStatus.publicAccessError}
+                  </div>
+                )}
+              </div>
+              {sheetsStatus.spreadsheetUrl && sheetsStatus.status === "Connected" && (
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => void handleCopySpreadsheetUrl(sheetsStatus.spreadsheetUrl!)}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium transition-colors"
+                  >
+                    {copiedUrl ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                    <span>{copiedUrl ? "Copied" : "Copy Link"}</span>
+                  </button>
+                  <a
+                    href={sheetsStatus.spreadsheetUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-sky-600 hover:bg-sky-500 text-white font-medium transition-colors"
+                  >
+                    <span>Open</span>
+                    <ExternalLink className="w-3 h-3" />
+                  </a>
+                </div>
+              )}
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
               <div className="rounded-lg bg-[#070D1A] border border-slate-800/80 px-2.5 py-2">
                 <div className="text-slate-500">Last Successful Sync</div>
                 <div className="font-mono text-slate-200 mt-0.5 truncate">
@@ -1021,13 +1166,123 @@ export function OverviewPanel({
                   {sheetsStatus.lastMode ? sheetsStatus.lastMode : "—"}
                 </div>
               </div>
-              <div className="rounded-lg bg-[#070D1A] border border-slate-800/80 px-2.5 py-2 col-span-2 sm:col-span-1">
-                <div className="text-slate-500">Last Delta</div>
+              <div className="rounded-lg bg-[#070D1A] border border-slate-800/80 px-2.5 py-2">
+                <div className="text-slate-500">Inserted / Updated</div>
                 <div className="font-mono text-slate-200 mt-0.5 tabular-nums">
                   {sheetsStatus.lastSyncAt
-                    ? `+${sheetsStatus.rowsAdded} / ~${sheetsStatus.rowsUpdated} / =${sheetsStatus.rowsUnchanged}`
+                    ? `+${sheetsStatus.rowsAdded.toLocaleString()} / ~${sheetsStatus.rowsUpdated.toLocaleString()}`
                     : "—"}
                 </div>
+              </div>
+              <div className="rounded-lg bg-[#070D1A] border border-slate-800/80 px-2.5 py-2">
+                <div className="text-slate-500">Skipped / Failed</div>
+                <div className="font-mono text-slate-200 mt-0.5 tabular-nums">
+                  {sheetsStatus.lastAttemptAt
+                    ? `${(sheetsStatus.rowsSkipped ?? sheetsStatus.rowsUnchanged ?? 0).toLocaleString()} / ${(sheetsStatus.rowsFailed ?? 0).toLocaleString()}`
+                    : "—"}
+                </div>
+              </div>
+            </div>
+
+            {/* 7-Step Google Sheets Workflow Progress */}
+            <div className="rounded-lg bg-[#070D1A] border border-slate-800/80 p-3 space-y-2 text-xs">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-medium text-slate-200">One-Click 6-Tab Export Workflow</span>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={onExportSheets}
+                    disabled={sheetsExporting || sheetsSyncing}
+                    className="px-2.5 py-1 rounded bg-sky-600 hover:bg-sky-500 disabled:opacity-60 text-white text-[11px] font-medium transition-colors"
+                  >
+                    {sheetsExporting ? "Exporting..." : "Run 6-Tab Export"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={onSyncSheets}
+                    disabled={sheetsExporting || sheetsSyncing}
+                    className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-60 text-slate-200 text-[11px] font-medium transition-colors"
+                  >
+                    {sheetsSyncing ? "Syncing..." : "Incremental Sync"}
+                  </button>
+                </div>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                {[
+                  {
+                    step: 1,
+                    key: "auth",
+                    label: "1. Connect or configure Google access",
+                    done: Boolean(sheetsStatus.configured || googleHasToken),
+                  },
+                  {
+                    step: 2,
+                    key: "connection",
+                    label: "2. Test connection",
+                    done: sheetsStatus.status === "Connected",
+                  },
+                  {
+                    step: 3,
+                    key: "spreadsheet",
+                    label: "3. Target single 6-tab spreadsheet",
+                    done: Boolean(sheetsStatus.spreadsheetId && sheetsStatus.status === "Connected"),
+                  },
+                  {
+                    step: 4,
+                    key: "write_tabs",
+                    label: "4. Export all 6 datasets in batches",
+                    done: Boolean(sheetsStatus.lastSyncAt && sheetsStatus.status === "Connected"),
+                  },
+                  {
+                    step: 5,
+                    key: "verify_tabs",
+                    label: "5. Verify row counts in each tab",
+                    done: SHEETS_TABS_ORDER.every(
+                      (t) => sheetsStatus.tabStatuses?.[t]?.status === "success"
+                    ),
+                  },
+                  {
+                    step: 6,
+                    key: "public_access",
+                    label: "6. Configure & verify Anyone-with-link Viewer",
+                    done: Boolean(sheetsStatus.publicViewerVerified),
+                  },
+                  {
+                    step: 7,
+                    key: "share_url",
+                    label: "7. Confirm final shareable Google Sheets URL",
+                    done: Boolean(sheetsStatus.spreadsheetUrl && sheetsStatus.status === "Connected"),
+                  },
+                ].map((item) => {
+                  const runtimeStep = sheetsFeedback?.steps?.find((s) => s.key === item.key);
+                  const stepStatus = runtimeStep?.status ?? (item.done ? "completed" : "pending");
+                  return (
+                    <div
+                      key={item.key}
+                      title={runtimeStep?.detail || item.label}
+                      className="flex items-center gap-2 rounded px-2 py-1 bg-[#0E172B]/80 border border-slate-800/70"
+                    >
+                      {stepStatus === "completed" ? (
+                        <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                      ) : stepStatus === "failed" || stepStatus === "blocked" ? (
+                        <XCircle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                      ) : (
+                        <Clock className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                      )}
+                      <span
+                        className={`truncate ${
+                          stepStatus === "completed"
+                            ? "text-emerald-200"
+                            : stepStatus === "failed" || stepStatus === "blocked"
+                            ? "text-rose-200"
+                            : "text-slate-400"
+                        }`}
+                      >
+                        {item.label}
+                      </span>
+                    </div>
+                  );
+                })}
               </div>
             </div>
 
@@ -1076,6 +1331,55 @@ export function OverviewPanel({
                 {sheetsStatus.lastError}
               </p>
             )}
+
+            <details className="rounded-lg bg-[#070D1A] border border-slate-800/80 p-3 text-xs">
+              <summary className="cursor-pointer font-medium text-slate-200 select-none">
+                Service Account Setup Guide (Recommended if OAuth returns Error 403)
+              </summary>
+              <ol className="list-decimal list-inside space-y-1 text-slate-400 mt-2 leading-relaxed">
+                <li>
+                  Enable <strong className="text-slate-200">Google Sheets API</strong> and <strong className="text-slate-200">Google Drive API</strong> in Google Cloud Console.
+                </li>
+                <li>
+                  Create a Service Account JSON key and configure <code className="text-slate-200">GOOGLE_SHEETS_CREDENTIALS_PATH</code> (or <code className="text-slate-200">GOOGLE_SHEETS_CREDENTIALS_JSON</code>) strictly in server environment variables (never in browser code).
+                </li>
+                <li>
+                  Leave <code className="text-slate-200">GOOGLE_SHEETS_SPREADSHEET_ID</code> blank to auto-create one workbook, or share an existing sheet with the Service Account email as <strong className="text-slate-200">Editor</strong>.
+                </li>
+              </ol>
+            </details>
+
+            {(() => {
+              const oauthDiag = getOAuthSetupDiagnostics();
+              return (
+                <details className="rounded-lg bg-[#070D1A] border border-slate-800/80 p-3 text-xs">
+                  <summary className="cursor-pointer font-medium text-slate-200 select-none">
+                    Firebase &amp; GCP OAuth Domain Settings (Fix auth/unauthorized-domain)
+                  </summary>
+                  <div className="space-y-1.5 text-slate-400 mt-2 leading-relaxed">
+                    <p>
+                      Current origin: <code className="text-sky-300">{oauthDiag.currentOrigin}</code>
+                    </p>
+                    <p>
+                      Add these hostnames to <strong className="text-slate-200">Firebase Console ({oauthDiag.firebaseProjectId}) &rarr; Authentication &rarr; Settings &rarr; Authorized domains</strong> and to <strong className="text-slate-200">GCP OAuth Client Authorized JavaScript origins</strong>:
+                    </p>
+                    <ul className="list-disc list-inside font-mono text-[11px] text-slate-300 space-y-0.5">
+                      {oauthDiag.previewHostnames.map((host) => (
+                        <li key={host}>{host}</li>
+                      ))}
+                    </ul>
+                    <p>
+                      Authorized redirect URI: <code className="text-slate-200">{oauthDiag.firebaseRedirectUri}</code>
+                    </p>
+                    {oauthDiag.oauthClientId && (
+                      <p>
+                        OAuth Client ID: <code className="text-slate-200">{oauthDiag.oauthClientId}</code>
+                      </p>
+                    )}
+                  </div>
+                </details>
+              );
+            })()}
 
             {/* Honest OAuth Restriction Notice & Reliable CSV/ZIP Alternative Workflow */}
             <div className="mt-4 pt-4 border-t border-slate-800/80 space-y-3">

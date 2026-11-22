@@ -264,6 +264,40 @@ export class GoogleApiHttpError extends Error {
   }
 }
 
+export type ExportScope = "qualified_24h" | "all";
+export type PublicAccessStatus = "public_viewer" | "policy_blocked" | "not_configured" | "unknown";
+
+export interface ExportStepStatus {
+  step: number;
+  key:
+    | "auth"
+    | "connection"
+    | "spreadsheet"
+    | "write_tabs"
+    | "verify_tabs"
+    | "public_access"
+    | "share_url";
+  label: string;
+  status: "completed" | "failed" | "blocked" | "skipped";
+  detail: string;
+}
+
+export interface SheetsFallbackExportSummary {
+  ready: boolean;
+  reason: string;
+  zipFilename: string;
+  zipUrl: string;
+  zipByteSize: number;
+  rowCounts: Record<string, number>;
+  totalRows: number;
+  datasets: Array<{
+    tabName: string;
+    filename: string;
+    rowCount: number;
+    downloadUrl: string;
+  }>;
+}
+
 export interface GoogleSheetsConfig {
   atlasDir: string;
   rootDir: string;
@@ -271,8 +305,10 @@ export interface GoogleSheetsConfig {
   credentialsJson: string | null;
   spreadsheetId: string | null;
   spreadsheetName: string;
+  freshnessWindowHours?: number;
   apiBaseUrl?: string; // Overrideable for local integration tests
   driveApiBaseUrl?: string; // Overrideable for local integration tests
+  publicCheckBaseUrl?: string; // Overrideable base URL for anonymous read-access verification
   oauthTokenUrl?: string;
   tokenInfoUrl?: string;
 }
@@ -280,6 +316,7 @@ export interface GoogleSheetsConfig {
 export interface SheetsSyncResult {
   success: boolean;
   mode: "full" | "incremental";
+  exportScope: ExportScope;
   status: "Connected" | "Not Connected" | "Sync Failed";
   authRequired?: boolean;
   spreadsheetId: string | null;
@@ -290,6 +327,19 @@ export interface SheetsSyncResult {
   rowsAdded: number;
   rowsUpdated: number;
   rowsUnchanged: number;
+  rowsSkipped: number;
+  rowsFailed: number;
+  skippedBreakdown: {
+    rejected: number;
+    stale24h: number;
+    duplicateOrInvalid: number;
+    unchanged: number;
+  };
+  publicAccessStatus: PublicAccessStatus;
+  publicViewerVerified: boolean;
+  publicAccessError: string | null;
+  steps: ExportStepStatus[];
+  fallbackExport?: SheetsFallbackExportSummary | null;
   syncedAt: string | null;
   error: string | null;
 }
@@ -312,6 +362,11 @@ export interface SheetsConnectionStatus {
   rowsAdded: number;
   rowsUpdated: number;
   rowsUnchanged: number;
+  rowsSkipped: number;
+  rowsFailed: number;
+  publicAccessStatus: PublicAccessStatus;
+  publicViewerVerified: boolean;
+  publicAccessError: string | null;
   lastError: string | null;
 }
 
@@ -324,6 +379,7 @@ export class GoogleSheetsService {
   private tokenExpiresInSeconds: number | null = null;
   private readonly apiBase: string;
   private readonly driveApiBase: string;
+  private readonly publicCheckBase: string | null;
   private readonly tokenInfoUrl: string | null;
   private readonly config: GoogleSheetsConfig;
   private readonly db: AtlasDatabase;
@@ -333,6 +389,11 @@ export class GoogleSheetsService {
     this.db = db;
     this.apiBase = (config.apiBaseUrl || "https://sheets.googleapis.com/v4").replace(/\/+$/, "");
     this.driveApiBase = (config.driveApiBaseUrl || "https://www.googleapis.com/drive/v3").replace(/\/+$/, "");
+    this.publicCheckBase = config.publicCheckBaseUrl
+      ? config.publicCheckBaseUrl.replace(/\/+$/, "")
+      : config.apiBaseUrl
+      ? null
+      : "https://docs.google.com/spreadsheets/d";
     this.tokenInfoUrl = config.tokenInfoUrl
       ? config.tokenInfoUrl.replace(/\/+$/, "")
       : config.apiBaseUrl
@@ -817,20 +878,80 @@ export class GoogleSheetsService {
     });
   }
 
-  private buildDeduplicatedTabRows(
+  private parseRowTimestampMs(row: Record<string, unknown>, tableName: string): number | null {
+    const raw =
+      tableName === "jobs"
+        ? row.posted_at
+        : tableName === "news" || tableName === "research_papers"
+        ? row.published_at
+        : null;
+    if (typeof raw !== "string" || !raw.trim()) return null;
+    const s = raw.trim();
+    const normalized = /^\d{4}-\d{2}-\d{2}$/.test(s)
+      ? `${s}T00:00:00.000Z`
+      : /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/.test(s)
+      ? `${s.replace(" ", "T")}Z`
+      : s;
+    const ms = Date.parse(normalized);
+    return Number.isFinite(ms) ? ms : null;
+  }
+
+  public buildDeduplicatedTabRows(
     spec: ExportSpec,
-    canonicalNames?: Map<string, string>
+    canonicalNames?: Map<string, string>,
+    opts?: {
+      exportScope?: ExportScope;
+      freshnessWindowHours?: number;
+      refNow?: Date;
+    }
   ): {
     orderedIds: string[];
     rowMap: Map<string, Array<string | number>>;
+    skippedRejected: number;
+    skippedStale24h: number;
+    skippedDuplicate: number;
+    failedValidation: number;
   } {
     const namesMap = canonicalNames ?? this.db.fetchCanonicalNameMap();
     const rawRows = this.db.fetchDataset(spec.tableName);
+    const scope: ExportScope = opts?.exportScope ?? "qualified_24h";
+    const windowHours = opts?.freshnessWindowHours ?? this.config.freshnessWindowHours ?? 24;
+    const refMs = (opts?.refNow ?? new Date()).getTime();
+    const minMs = refMs - windowHours * 3600_000;
+    const maxMs = refMs + 5 * 60_000;
+
     const orderedIds: string[] = [];
     const rowMap = new Map<string, Array<string | number>>();
+    let skippedRejected = 0;
+    let skippedStale24h = 0;
+    let skippedDuplicate = 0;
+    let failedValidation = 0;
+
     for (const row of rawRows) {
       const rid = String(row[spec.idColumn] ?? "").trim();
-      if (!rid || rowMap.has(rid)) continue;
+      if (!rid) {
+        failedValidation += 1;
+        continue;
+      }
+      if (rowMap.has(rid)) {
+        skippedDuplicate += 1;
+        continue;
+      }
+      if (scope === "qualified_24h" && spec.tableName !== "entity_mapping_log") {
+        const verStatus = String(row.verification_status ?? "");
+        if (verStatus === "Rejected") {
+          skippedRejected += 1;
+          continue;
+        }
+        if (spec.tableName === "jobs" || spec.tableName === "news") {
+          const tsMs = this.parseRowTimestampMs(row, spec.tableName);
+          if (tsMs === null || tsMs < minMs || tsMs > maxMs) {
+            skippedStale24h += 1;
+            continue;
+          }
+        }
+      }
+
       const enrichedRow: Record<string, unknown> = { ...row };
       if (spec.tableName === "startups" || spec.tableName === "products") {
         const cid = String(row.canonical_entity_id ?? "").trim();
@@ -845,7 +966,14 @@ export class GoogleSheetsService {
         spec.columns.map((c) => formatExportCell(c, enrichedRow, true))
       );
     }
-    return { orderedIds, rowMap };
+    return {
+      orderedIds,
+      rowMap,
+      skippedRejected,
+      skippedStale24h,
+      skippedDuplicate,
+      failedValidation,
+    };
   }
 
   private async verifyWrittenTab(
@@ -919,6 +1047,11 @@ export class GoogleSheetsService {
       rowsAdded: saved?.rowsAdded ?? 0,
       rowsUpdated: saved?.rowsUpdated ?? 0,
       rowsUnchanged: saved?.rowsUnchanged ?? 0,
+      rowsSkipped: saved?.rowsSkipped ?? 0,
+      rowsFailed: saved?.rowsFailed ?? 0,
+      publicAccessStatus: saved?.publicAccessStatus ?? "unknown",
+      publicViewerVerified: saved?.publicViewerVerified ?? false,
+      publicAccessError: saved?.publicAccessError ?? null,
       lastError: saved?.lastError ?? null,
     };
   }
@@ -928,6 +1061,69 @@ export class GoogleSheetsService {
       return this.resolveTargetSpreadsheetId(overrideId, createNew);
     } catch {
       return createNew ? null : this.db.getSheetsSyncState()?.spreadsheetId ?? null;
+    }
+  }
+
+  private splitRangeEntryInHalf(entry: {
+    range: string;
+    values: Array<Array<string | number>>;
+  }): Array<{ range: string; values: Array<Array<string | number>> }> | null {
+    if (entry.values.length <= 1) return null;
+    const match = entry.range.match(/^(.+!A)(\d+):([A-Z]+)(\d+)$/);
+    if (!match) return null;
+    const [, prefix, startRowStr, colEnd, endRowStr] = match;
+    const startRow = Number(startRowStr);
+    const endRow = Number(endRowStr);
+    if (!Number.isFinite(startRow) || !Number.isFinite(endRow)) return null;
+    const mid = Math.floor(entry.values.length / 2);
+    const firstValues = entry.values.slice(0, mid);
+    const secondValues = entry.values.slice(mid);
+    const firstEnd = startRow + firstValues.length - 1;
+    const secondStart = firstEnd + 1;
+    const secondEnd = secondStart + secondValues.length - 1;
+    return [
+      { range: `${prefix}${startRow}:${colEnd}${firstEnd}`, values: firstValues },
+      { range: `${prefix}${secondStart}:${colEnd}${secondEnd}`, values: secondValues },
+    ];
+  }
+
+  private isPayloadTooLargeError(err: unknown): boolean {
+    if (err instanceof GoogleApiHttpError && err.httpStatus === 413) return true;
+    const msg = err instanceof Error ? err.message : String(err);
+    return /413|payload too large|request entity too large|exceeds the maximum allowed/i.test(msg);
+  }
+
+  private async sendBatchWithSplit(
+    accessToken: string,
+    spreadsheetId: string,
+    batch: Array<{ range: string; values: Array<Array<string | number>> }>
+  ): Promise<void> {
+    if (batch.length === 0) return;
+    try {
+      await this.sheetsJson(accessToken, `/spreadsheets/${spreadsheetId}/values:batchUpdate`, {
+        method: "POST",
+        body: {
+          valueInputOption: "RAW",
+          data: batch,
+        },
+      });
+    } catch (err) {
+      if (!this.isPayloadTooLargeError(err)) {
+        throw err;
+      }
+      if (batch.length > 1) {
+        const mid = Math.floor(batch.length / 2);
+        await this.sendBatchWithSplit(accessToken, spreadsheetId, batch.slice(0, mid));
+        await this.sendBatchWithSplit(accessToken, spreadsheetId, batch.slice(mid));
+        return;
+      }
+      const splitSingle = this.splitRangeEntryInHalf(batch[0]);
+      if (splitSingle) {
+        await this.sendBatchWithSplit(accessToken, spreadsheetId, [splitSingle[0]]);
+        await this.sendBatchWithSplit(accessToken, spreadsheetId, [splitSingle[1]]);
+        return;
+      }
+      throw err;
     }
   }
 
@@ -946,16 +1142,11 @@ export class GoogleSheetsService {
 
     const flushBatch = async () => {
       if (currentBatch.length === 0) return;
-      await this.sheetsJson(accessToken, `/spreadsheets/${spreadsheetId}/values:batchUpdate`, {
-        method: "POST",
-        body: {
-          valueInputOption: "RAW",
-          data: currentBatch,
-        },
-      });
+      const toSend = currentBatch;
       currentBatch = [];
       currentRows = 0;
       currentBytes = 0;
+      await this.sendBatchWithSplit(accessToken, spreadsheetId, toSend);
     };
 
     for (const entry of dataEntries) {
@@ -974,6 +1165,167 @@ export class GoogleSheetsService {
       currentBytes += entryBytes;
     }
     await flushBatch();
+  }
+
+  private async verifyAnonymousSpreadsheetRead(
+    spreadsheetId: string
+  ): Promise<{ readable: boolean; status: number | null; detail: string }> {
+    if (!this.publicCheckBase) {
+      return {
+        readable: true,
+        status: null,
+        detail: "Anonymous HTTP check skipped (local Drive mock mode).",
+      };
+    }
+    const encodedId = encodeURIComponent(spreadsheetId);
+    const probeUrl = `${this.publicCheckBase}/${encodedId}/gviz/tq?tqx=out:csv&sheet=Startups&tq=${encodeURIComponent("select A limit 2")}`;
+    try {
+      const resp = await fetch(probeUrl, {
+        method: "GET",
+        redirect: "manual",
+        headers: {
+          Accept: "text/csv,text/plain;q=0.9,*/*;q=0.8",
+        },
+      });
+      const location = resp.headers.get("location") || "";
+      if (resp.status >= 300 && resp.status < 400) {
+        if (/accounts\.google\.com|ServiceLogin/i.test(location)) {
+          return {
+            readable: false,
+            status: resp.status,
+            detail: `Unauthenticated request redirected to Google Sign-In (${resp.status}). Public Viewer access is NOT active.`,
+          };
+        }
+        return {
+          readable: false,
+          status: resp.status,
+          detail: `Unauthenticated request returned unexpected redirect (${resp.status}${location ? ` -> ${redactSecrets(location)}` : ""}).`,
+        };
+      }
+      if (resp.status === 200) {
+        const body = await resp.text();
+        if (/accounts\.google\.com\/ServiceLogin|Sign in - Google Accounts/i.test(body)) {
+          return {
+            readable: false,
+            status: 200,
+            detail: "Unauthenticated request returned Google Sign-In HTML page instead of spreadsheet CSV.",
+          };
+        }
+        return {
+          readable: true,
+          status: 200,
+          detail: "Separate unauthenticated HTTP GET returned HTTP 200 CSV data.",
+        };
+      }
+      return {
+        readable: false,
+        status: resp.status,
+        detail: `Unauthenticated read check returned HTTP ${resp.status}.`,
+      };
+    } catch (err) {
+      return {
+        readable: false,
+        status: null,
+        detail: `Unauthenticated read check failed: ${redactSecrets(err instanceof Error ? err.message : String(err))}`,
+      };
+    }
+  }
+
+  private async ensureAndVerifyPublicViewerAccess(
+    accessToken: string,
+    spreadsheetId: string
+  ): Promise<{
+    status: PublicAccessStatus;
+    verified: boolean;
+    permissionId: string | null;
+    error: string | null;
+  }> {
+    if (Boolean(this.config.apiBaseUrl) && !this.config.driveApiBaseUrl) {
+      return {
+        status: "not_configured",
+        verified: false,
+        permissionId: null,
+        error: "Google Drive Permissions API endpoint not configured for this test harness; public link access not verified.",
+      };
+    }
+
+    const encodedId = encodeURIComponent(spreadsheetId);
+    const hasPublicViewerRole = (perms: Array<{ id?: string; type?: string; role?: string }>) =>
+      perms.find(
+        (p) =>
+          p.type === "anyone" &&
+          (p.role === "reader" || p.role === "commenter" || p.role === "writer")
+      );
+
+    try {
+      const existing = await this.driveJson<{
+        permissions?: Array<{ id?: string; type?: string; role?: string; allowFileDiscovery?: boolean }>;
+      }>(
+        accessToken,
+        `/files/${encodedId}/permissions?fields=permissions(id,type,role,allowFileDiscovery)&supportsAllDrives=true`
+      );
+      let matched = hasPublicViewerRole(existing.permissions ?? []);
+
+      if (!matched) {
+        await this.driveJson<{ id?: string; type?: string; role?: string }>(
+          accessToken,
+          `/files/${encodedId}/permissions?supportsAllDrives=true`,
+          {
+            method: "POST",
+            body: {
+              role: "reader",
+              type: "anyone",
+              allowFileDiscovery: false,
+            },
+          }
+        );
+        // Verify via an actual Drive permissions read-back response
+        const readback = await this.driveJson<{
+          permissions?: Array<{ id?: string; type?: string; role?: string; allowFileDiscovery?: boolean }>;
+        }>(
+          accessToken,
+          `/files/${encodedId}/permissions?fields=permissions(id,type,role,allowFileDiscovery)&supportsAllDrives=true`
+        );
+        matched = hasPublicViewerRole(readback.permissions ?? []);
+      }
+
+      if (matched) {
+        const anonRead = await this.verifyAnonymousSpreadsheetRead(spreadsheetId);
+        if (!anonRead.readable) {
+          return {
+            status: "policy_blocked",
+            verified: false,
+            permissionId: matched.id ?? null,
+            error: `Drive permissions listed 'anyone' (${matched.role}), but unauthenticated verification failed: ${anonRead.detail}`,
+          };
+        }
+        return {
+          status: "public_viewer",
+          verified: true,
+          permissionId: matched.id ?? null,
+          error: null,
+        };
+      }
+      return {
+        status: "policy_blocked",
+        verified: false,
+        permissionId: null,
+        error:
+          "Google Drive permissions read-back did not confirm 'Anyone with the link — Viewer'. Check Drive sharing settings.",
+      };
+    } catch (err) {
+      const msg = redactSecrets(err instanceof Error ? err.message : String(err));
+      const isPolicyOrPerm =
+        err instanceof GoogleApiHttpError && (err.httpStatus === 403 || err.httpStatus === 400);
+      return {
+        status: isPolicyOrPerm ? "policy_blocked" : "unknown",
+        verified: false,
+        permissionId: null,
+        error: isPolicyOrPerm
+          ? `Public link sharing ("Anyone with the link — Viewer") was blocked by Google Workspace/Drive policy or missing Drive permissions (${msg}). Data was still written to the spreadsheet; download the 6-CSV ZIP bundle for external sharing.`
+          : `Unable to verify Google Drive public Viewer access (${msg}).`,
+      };
+    }
   }
 
   public async verifyConnection(opts?: {
@@ -1154,18 +1506,38 @@ export class GoogleSheetsService {
 
   public async exportOrSync(
     mode: "full" | "incremental",
-    opts?: { oauthAccessToken?: string | null; spreadsheetId?: string | null; createNew?: boolean }
+    opts?: {
+      oauthAccessToken?: string | null;
+      spreadsheetId?: string | null;
+      createNew?: boolean;
+      exportScope?: ExportScope;
+    }
   ): Promise<SheetsSyncResult> {
     const attemptAt = new Date().toISOString();
     const prev = this.db.getSheetsSyncState();
     const hasOauth = Boolean(this.sanitizeOAuthToken(opts?.oauthAccessToken));
     const createNew = Boolean(opts?.createNew);
+    const exportScope: ExportScope = opts?.exportScope ?? "all";
+    const steps: ExportStepStatus[] = [];
+    const emptySkippedBreakdown = {
+      rejected: 0,
+      stale24h: 0,
+      duplicateOrInvalid: 0,
+      unchanged: 0,
+    };
 
     if (!hasOauth && !this.isConfigured()) {
       this.liveSessionVerified = false;
       this.liveCredentialSource = null;
       const errMsg =
-        "Google Sheets authorization required. Click 'Sign in with Google' to authorize Google Drive & Sheets access before exporting.";
+        "Google Sheets authorization required. Configure Service Account credentials (GOOGLE_SHEETS_CREDENTIALS_JSON / GOOGLE_SHEETS_CREDENTIALS_PATH) or sign in with Google to authorize Drive & Sheets.";
+      steps.push({
+        step: 1,
+        key: "auth",
+        label: "Connect or configure Google access",
+        status: "failed",
+        detail: errMsg,
+      });
       this.db.saveSheetsSyncState({
         status: "Not Connected",
         spreadsheetId: this.safeResolveTargetSpreadsheetId(opts?.spreadsheetId, createNew),
@@ -1178,11 +1550,17 @@ export class GoogleSheetsService {
         rowsAdded: 0,
         rowsUpdated: 0,
         rowsUnchanged: 0,
+        rowsSkipped: 0,
+        rowsFailed: 0,
+        publicAccessStatus: "not_configured",
+        publicViewerVerified: false,
+        publicAccessError: null,
         lastError: errMsg,
       });
       return {
         success: false,
         mode,
+        exportScope,
         status: "Not Connected",
         authRequired: true,
         spreadsheetId: null,
@@ -1193,6 +1571,13 @@ export class GoogleSheetsService {
         rowsAdded: 0,
         rowsUpdated: 0,
         rowsUnchanged: 0,
+        rowsSkipped: 0,
+        rowsFailed: 0,
+        skippedBreakdown: emptySkippedBreakdown,
+        publicAccessStatus: "not_configured",
+        publicViewerVerified: false,
+        publicAccessError: null,
+        steps,
         syncedAt: null,
         error: errMsg,
       };
@@ -1201,8 +1586,30 @@ export class GoogleSheetsService {
     try {
       const auth = await this.resolveAuthToken(opts?.oauthAccessToken);
       const accessToken = auth.accessToken;
+      steps.push({
+        step: 1,
+        key: "auth",
+        label: "Connect or configure Google access",
+        status: "completed",
+        detail: `Authenticated via ${auth.credentialSource === "oauth" ? "Google OAuth" : "Service Account"}${auth.email ? ` (${auth.email})` : ""}.`,
+      });
+      steps.push({
+        step: 2,
+        key: "connection",
+        label: "Test connection",
+        status: "completed",
+        detail: "Verified Sheets & Drive API access token.",
+      });
+
       const { spreadsheetId, spreadsheetUrl, sheetPropsByTitle } =
         await this.ensureSpreadsheetAndTabs(accessToken, opts?.spreadsheetId, createNew);
+      steps.push({
+        step: 3,
+        key: "spreadsheet",
+        label: "Create or select target spreadsheet",
+        status: "completed",
+        detail: `Using spreadsheet ${spreadsheetId} with all 6 required tabs.`,
+      });
 
       const batchSize = 250;
       const tabRowCounts: Record<string, number> = {};
@@ -1211,17 +1618,31 @@ export class GoogleSheetsService {
       let totalAdded = 0;
       let totalUpdated = 0;
       let totalUnchanged = 0;
+      let totalRejectedSkipped = 0;
+      let totalStale24hSkipped = 0;
+      let totalDupOrInvalidSkipped = 0;
+      let totalFailedRows = 0;
 
+      const canonicalNames = this.db.fetchCanonicalNameMap();
+      const refNow = new Date();
       const preparedByTab = new Map<
         string,
-        { orderedIds: string[]; rowMap: Map<string, Array<string | number>> }
+        ReturnType<GoogleSheetsService["buildDeduplicatedTabRows"]>
       >();
       for (const spec of EXPORT_SPECS) {
-        preparedByTab.set(spec.tabName, this.buildDeduplicatedTabRows(spec));
+        const prep = this.buildDeduplicatedTabRows(spec, canonicalNames, {
+          exportScope,
+          freshnessWindowHours: this.config.freshnessWindowHours ?? 24,
+          refNow,
+        });
+        preparedByTab.set(spec.tabName, prep);
+        totalRejectedSkipped += prep.skippedRejected;
+        totalStale24hSkipped += prep.skippedStale24h;
+        totalDupOrInvalidSkipped += prep.skippedDuplicate;
+        totalFailedRows += prep.failedValidation;
       }
 
       if (mode === "full") {
-        // 1) Resize grids + bold/freeze header rows across all 6 tabs in one :batchUpdate
         const formatRequests: Array<Record<string, unknown>> = [];
         for (const spec of EXPORT_SPECS) {
           const sheetMeta = sheetPropsByTitle.get(spec.tabName);
@@ -1279,7 +1700,6 @@ export class GoogleSheetsService {
           });
         }
 
-        // 2) Clear all 6 tabs in one values:batchClear request
         await this.sheetsJson(accessToken, `/spreadsheets/${spreadsheetId}/values:batchClear`, {
           method: "POST",
           body: {
@@ -1288,7 +1708,6 @@ export class GoogleSheetsService {
         });
       }
 
-      // 3) Process, write, and verify each of the 6 tabs individually with explicit per-tab outcomes
       let fatalAuthOrTargetError: string | null = null;
       for (const spec of EXPORT_SPECS) {
         const { orderedIds, rowMap } = preparedByTab.get(spec.tabName)!;
@@ -1305,6 +1724,7 @@ export class GoogleSheetsService {
             message: `Skipped after earlier failure: ${fatalAuthOrTargetError}`,
           };
           verifiedTabRowCounts[spec.tabName] = 0;
+          totalFailedRows += expectedRows;
           continue;
         }
 
@@ -1467,6 +1887,7 @@ export class GoogleSheetsService {
               error: `Header column mismatch on '${spec.tabName}'`,
               message: `Verification failed: expected header '${spec.columns[0]}' in A1`,
             };
+            totalFailedRows += expectedRows;
           } else if (duplicateCount > 0) {
             tabStatuses[spec.tabName] = {
               tabName: spec.tabName,
@@ -1477,7 +1898,8 @@ export class GoogleSheetsService {
               error: `Duplicate rows detected on '${spec.tabName}' (${duplicateCount} duplicate IDs)`,
               message: `Verification failed: ${duplicateCount} duplicate IDs found`,
             };
-          } else if (verifiedRows !== expectedRows) {
+            totalFailedRows += duplicateCount;
+          } else if (mode === "incremental" ? verifiedRows < expectedRows : verifiedRows !== expectedRows) {
             tabStatuses[spec.tabName] = {
               tabName: spec.tabName,
               status: "failed",
@@ -1487,6 +1909,7 @@ export class GoogleSheetsService {
               error: `Row count mismatch (${verifiedRows} verified vs ${expectedRows} expected)`,
               message: `Verification mismatch: ${verifiedRows.toLocaleString()} verified vs ${expectedRows.toLocaleString()} DB rows`,
             };
+            totalFailedRows += Math.abs(expectedRows - verifiedRows);
           } else {
             tabStatuses[spec.tabName] = {
               tabName: spec.tabName,
@@ -1495,12 +1918,16 @@ export class GoogleSheetsService {
               writtenRows: expectedRows,
               verifiedRows,
               error: null,
-              message: `Verified ${verifiedRows.toLocaleString()} rows`,
+              message:
+                verifiedRows > expectedRows
+                  ? `Verified ${verifiedRows.toLocaleString()} rows (${expectedRows.toLocaleString()} current + ${(verifiedRows - expectedRows).toLocaleString()} preserved)`
+                  : `Verified ${verifiedRows.toLocaleString()} rows`,
             };
           }
         } catch (tabErr) {
           const tabMsg = redactSecrets(tabErr instanceof Error ? tabErr.message : String(tabErr));
           verifiedTabRowCounts[spec.tabName] = 0;
+          totalFailedRows += expectedRows;
           tabStatuses[spec.tabName] = {
             tabName: spec.tabName,
             status: "failed",
@@ -1516,14 +1943,41 @@ export class GoogleSheetsService {
           }
           if (/HTTP (401|403|404)/.test(tabMsg)) {
             fatalAuthOrTargetError = tabMsg;
-            break;
           }
         }
       }
 
+      const skippedBreakdown = {
+        rejected: totalRejectedSkipped,
+        stale24h: totalStale24hSkipped,
+        duplicateOrInvalid: totalDupOrInvalidSkipped,
+        unchanged: totalUnchanged,
+      };
+      const totalSkipped =
+        totalRejectedSkipped + totalStale24hSkipped + totalDupOrInvalidSkipped + totalUnchanged;
+
       const failedTabs = EXPORT_SPECS.filter((s) => tabStatuses[s.tabName]?.status !== "success");
       const allSixSucceeded = failedTabs.length === 0;
       const syncedAt = new Date().toISOString();
+
+      steps.push({
+        step: 4,
+        key: "write_tabs",
+        label: "Export all six datasets",
+        status: allSixSucceeded ? "completed" : "failed",
+        detail: allSixSucceeded
+          ? `Wrote ${Object.values(tabRowCounts).reduce((a, b) => a + b, 0).toLocaleString()} records across 6 tabs (+${totalAdded} inserted, ~${totalUpdated} updated, ${totalSkipped} skipped).`
+          : `Failed writing one or more tabs (${failedTabs.map((t) => t.tabName).join(", ")}).`,
+      });
+      steps.push({
+        step: 5,
+        key: "verify_tabs",
+        label: "Verify row counts in each tab",
+        status: allSixSucceeded ? "completed" : "failed",
+        detail: allSixSucceeded
+          ? EXPORT_SPECS.map((s) => `${s.tabName}: ${verifiedTabRowCounts[s.tabName] ?? 0}`).join(" · ")
+          : `${6 - failedTabs.length}/6 tabs verified.`,
+      });
 
       if (!allSixSucceeded) {
         const failedSummary = failedTabs
@@ -1535,37 +1989,90 @@ export class GoogleSheetsService {
           this.liveSessionVerified = false;
           this.liveCredentialSource = null;
         }
+        steps.push({
+          step: 6,
+          key: "public_access",
+          label: "Verify public Viewer access",
+          status: "skipped",
+          detail: "Skipped public permission check because worksheet verification did not complete.",
+        });
+        steps.push({
+          step: 7,
+          key: "share_url",
+          label: "Display shareable Google Sheets URL",
+          status: "skipped",
+          detail: "Spreadsheet URL withheld until all 6 tabs pass verification.",
+        });
+        const preservedUrl = prev?.lastSuccessAt ? (prev.spreadsheetUrl ?? null) : null;
+        const preservedId = prev?.lastSuccessAt ? (prev.spreadsheetId ?? spreadsheetId) : spreadsheetId;
         this.db.saveSheetsSyncState({
           status: "Sync Failed",
-          spreadsheetId,
-          spreadsheetUrl: null,
+          spreadsheetId: preservedId,
+          spreadsheetUrl: preservedUrl,
           lastSyncMode: mode,
           lastAttemptAt: attemptAt,
           lastSuccessAt: prev?.lastSuccessAt ?? null,
-          tabRowCounts: verifiedTabRowCounts,
+          tabRowCounts: prev?.lastSuccessAt ? (prev.tabRowCounts ?? verifiedTabRowCounts) : verifiedTabRowCounts,
           tabStatuses,
           rowsAdded: totalAdded,
           rowsUpdated: totalUpdated,
           rowsUnchanged: totalUnchanged,
+          rowsSkipped: totalSkipped,
+          rowsFailed: totalFailedRows,
+          publicAccessStatus: prev?.lastSuccessAt ? (prev.publicAccessStatus ?? "unknown") : "unknown",
+          publicViewerVerified: prev?.lastSuccessAt ? Boolean(prev.publicViewerVerified) : false,
+          publicAccessError: prev?.lastSuccessAt ? (prev.publicAccessError ?? null) : null,
           lastError: errMsg,
         });
         return {
           success: false,
           mode,
+          exportScope,
           status: "Sync Failed",
           authRequired,
-          spreadsheetId,
-          spreadsheetUrl: null,
+          spreadsheetId: preservedId,
+          spreadsheetUrl: preservedUrl,
           tabRowCounts,
           verifiedTabRowCounts,
           tabStatuses,
           rowsAdded: totalAdded,
           rowsUpdated: totalUpdated,
           rowsUnchanged: totalUnchanged,
+          rowsSkipped: totalSkipped,
+          rowsFailed: totalFailedRows,
+          skippedBreakdown,
+          publicAccessStatus: "unknown",
+          publicViewerVerified: false,
+          publicAccessError: null,
+          steps,
           syncedAt: null,
           error: errMsg,
         };
       }
+
+      const publicShare = await this.ensureAndVerifyPublicViewerAccess(accessToken, spreadsheetId);
+      steps.push({
+        step: 6,
+        key: "public_access",
+        label: "Verify public Viewer access",
+        status: publicShare.verified
+          ? "completed"
+          : publicShare.status === "policy_blocked"
+          ? "blocked"
+          : "failed",
+        detail: publicShare.verified
+          ? `Confirmed 'Anyone with the link — Viewer' via Google Drive Permissions API${publicShare.permissionId ? ` (permission ${publicShare.permissionId})` : ""}.`
+          : publicShare.error || "Public Viewer permission could not be verified.",
+      });
+      steps.push({
+        step: 7,
+        key: "share_url",
+        label: "Display shareable Google Sheets URL",
+        status: "completed",
+        detail: publicShare.verified
+          ? `Public link ready: ${spreadsheetUrl}`
+          : `Private spreadsheet URL: ${spreadsheetUrl} (public link blocked/unverified — use ZIP fallback for external viewers if needed).`,
+      });
 
       this.liveSessionVerified = true;
       this.liveCredentialSource = auth.credentialSource;
@@ -1585,12 +2092,18 @@ export class GoogleSheetsService {
         rowsAdded: totalAdded,
         rowsUpdated: totalUpdated,
         rowsUnchanged: totalUnchanged,
+        rowsSkipped: totalSkipped,
+        rowsFailed: totalFailedRows,
+        publicAccessStatus: publicShare.status,
+        publicViewerVerified: publicShare.verified,
+        publicAccessError: publicShare.error,
         lastError: null,
       });
 
       return {
         success: true,
         mode,
+        exportScope,
         status: "Connected",
         authRequired: false,
         spreadsheetId,
@@ -1601,6 +2114,13 @@ export class GoogleSheetsService {
         rowsAdded: totalAdded,
         rowsUpdated: totalUpdated,
         rowsUnchanged: totalUnchanged,
+        rowsSkipped: totalSkipped,
+        rowsFailed: totalFailedRows,
+        skippedBreakdown,
+        publicAccessStatus: publicShare.status,
+        publicViewerVerified: publicShare.verified,
+        publicAccessError: publicShare.error,
+        steps,
         syncedAt,
         error: null,
       };
@@ -1612,6 +2132,15 @@ export class GoogleSheetsService {
         this.liveSessionVerified = false;
         this.liveCredentialSource = null;
         this.verifiedAccountEmail = null;
+      }
+      if (steps.length === 0) {
+        steps.push({
+          step: 1,
+          key: "auth",
+          label: "Connect or configure Google access",
+          status: "failed",
+          detail: msg,
+        });
       }
       const targetId = this.safeResolveTargetSpreadsheetId(opts?.spreadsheetId, createNew);
       const tabStatuses: Record<string, TabExportStatus> = {};
@@ -1626,10 +2155,11 @@ export class GoogleSheetsService {
           message: `Failed: ${msg}`,
         };
       }
+      const hasPriorValid = Boolean(!createNew && prev?.lastSuccessAt && prev?.spreadsheetUrl);
       this.db.saveSheetsSyncState({
         status: "Sync Failed",
-        spreadsheetId: targetId,
-        spreadsheetUrl: null,
+        spreadsheetId: hasPriorValid ? (prev?.spreadsheetId ?? targetId) : targetId,
+        spreadsheetUrl: hasPriorValid ? (prev?.spreadsheetUrl ?? null) : null,
         lastSyncMode: mode,
         lastAttemptAt: attemptAt,
         lastSuccessAt: prev?.lastSuccessAt ?? null,
@@ -1638,21 +2168,34 @@ export class GoogleSheetsService {
         rowsAdded: 0,
         rowsUpdated: 0,
         rowsUnchanged: 0,
+        rowsSkipped: 0,
+        rowsFailed: 0,
+        publicAccessStatus: hasPriorValid ? (prev?.publicAccessStatus ?? "unknown") : "unknown",
+        publicViewerVerified: hasPriorValid ? Boolean(prev?.publicViewerVerified) : false,
+        publicAccessError: hasPriorValid ? (prev?.publicAccessError ?? null) : null,
         lastError: msg,
       });
       return {
         success: false,
         mode,
+        exportScope,
         status: "Sync Failed",
         authRequired,
-        spreadsheetId: targetId,
-        spreadsheetUrl: null,
+        spreadsheetId: hasPriorValid ? (prev?.spreadsheetId ?? targetId) : targetId,
+        spreadsheetUrl: hasPriorValid ? (prev?.spreadsheetUrl ?? null) : null,
         tabRowCounts: {},
         verifiedTabRowCounts: {},
         tabStatuses,
         rowsAdded: 0,
         rowsUpdated: 0,
         rowsUnchanged: 0,
+        rowsSkipped: 0,
+        rowsFailed: 0,
+        skippedBreakdown: emptySkippedBreakdown,
+        publicAccessStatus: "unknown",
+        publicViewerVerified: false,
+        publicAccessError: null,
+        steps,
         syncedAt: null,
         error: msg,
       };
