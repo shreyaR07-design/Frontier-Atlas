@@ -133,18 +133,19 @@ Configure values in `.env` (never commit `.env` or credential JSON files):
 | Variable | Description | Default |
 |---|---|---|
 | `GEMINI_API_KEY` | Google Gemini API key | *(empty)* |
-| `GEMINI_MODEL` | Active Gemini model name | `gemini-4-hydrogen` |
-| `GROQ_API_KEY` | Optional Groq fallback API key | *(empty)* |
+| `GEMINI_MODEL` | Active Gemini model name | `gemini-2.5-flash` |
+| `GROQ_API_KEY` | Optional Groq tier-2 fallback API key | *(empty)* |
 | `GROQ_MODEL` | Optional Groq model | `llama-3.3-70b-versatile` |
-| `DEEPSEEK_API_KEY` | Optional DeepSeek fallback API key | *(empty)* |
+| `DEEPSEEK_API_KEY` | Optional DeepSeek tier-3 fallback API key | *(empty)* |
 | `DEEPSEEK_MODEL` | Optional DeepSeek model | `deepseek-chat` |
 | `DATABASE_URL` | SQLite or PostgreSQL DSN | `sqlite:///data/frontier_atlas.db` |
 | `GITHUB_TOKEN` | Optional GitHub PAT for higher API rate limits | *(empty)* |
+| `GOOGLE_SHEETS_CREDENTIALS_JSON` | Inline or base64 Google Service Account JSON (alternative to path) | *(empty)* |
 | `GOOGLE_SHEETS_CREDENTIALS_PATH` | Path to Google Service Account JSON | *(empty)* |
 | `GOOGLE_SHEETS_SPREADSHEET_ID` | Existing Google Sheet ID (blank creates new) | *(empty)* |
 | `GOOGLE_SHEETS_SPREADSHEET_NAME` | Workbook title when creating new sheet | `FrontierAtlas Intelligence` |
 | `MAX_CONCURRENCY` | Max concurrent HTTP requests | `8` |
-| `RATE_LIMIT_PER_SECOND` | Per-domain request cap | `2.0` |
+| `RATE_LIMIT_PER_SECOND` | Per-domain request cap | `4.0` |
 | `FRESHNESS_WINDOW_HOURS` | UTC lookback window for Jobs and News | `24` |
 | `ENABLE_LIVE_TESTS` | Enable live network tests (`true`/`false`) | `false` |
 
@@ -152,15 +153,22 @@ Configure values in `.env` (never commit `.env` or credential JSON files):
 
 ## API Setup
 
-1. **Gemini API**: Obtain a key from Google AI Studio and set `GEMINI_API_KEY` in `.env`.
-2. **GitHub API (Optional)**: Create a read-only personal access token (`public_repo` not required for public read) and set `GITHUB_TOKEN` to raise the unauthenticated 60 req/hr limit to 5,000 req/hr when enriching research paper star counts and product repos.
-3. **OpenAlex / arXiv / Crossref / Remotive / Arbeitnow / HN Algolia**: Public APIs requiring no API key; FrontierAtlas sends a polite `USER_AGENT` and enforces rate limits.
+1. **Gemini / Groq / DeepSeek APIs**: Set `GEMINI_API_KEY` (primary), and optionally `GROQ_API_KEY` + `DEEPSEEK_API_KEY` for multi-tier fallback (`Gemini -> Groq -> DeepSeek`).
+2. **GitHub API (Optional)**: Create a read-only personal access token (`public_repo` not required for public read) and set `GITHUB_TOKEN` to raise the unauthenticated 60 req/hr limit to 5,000 req/hr when enriching research paper star counts/metrics and product repos.
+3. **Public Structured APIs & Feeds**: Collects from YC OSS, Hugging Face Spaces & Daily Papers, arXiv, OpenAlex, Crossref, WeWorkRemotely, Jobicy, Arbeitnow, Greenhouse/Ashby/Lever ATS boards, Himalayas, Remotive, RemoteOK, 12+ AI RSS/Atom feeds, and HN Algolia while honoring `robots.txt` and rate limits.
 
 ---
 
 ## Running Instructions
 
-Run a small real-data collection pass across all five source categories with CSV export:
+Run the web dashboard + Node.js backend from the repository root:
+
+```bash
+npm install
+npm run dev
+```
+
+Or run the Python CLI inside `frontier-atlas/`:
 
 ```bash
 python -m src.pipeline.orchestrator --categories all --limit 25 --export-csv
@@ -203,16 +211,16 @@ ENABLE_LIVE_TESTS=true pytest -m live -v
 
 ## Google Sheets Setup
 
-1. Create a Google Cloud Project and enable the **Google Sheets API** and **Google Drive API**.
+1. Create a Google Cloud Project and enable the **Google Sheets API** (and optionally **Google Drive API**).
 2. Create a **Service Account** and download its JSON key file (store outside git, e.g., `./secrets/google-sa.json`).
-3. Set `GOOGLE_SHEETS_CREDENTIALS_PATH=./secrets/google-sa.json` in `.env`.
+3. Set `GOOGLE_SHEETS_CREDENTIALS_PATH=./secrets/google-sa.json` (or `GOOGLE_SHEETS_CREDENTIALS_JSON`) in `.env`.
 4. Optional: Create a Google Spreadsheet manually, share it as **Editor** with the Service Account's `client_email`, and set `GOOGLE_SHEETS_SPREADSHEET_ID`. If left blank, FrontierAtlas creates a new workbook automatically.
-5. Run the pipeline with `--export-sheets`.
+5. Use **Export Google Sheets** (full export) or **Sync Google Sheets** (incremental sync via Column A stable-ID deduplication) in the dashboard, or `--export-sheets` in Python CLI.
 
 Exported tabs match exact names:
 `Startups`, `Products`, `Research Papers`, `Jobs`, `News`, `Entity Mapping Log`.
 
-If credentials are missing or invalid, the exporter explicitly returns `success=False` and logs the error without claiming success; CSV export always remains available as a reliable fallback.
+If credentials are missing or invalid, the exporter explicitly sets status to `Not Connected` or `Sync Failed` and surfaces the exact error without fabricating success; CSV export always remains available as a reliable fallback.
 
 ---
 

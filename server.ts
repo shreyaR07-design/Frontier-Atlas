@@ -133,7 +133,7 @@ async function startServer(): Promise<void> {
     }
 
     const rawLimit = Number(req.body?.limit ?? 20);
-    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(1, Math.floor(rawLimit)), 1000) : 20;
+    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(1, Math.floor(rawLimit)), 1500) : 20;
     const rawPage = Number(req.body?.page ?? 1);
     const page = Number.isFinite(rawPage) ? Math.min(Math.max(1, Math.floor(rawPage)), 100) : 1;
 
@@ -164,9 +164,15 @@ async function startServer(): Promise<void> {
         currentRun.finishedAt = new Date().toISOString();
         currentRun.result = result;
         currentRun.status = "completed";
+        const syncNote =
+          result && typeof result === "object" && "sheetsSync" in result && result.sheetsSync
+            ? (result.sheetsSync as { success?: boolean; error?: string | null }).success
+              ? " Google Sheets incremental sync succeeded."
+              : ` Google Sheets sync failed: ${(result.sheetsSync as { error?: string | null }).error ?? "unknown error"}`
+            : "";
         currentRun.logs = [
           ...currentRun.logs,
-          "Pipeline run completed and persisted to SQLite + CSV.",
+          `Pipeline run completed and persisted to SQLite + CSV.${syncNote}`,
         ].slice(-80);
       })
       .catch((err) => {
@@ -230,12 +236,46 @@ async function startServer(): Promise<void> {
     }
   });
 
-  app.post("/api/atlas/export/sheets", async (_req, res) => {
+  const extractSheetsOpts = (req: express.Request) => {
+    const authHeader = req.headers.authorization;
+    const oauthAccessToken =
+      typeof authHeader === "string" && authHeader.toLowerCase().startsWith("bearer ")
+        ? authHeader.slice(7).trim() || null
+        : null;
+    const rawSheetId = typeof req.body?.spreadsheetId === "string" ? req.body.spreadsheetId.trim() : "";
+    return {
+      oauthAccessToken,
+      spreadsheetId: rawSheetId || null,
+    };
+  };
+
+  app.post("/api/atlas/export/sheets", async (req, res) => {
     try {
-      const result = await atlas.exportGoogleSheets();
+      const result = await atlas.exportGoogleSheets(extractSheetsOpts(req));
       res.json(result);
     } catch (err) {
       res.status(500).json({ success: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post("/api/atlas/sync/sheets", async (req, res) => {
+    try {
+      const result = await atlas.syncGoogleSheets(extractSheetsOpts(req));
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ success: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post("/api/atlas/sheets/verify", async (req, res) => {
+    try {
+      const result = await atlas.verifyGoogleSheetsConnection(extractSheetsOpts(req));
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({
+        status: "Sync Failed",
+        lastError: err instanceof Error ? err.message : String(err),
+      });
     }
   });
 

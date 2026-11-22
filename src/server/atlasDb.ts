@@ -21,6 +21,7 @@ export const ALLOWED_DATASET_TABLES = new Set([
   "canonical_entities",
   "failure_logs",
   "verification_audit_log",
+  "sheets_sync_state",
 ]);
 
 export const VERIFICATION_STATUSES = [
@@ -41,9 +42,9 @@ const SCHEMA_DDL_STATEMENTS: string[] = [
     entity_type TEXT NOT NULL,
     primary_domain TEXT,
     aliases_json TEXT NOT NULL DEFAULT '[]',
-    created_at TEXT NOT NULL,
-    UNIQUE(entity_type, normalized_name)
+    created_at TEXT NOT NULL
   );`,
+  `CREATE INDEX IF NOT EXISTS idx_canonical_type_norm ON canonical_entities(entity_type, normalized_name);`,
   `CREATE TABLE IF NOT EXISTS startups (
     startup_id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -201,6 +202,21 @@ const SCHEMA_DDL_STATEMENTS: string[] = [
   );`,
   `CREATE INDEX IF NOT EXISTS idx_audit_category_record ON verification_audit_log(category, record_id);`,
   `CREATE INDEX IF NOT EXISTS idx_audit_checked_at ON verification_audit_log(checked_at);`,
+  `CREATE TABLE IF NOT EXISTS sheets_sync_state (
+    id TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'Not Connected',
+    spreadsheet_id TEXT,
+    spreadsheet_url TEXT,
+    last_sync_mode TEXT,
+    last_attempt_at TEXT,
+    last_success_at TEXT,
+    tab_row_counts_json TEXT NOT NULL DEFAULT '{}',
+    tab_statuses_json TEXT NOT NULL DEFAULT '{}',
+    rows_added INTEGER NOT NULL DEFAULT 0,
+    rows_updated INTEGER NOT NULL DEFAULT 0,
+    rows_unchanged INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT
+  );`,
 ];
 
 const TRACEABILITY_COLUMNS: Array<[string, string]> = [
@@ -357,6 +373,16 @@ export interface AuditEntryInput {
   checked_at?: string;
 }
 
+export interface TabExportStatus {
+  tabName: string;
+  status: "success" | "failed";
+  expectedRows: number;
+  writtenRows: number;
+  verifiedRows: number;
+  error: string | null;
+  message: string;
+}
+
 export function sha256Prefix(input: string, len = 16): string {
   return crypto.createHash("sha256").update(input, "utf-8").digest("hex").slice(0, len);
 }
@@ -399,6 +425,36 @@ export class AtlasDatabase {
         }
         conn.exec(`CREATE INDEX IF NOT EXISTS idx_${table}_verification ON ${table}(verification_status);`);
       }
+      // Migrate legacy canonical_entities table if it still has strict UNIQUE(entity_type, normalized_name)
+      const ceMaster = conn
+        .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'canonical_entities';")
+        .get() as { sql?: string } | undefined;
+      if (ceMaster?.sql && /UNIQUE\s*\(\s*entity_type\s*,\s*normalized_name\s*\)/i.test(ceMaster.sql)) {
+        conn.exec(`
+          CREATE TABLE canonical_entities_migrated (
+            canonical_id TEXT PRIMARY KEY,
+            canonical_name TEXT NOT NULL,
+            normalized_name TEXT NOT NULL,
+            entity_type TEXT NOT NULL,
+            primary_domain TEXT,
+            aliases_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL
+          );
+          INSERT OR IGNORE INTO canonical_entities_migrated
+            SELECT canonical_id, canonical_name, normalized_name, entity_type, primary_domain, aliases_json, created_at
+            FROM canonical_entities;
+          DROP TABLE canonical_entities;
+          ALTER TABLE canonical_entities_migrated RENAME TO canonical_entities;
+          CREATE INDEX IF NOT EXISTS idx_canonical_type_norm ON canonical_entities(entity_type, normalized_name);
+        `);
+      }
+
+      const sheetsInfoRows = conn.prepare("PRAGMA table_info(sheets_sync_state);").all() as Array<{ name: string }>;
+      const sheetsCols = new Set(sheetsInfoRows.map((r) => String(r.name)));
+      if (!sheetsCols.has("tab_statuses_json")) {
+        conn.exec("ALTER TABLE sheets_sync_state ADD COLUMN tab_statuses_json TEXT NOT NULL DEFAULT '{}';");
+      }
+
       conn.exec("COMMIT");
       this.initialized = true;
     } catch (err) {
@@ -419,9 +475,9 @@ export class AtlasDatabase {
       throw new Error(`Unsupported dataset table: ${tableName}`);
     }
     if (limit !== undefined) {
-      return this.fetchAll(`SELECT * FROM ${tableName} LIMIT ?;`, limit);
+      return this.fetchAll(`SELECT * FROM ${tableName} ORDER BY rowid ASC LIMIT ?;`, limit);
     }
-    return this.fetchAll(`SELECT * FROM ${tableName};`);
+    return this.fetchAll(`SELECT * FROM ${tableName} ORDER BY rowid ASC;`);
   }
 
   public countRecords(): Record<string, number> {
@@ -523,6 +579,16 @@ export class AtlasDatabase {
     if (records.length === 0) return 0;
     this.initializeSchema();
     const conn = this.getConnection();
+    const existingRows = conn.prepare("SELECT startup_id, name, source_url FROM startups;").all() as Array<{
+      startup_id: string;
+      name: string;
+      source_url: string;
+    }>;
+    const existingByKey = new Map<string, string>();
+    for (const row of existingRows) {
+      existingByKey.set(`${row.name}\u0000${row.source_url}`, String(row.startup_id));
+    }
+
     const stmt = conn.prepare(`
       INSERT INTO startups (
         startup_id, name, description, website, official_website, industry, location,
@@ -556,25 +622,28 @@ export class AtlasDatabase {
     conn.exec("BEGIN");
     try {
       for (const r of records) {
+        const key = `${r.name}\u0000${r.source_url}`;
+        const sid = existingByKey.get(key) ?? r.startup_id;
+        existingByKey.set(key, sid);
         stmt.run(
-          r.startup_id,
+          sid,
           r.name,
-          r.description,
-          r.website,
-          r.official_website,
-          r.industry,
-          r.location,
-          r.founding_date,
+          r.description ?? null,
+          r.website ?? null,
+          r.official_website ?? null,
+          r.industry || "Unknown",
+          r.location || "Unknown",
+          r.founding_date ?? null,
           r.source_name,
           r.source_url,
-          r.source_title,
+          r.source_title ?? null,
           r.collected_at,
-          r.last_checked_at,
-          JSON.stringify(r.supported_fields),
-          r.verification_status,
-          r.rejection_reason,
-          r.canonical_entity_id,
-          JSON.stringify(r.source_metadata)
+          r.last_checked_at ?? null,
+          JSON.stringify(r.supported_fields ?? []),
+          r.verification_status ?? "Unverified",
+          r.rejection_reason ?? null,
+          r.canonical_entity_id ?? null,
+          JSON.stringify(r.source_metadata ?? {})
         );
       }
       conn.exec("COMMIT");
@@ -589,6 +658,16 @@ export class AtlasDatabase {
     if (records.length === 0) return 0;
     this.initializeSchema();
     const conn = this.getConnection();
+    const existingRows = conn.prepare("SELECT product_id, name, source_url FROM products;").all() as Array<{
+      product_id: string;
+      name: string;
+      source_url: string;
+    }>;
+    const existingByKey = new Map<string, string>();
+    for (const row of existingRows) {
+      existingByKey.set(`${row.name}\u0000${row.source_url}`, String(row.product_id));
+    }
+
     const stmt = conn.prepare(`
       INSERT INTO products (
         product_id, name, description, website, official_website, category, company_name,
@@ -620,24 +699,27 @@ export class AtlasDatabase {
     conn.exec("BEGIN");
     try {
       for (const r of records) {
+        const key = `${r.name}\u0000${r.source_url}`;
+        const pid = existingByKey.get(key) ?? r.product_id;
+        existingByKey.set(key, pid);
         stmt.run(
-          r.product_id,
+          pid,
           r.name,
-          r.description,
-          r.website,
-          r.official_website,
-          r.category,
-          r.company_name,
+          r.description ?? null,
+          r.website ?? null,
+          r.official_website ?? null,
+          r.category || "Unknown",
+          r.company_name || "Unknown",
           r.source_name,
           r.source_url,
-          r.source_title,
+          r.source_title ?? null,
           r.collected_at,
-          r.last_checked_at,
-          JSON.stringify(r.supported_fields),
-          r.verification_status,
-          r.rejection_reason,
-          r.canonical_entity_id,
-          JSON.stringify(r.source_metadata)
+          r.last_checked_at ?? null,
+          JSON.stringify(r.supported_fields ?? []),
+          r.verification_status ?? "Unverified",
+          r.rejection_reason ?? null,
+          r.canonical_entity_id ?? null,
+          JSON.stringify(r.source_metadata ?? {})
         );
       }
       conn.exec("COMMIT");
@@ -695,23 +777,23 @@ export class AtlasDatabase {
         stmt.run(
           pid,
           r.title,
-          r.abstract,
-          JSON.stringify(r.authors),
-          r.publication_date,
-          r.doi,
-          r.arxiv_id,
-          r.github_repository,
-          r.github_stars,
-          r.official_website,
+          r.abstract ?? null,
+          JSON.stringify(r.authors ?? []),
+          r.publication_date ?? null,
+          r.doi ?? null,
+          r.arxiv_id ?? null,
+          r.github_repository ?? null,
+          r.github_stars ?? null,
+          r.official_website ?? null,
           r.source_name,
           r.source_url,
-          r.source_title,
+          r.source_title ?? null,
           r.collected_at,
-          r.last_checked_at,
-          JSON.stringify(r.supported_fields),
-          r.verification_status,
-          r.rejection_reason,
-          JSON.stringify(r.source_metadata)
+          r.last_checked_at ?? null,
+          JSON.stringify(r.supported_fields ?? []),
+          r.verification_status ?? "Unverified",
+          r.rejection_reason ?? null,
+          JSON.stringify(r.source_metadata ?? {})
         );
       }
       conn.exec("COMMIT");
@@ -763,23 +845,23 @@ export class AtlasDatabase {
         stmt.run(
           r.job_id,
           r.title,
-          r.company,
-          r.location,
-          r.employment_type,
-          r.description,
+          r.company || "Unknown",
+          r.location || "Unknown",
+          r.employment_type || "Unknown",
+          r.description ?? null,
           r.posted_at,
           r.application_url,
-          r.official_website,
+          r.official_website ?? null,
           r.source_name,
           r.source_url,
-          r.source_title,
+          r.source_title ?? null,
           r.collected_at,
-          r.last_checked_at,
-          JSON.stringify(r.supported_fields),
-          r.verification_status,
-          r.rejection_reason,
-          r.canonical_company_id,
-          JSON.stringify(r.source_metadata)
+          r.last_checked_at ?? null,
+          JSON.stringify(r.supported_fields ?? []),
+          r.verification_status ?? "Unverified",
+          r.rejection_reason ?? null,
+          r.canonical_company_id ?? null,
+          JSON.stringify(r.source_metadata ?? {})
         );
       }
       conn.exec("COMMIT");
@@ -825,21 +907,21 @@ export class AtlasDatabase {
         stmt.run(
           r.news_id,
           r.headline,
-          r.summary,
-          r.publisher,
+          r.summary ?? null,
+          r.publisher || "Unknown",
           r.published_at,
           r.article_url,
-          r.official_website,
-          r.category,
-          r.source_name,
+          r.official_website ?? null,
+          r.category || "ai_news",
+          r.source_name ?? null,
           r.source_url,
-          r.source_title,
+          r.source_title ?? null,
           r.collected_at,
-          r.last_checked_at,
-          JSON.stringify(r.supported_fields),
-          r.verification_status,
-          r.rejection_reason,
-          JSON.stringify(r.source_metadata)
+          r.last_checked_at ?? null,
+          JSON.stringify(r.supported_fields ?? []),
+          r.verification_status ?? "Unverified",
+          r.rejection_reason ?? null,
+          JSON.stringify(r.source_metadata ?? {})
         );
       }
       conn.exec("COMMIT");
@@ -871,8 +953,8 @@ export class AtlasDatabase {
           e.canonical_name,
           e.normalized_name,
           e.entity_type,
-          e.primary_domain,
-          e.aliases_json,
+          e.primary_domain ?? null,
+          e.aliases_json ?? "[]",
           e.created_at
         );
       }
@@ -888,6 +970,23 @@ export class AtlasDatabase {
     if (logs.length === 0) return 0;
     this.initializeSchema();
     const conn = this.getConnection();
+    const existingRows = conn
+      .prepare("SELECT mapping_id, raw_name, canonical_id, source_url, match_method FROM entity_mapping_log;")
+      .all() as Array<{
+      mapping_id: string;
+      raw_name: string;
+      canonical_id: string;
+      source_url: string;
+      match_method: string;
+    }>;
+    const existingByComposite = new Map<string, string>();
+    for (const row of existingRows) {
+      existingByComposite.set(
+        `${row.raw_name}\u0000${row.canonical_id}\u0000${row.source_url}\u0000${row.match_method}`,
+        String(row.mapping_id)
+      );
+    }
+
     const stmt = conn.prepare(`
       INSERT INTO entity_mapping_log (
         mapping_id, raw_name, normalized_name, canonical_name, canonical_id,
@@ -903,8 +1002,11 @@ export class AtlasDatabase {
     conn.exec("BEGIN");
     try {
       for (const entry of logs) {
+        const compKey = `${entry.raw_name}\u0000${entry.canonical_id}\u0000${entry.source_url}\u0000${entry.match_method}`;
+        const mid = existingByComposite.get(compKey) ?? entry.mapping_id;
+        existingByComposite.set(compKey, mid);
         stmt.run(
-          entry.mapping_id,
+          mid,
           entry.raw_name,
           entry.normalized_name,
           entry.canonical_name,
@@ -1039,5 +1141,118 @@ export class AtlasDatabase {
       .prepare(`DELETE FROM ${tableName} WHERE ${idCol} IN (${placeholders});`)
       .run(...ids);
     return Number(res.changes ?? 0);
+  }
+
+  public getSheetsSyncState(): {
+    status: "Connected" | "Not Connected" | "Sync Failed";
+    spreadsheetId: string | null;
+    spreadsheetUrl: string | null;
+    lastSyncMode: string | null;
+    lastAttemptAt: string | null;
+    lastSuccessAt: string | null;
+    tabRowCounts: Record<string, number>;
+    tabStatuses: Record<string, TabExportStatus>;
+    rowsAdded: number;
+    rowsUpdated: number;
+    rowsUnchanged: number;
+    lastError: string | null;
+  } | null {
+    this.initializeSchema();
+    const conn = this.getConnection();
+    const row = conn
+      .prepare("SELECT * FROM sheets_sync_state WHERE id = 'default';")
+      .get() as Record<string, unknown> | undefined;
+    if (!row) return null;
+    let tabRowCounts: Record<string, number> = {};
+    try {
+      const parsed = JSON.parse(String(row.tab_row_counts_json ?? "{}"));
+      if (parsed && typeof parsed === "object") {
+        tabRowCounts = parsed as Record<string, number>;
+      }
+    } catch {
+      tabRowCounts = {};
+    }
+    let tabStatuses: Record<string, TabExportStatus> = {};
+    try {
+      const parsed = JSON.parse(String(row.tab_statuses_json ?? "{}"));
+      if (parsed && typeof parsed === "object") {
+        tabStatuses = parsed as Record<string, TabExportStatus>;
+      }
+    } catch {
+      tabStatuses = {};
+    }
+    const rawStatus = String(row.status ?? "Not Connected");
+    const status =
+      rawStatus === "Connected" || rawStatus === "Sync Failed" ? rawStatus : "Not Connected";
+    return {
+      status,
+      spreadsheetId: (row.spreadsheet_id as string | null) ?? null,
+      spreadsheetUrl: (row.spreadsheet_url as string | null) ?? null,
+      lastSyncMode: (row.last_sync_mode as string | null) ?? null,
+      lastAttemptAt: (row.last_attempt_at as string | null) ?? null,
+      lastSuccessAt: (row.last_success_at as string | null) ?? null,
+      tabRowCounts,
+      tabStatuses,
+      rowsAdded: Number(row.rows_added ?? 0),
+      rowsUpdated: Number(row.rows_updated ?? 0),
+      rowsUnchanged: Number(row.rows_unchanged ?? 0),
+      lastError: (row.last_error as string | null) ?? null,
+    };
+  }
+
+  public saveSheetsSyncState(state: {
+    status: "Connected" | "Not Connected" | "Sync Failed";
+    spreadsheetId: string | null;
+    spreadsheetUrl: string | null;
+    lastSyncMode: string | null;
+    lastAttemptAt: string | null;
+    lastSuccessAt: string | null;
+    tabRowCounts: Record<string, number>;
+    tabStatuses?: Record<string, TabExportStatus>;
+    rowsAdded: number;
+    rowsUpdated: number;
+    rowsUnchanged: number;
+    lastError: string | null;
+  }): void {
+    this.initializeSchema();
+    const conn = this.getConnection();
+    conn
+      .prepare(
+        `INSERT INTO sheets_sync_state (
+          id, status, spreadsheet_id, spreadsheet_url, last_sync_mode,
+          last_attempt_at, last_success_at, tab_row_counts_json, tab_statuses_json,
+          rows_added, rows_updated, rows_unchanged, last_error
+        ) VALUES ('default', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          status = excluded.status,
+          spreadsheet_id = COALESCE(excluded.spreadsheet_id, sheets_sync_state.spreadsheet_id),
+          spreadsheet_url = COALESCE(excluded.spreadsheet_url, sheets_sync_state.spreadsheet_url),
+          last_sync_mode = excluded.last_sync_mode,
+          last_attempt_at = excluded.last_attempt_at,
+          last_success_at = COALESCE(excluded.last_success_at, sheets_sync_state.last_success_at),
+          tab_row_counts_json = CASE
+            WHEN excluded.status = 'Connected' THEN excluded.tab_row_counts_json
+            ELSE sheets_sync_state.tab_row_counts_json
+          END,
+          tab_statuses_json = excluded.tab_statuses_json,
+          rows_added = excluded.rows_added,
+          rows_updated = excluded.rows_updated,
+          rows_unchanged = excluded.rows_unchanged,
+          last_error = excluded.last_error;`
+      )
+      .run(
+        state.status,
+        state.spreadsheetId,
+        state.spreadsheetUrl,
+        state.lastSyncMode,
+        state.lastAttemptAt,
+        state.lastSuccessAt,
+        JSON.stringify(state.tabRowCounts ?? {}),
+        JSON.stringify(state.tabStatuses ?? {}),
+        state.rowsAdded,
+        state.rowsUpdated,
+        state.rowsUnchanged,
+        state.lastError
+      );
   }
 }

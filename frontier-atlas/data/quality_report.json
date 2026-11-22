@@ -1,44 +1,55 @@
 {
-  "generated_at_utc": "2026-11-21T11:30:11.896074+00:00",
+  "generated_at_utc": "2026-11-22T02:39:24.851Z",
   "categories": {
-    "startups": {
-      "discovered": 5,
-      "extracted": 5,
-      "validated": 5,
+    "research_papers": {
+      "discovered": 944,
+      "extracted": 944,
+      "validated": 944,
       "rejected": 0,
       "duplicates": 0,
-      "persisted_total": 23,
+      "persisted_total": 952,
       "target_minimum": 1000,
       "target_met": false,
       "verification_breakdown": {
-        "Verified": 1,
-        "Partially Verified": 4,
-        "Unverified": 0,
+        "Verified": 583,
+        "Partially Verified": 95,
+        "Unverified": 262,
         "Source Unavailable": 0,
-        "Rejected": 0
+        "Rejected": 4
       },
-      "missing_fields": {},
+      "missing_fields": {
+        "doi": 100,
+        "github_repository": 878,
+        "github_stars": 879,
+        "arxiv_id": 844,
+        "abstract": 345,
+        "authors": 74
+      },
       "source_distribution": {
-        "yc_oss_directory": 5
+        "huggingface_daily_papers": 100,
+        "openalex": 585,
+        "crossref": 259
       },
       "freshness": null,
       "sample_rejection_reasons": []
     }
   },
   "entity_resolution": {
-    "total_logged": 5,
+    "total_logged": 0,
     "exact_match": 0,
     "auto_merge": 0,
     "manual_review": 0,
-    "new_entity": 5,
+    "new_entity": 0,
     "rejected": 0
   },
   "verification_summary": {
-    "Verified": 1,
-    "Partially Verified": 4,
-    "Unverified": 0,
+    "Verified": 583,
+    "Partially Verified": 95,
+    "Unverified": 262,
     "Source Unavailable": 0,
-    "Rejected": 0
+    "Rejected": 4
   },
-  "unavailable_sources": []
+  "unavailable_sources": [
+    "arxiv"
+  ]
 }

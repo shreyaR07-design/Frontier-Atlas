@@ -136,6 +136,33 @@ export interface AuditTrailEntry {
   checked_at: string;
 }
 
+export interface TabExportStatus {
+  tabName: string;
+  status: "success" | "failed";
+  expectedRows: number;
+  writtenRows: number;
+  verifiedRows: number;
+  error: string | null;
+  message: string;
+}
+
+export interface SheetsStatusPayload {
+  status: "Connected" | "Not Connected" | "Sync Failed";
+  configured: boolean;
+  credentialSource: "path" | "json_env" | null;
+  spreadsheetId: string | null;
+  spreadsheetUrl: string | null;
+  lastSyncAt: string | null;
+  lastAttemptAt: string | null;
+  lastMode: string | null;
+  tabRowCounts: Record<string, number>;
+  tabStatuses?: Record<string, TabExportStatus>;
+  rowsAdded: number;
+  rowsUpdated: number;
+  rowsUnchanged: number;
+  lastError: string | null;
+}
+
 export interface AtlasStatusResponse {
   counts: Record<DatasetCategory, number>;
   verificationCounts?: VerificationCountsPayload;
@@ -156,6 +183,7 @@ export interface AtlasStatusResponse {
     googleSheetsConfigured: boolean;
     googleSheetsSpreadsheetId: boolean;
   };
+  sheetsStatus?: SheetsStatusPayload;
   storage: {
     backend: string;
     sqlitePath: string | null;

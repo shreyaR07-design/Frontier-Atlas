@@ -12,10 +12,10 @@ interface RunCollectionModalProps {
 
 const RUNNABLE_CATEGORIES = [
   { id: "startups", label: "Startups (YC OSS directory & official websites)" },
-  { id: "products", label: "Products (GitHub Search API & Show HN)" },
-  { id: "research_papers", label: "Research Papers (arXiv, OpenAlex, Crossref)" },
-  { id: "jobs", label: "Jobs (24h UTC: Arbeitnow, Remotive, Greenhouse)" },
-  { id: "news", label: "News (24h UTC: RSS/Atom & HN Algolia)" },
+  { id: "products", label: "Products (HF Spaces, GitHub Search API & Show HN)" },
+  { id: "research_papers", label: "Research Papers (HF Daily Papers, arXiv, OpenAlex, Crossref & GitHub stars)" },
+  { id: "jobs", label: "Jobs (24h UTC: 9 distinct job boards)" },
+  { id: "news", label: "News (24h UTC: 12+ AI RSS/Atom feeds & HN Algolia)" },
 ];
 
 export function RunCollectionModal({
@@ -69,9 +69,10 @@ export function RunCollectionModal({
         </div>
 
         <p className="text-xs text-slate-400 leading-relaxed">
-          Executes the Python <code className="text-slate-300">PipelineOrchestrator</code> against
-          real public APIs and feeds, verifies every record against its source URL, resolves
-          entities, and persists results to SQLite and CSV.
+          Executes the <code className="text-slate-300">AtlasBackendService</code> collectors against
+          real public APIs and feeds with <code className="text-slate-300">robots.txt</code> compliance,
+          verifies every record against its source URL, resolves entities, persists to SQLite + CSV, and
+          incrementally syncs Google Sheets when configured.
         </p>
 
         {missingNotices.length > 0 && (
@@ -117,12 +118,12 @@ export function RunCollectionModal({
               id="limit-input"
               type="number"
               min={1}
-              max={1000}
+              max={1500}
               value={limit}
               onChange={(e) => {
                 const v = Number(e.target.value);
                 if (Number.isFinite(v)) {
-                  setLimit(Math.min(1000, Math.max(1, Math.floor(v))));
+                  setLimit(Math.min(1500, Math.max(1, Math.floor(v))));
                 }
               }}
               className="w-full px-3 py-2 rounded-lg bg-[#070D1A] border border-slate-800 text-sm font-mono tabular-nums text-slate-100 focus:outline-none focus:ring-2 focus:ring-sky-500"
@@ -152,7 +153,7 @@ export function RunCollectionModal({
 
         <div className="flex flex-wrap items-center gap-1.5 text-xs">
           <span className="text-slate-500 mr-1">Presets:</span>
-          {[10, 25, 50, 100, 500, 1000].map((preset) => (
+          {[10, 25, 100, 500, 1000, 1200].map((preset) => (
             <button
               key={preset}
               type="button"

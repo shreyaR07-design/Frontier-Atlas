@@ -8,7 +8,15 @@ import { Menu, Play, RefreshCw } from "lucide-react";
 import { DatasetView } from "./components/DatasetView";
 import { OverviewPanel } from "./components/OverviewPanel";
 import { RunCollectionModal } from "./components/RunCollectionModal";
+import { SheetsConfirmModal } from "./components/SheetsConfirmModal";
 import { Sidebar } from "./components/Sidebar";
+import {
+  clearGoogleAccessToken,
+  getGoogleAccessToken,
+  googleSignIn,
+  googleSignOut,
+  initGoogleAuth,
+} from "./lib/googleWorkspaceAuth";
 import type {
   AnyDatasetRow,
   AtlasStatusResponse,
@@ -64,6 +72,12 @@ export default function App() {
   const [runModalOpen, setRunModalOpen] = useState(false);
   const [auditing, setAuditing] = useState(false);
   const [sheetsExporting, setSheetsExporting] = useState(false);
+  const [sheetsSyncing, setSheetsSyncing] = useState(false);
+  const [sheetsConfirmMode, setSheetsConfirmMode] = useState<"full" | "incremental" | null>(null);
+  const [targetSpreadsheetId, setTargetSpreadsheetId] = useState("");
+  const [googleSigningIn, setGoogleSigningIn] = useState(false);
+  const [googleUserEmail, setGoogleUserEmail] = useState<string | null>(null);
+  const [googleHasToken, setGoogleHasToken] = useState(false);
   const [sheetsFeedback, setSheetsFeedback] = useState<{
     success: boolean;
     message: string;
@@ -140,6 +154,26 @@ export default function App() {
     void loadStatus();
     void loadFailures();
   }, [loadStatus, loadFailures]);
+
+  useEffect(() => {
+    const unsubscribe = initGoogleAuth(
+      (user, hasToken) => {
+        setGoogleUserEmail(user.email || user.displayName || "Google Account");
+        setGoogleHasToken(hasToken);
+      },
+      () => {
+        setGoogleUserEmail(null);
+        setGoogleHasToken(false);
+      }
+    );
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (status?.sheetsStatus?.spreadsheetId && !targetSpreadsheetId) {
+      setTargetSpreadsheetId(status.sheetsStatus.spreadsheetId);
+    }
+  }, [status?.sheetsStatus?.spreadsheetId, targetSpreadsheetId]);
 
   useEffect(() => {
     if (activeSection !== "overview") {
@@ -238,24 +272,104 @@ export default function App() {
     }
   };
 
-  const handleExportSheets = async () => {
-    setSheetsExporting(true);
+  const handleGoogleSignIn = async () => {
+    setGoogleSigningIn(true);
     setSheetsFeedback(null);
     try {
-      const resp = await fetch("/api/atlas/export/sheets", { method: "POST" });
+      const { user } = await googleSignIn();
+      setGoogleUserEmail(user.email || user.displayName || "Google Account");
+      setGoogleHasToken(true);
+      setSheetsFeedback({
+        success: true,
+        message: `Connected Google account (${user.email || "authenticated"}). You can now export or sync directly to Google Sheets.`,
+      });
+    } catch (err) {
+      setSheetsFeedback({
+        success: false,
+        message: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setGoogleSigningIn(false);
+    }
+  };
+
+  const handleGoogleSignOut = async () => {
+    await googleSignOut();
+    setGoogleUserEmail(null);
+    setGoogleHasToken(false);
+    setSheetsFeedback({
+      success: true,
+      message: "Signed out of Google Workspace session.",
+    });
+  };
+
+  const executeSheetsAction = async (mode: "full" | "incremental") => {
+    setSheetsConfirmMode(null);
+    const isFull = mode === "full";
+    if (isFull) setSheetsExporting(true);
+    else setSheetsSyncing(true);
+    setSheetsFeedback(null);
+
+    try {
+      const token = getGoogleAccessToken();
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (token) {
+        headers.Authorization = `Bearer ${token}`;
+      }
+      const resp = await fetch(isFull ? "/api/atlas/export/sheets" : "/api/atlas/sync/sheets", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          spreadsheetId: targetSpreadsheetId.trim() || undefined,
+        }),
+      });
       const data = await resp.json();
+      await loadStatus();
       if (data.success) {
-        setSheetsFeedback({
-          success: true,
-          message: "Google Sheets export completed across all 6 tabs.",
-          url: data.spreadsheetUrl,
-        });
+        if (data.spreadsheetId) {
+          setTargetSpreadsheetId(String(data.spreadsheetId));
+        }
+        const verifiedMap = (data.verifiedTabRowCounts || data.tabRowCounts || {}) as Record<string, number>;
+        const perTabText = [
+          "Startups",
+          "Products",
+          "Research Papers",
+          "Jobs",
+          "News",
+          "Entity Mapping Log",
+        ]
+          .map((t) => `${t}: ${Number(verifiedMap[t] ?? 0).toLocaleString()}`)
+          .join(" · ");
+        if (isFull) {
+          const verifiedTotal = Object.values(verifiedMap).reduce(
+            (a: number, b: unknown) => a + Number(b || 0),
+            0
+          );
+          setSheetsFeedback({
+            success: true,
+            message: `Google Sheets full export verified across all 6 tabs (${verifiedTotal.toLocaleString()} total rows — ${perTabText}).`,
+            url: data.spreadsheetUrl,
+          });
+        } else {
+          setSheetsFeedback({
+            success: true,
+            message: `Google Sheets incremental sync verified across all 6 tabs (+${Number(data.rowsAdded ?? 0).toLocaleString()} added, ${Number(data.rowsUpdated ?? 0).toLocaleString()} updated, ${Number(data.rowsUnchanged ?? 0).toLocaleString()} unchanged — ${perTabText}).`,
+            url: data.spreadsheetUrl,
+          });
+        }
       } else {
+        if (data.spreadsheetId) {
+          setTargetSpreadsheetId(String(data.spreadsheetId));
+        }
+        const errMsg = String(data.error || "Google Sheets operation failed.");
+        if (errMsg.includes("401")) {
+          clearGoogleAccessToken();
+          setGoogleHasToken(false);
+        }
         setSheetsFeedback({
           success: false,
-          message:
-            data.error ||
-            "Google Sheets credentials are not configured. Set GOOGLE_SHEETS_CREDENTIALS_PATH in frontier-atlas/.env.",
+          message: errMsg,
+          url: data.spreadsheetUrl || null,
         });
       }
     } catch (err) {
@@ -264,8 +378,44 @@ export default function App() {
         message: err instanceof Error ? err.message : String(err),
       });
     } finally {
-      setSheetsExporting(false);
+      if (isFull) setSheetsExporting(false);
+      else setSheetsSyncing(false);
     }
+  };
+
+  const startSheetsFlow = async (mode: "full" | "incremental") => {
+    setSheetsFeedback(null);
+    const token = getGoogleAccessToken();
+    const serviceAccountReady = Boolean(status?.credentials.googleSheetsConfigured);
+    if (!token && !serviceAccountReady) {
+      setGoogleSigningIn(true);
+      try {
+        const { user } = await googleSignIn();
+        setGoogleUserEmail(user.email || user.displayName || "Google Account");
+        setGoogleHasToken(true);
+        setSheetsConfirmMode(mode);
+      } catch (err) {
+        setSheetsFeedback({
+          success: false,
+          message:
+            err instanceof Error
+              ? `Google sign-in is required to create or write spreadsheets: ${err.message}`
+              : "Google sign-in is required to create or write spreadsheets.",
+        });
+      } finally {
+        setGoogleSigningIn(false);
+      }
+      return;
+    }
+    setSheetsConfirmMode(mode);
+  };
+
+  const handleExportSheets = () => {
+    void startSheetsFlow("full");
+  };
+
+  const handleSyncSheets = () => {
+    void startSheetsFlow("incremental");
   };
 
   const handleExportCsv = async () => {
@@ -367,11 +517,20 @@ export default function App() {
               runState={runState}
               auditing={auditing}
               sheetsExporting={sheetsExporting}
+              sheetsSyncing={sheetsSyncing}
               sheetsFeedback={sheetsFeedback}
+              googleUserEmail={googleUserEmail}
+              googleHasToken={googleHasToken}
+              googleSigningIn={googleSigningIn}
+              targetSpreadsheetId={targetSpreadsheetId}
+              onTargetSpreadsheetIdChange={setTargetSpreadsheetId}
+              onGoogleSignIn={handleGoogleSignIn}
+              onGoogleSignOut={handleGoogleSignOut}
               onSelectSection={handleSelectSection}
               onOpenRunModal={() => setRunModalOpen(true)}
               onAuditRecords={handleAuditRecords}
               onExportSheets={handleExportSheets}
+              onSyncSheets={handleSyncSheets}
               onExportCsv={handleExportCsv}
               onRetryStatus={loadStatus}
             />
@@ -399,6 +558,17 @@ export default function App() {
         credentials={status?.credentials ?? null}
         onClose={() => setRunModalOpen(false)}
         onStartRun={handleStartRun}
+      />
+
+      <SheetsConfirmModal
+        mode={sheetsConfirmMode}
+        spreadsheetId={targetSpreadsheetId}
+        counts={status?.counts ?? null}
+        googleEmail={googleHasToken ? googleUserEmail : null}
+        onCancel={() => setSheetsConfirmMode(null)}
+        onConfirm={() => {
+          if (sheetsConfirmMode) void executeSheetsAction(sheetsConfirmMode);
+        }}
       />
     </div>
   );

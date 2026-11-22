@@ -1,7 +1,5 @@
-import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { GoogleGenAI } from "@google/genai";
 import {
   AtlasDatabase,
   type AuditEntryInput,
@@ -15,8 +13,22 @@ import {
   type VerificationStatus,
   sha256Prefix,
 } from "./atlasDb.ts";
+import {
+  EXPORT_SPECS,
+  GoogleSheetsService,
+  type SheetsConnectionStatus,
+  type SheetsSyncResult,
+  formatExportCell,
+} from "./googleSheets.ts";
+import { PoliteHttpClient } from "./httpClient.ts";
+import {
+  GeminiLLMProvider,
+  LLMRouter,
+  OpenAICompatibleLLMProvider,
+} from "./llmRouter.ts";
 
 export interface AtlasConfig {
+  rootDir: string;
   atlasDir: string;
   dataDir: string;
   exportsDir: string;
@@ -28,17 +40,23 @@ export interface AtlasConfig {
   userAgent: string;
   requestTimeoutMs: number;
   maxConcurrency: number;
+  rateLimitPerSecond: number;
+  respectRobotsTxt: boolean;
   geminiApiKey: string | null;
   geminiModel: string;
   groqApiKey: string | null;
+  groqModel: string;
   deepseekApiKey: string | null;
+  deepseekModel: string;
   githubToken: string | null;
   googleSheetsCredentialsPath: string | null;
+  googleSheetsCredentialsJson: string | null;
   googleSheetsSpreadsheetId: string | null;
   googleSheetsSpreadsheetName: string;
 }
 
 export function loadAtlasConfig(atlasDir: string): AtlasConfig {
+  const rootDir = path.resolve(atlasDir, "..");
   const dataDir = path.resolve(atlasDir, "data");
   const exportsDir = path.resolve(dataDir, "exports");
   const rawDbUrl = process.env.DATABASE_URL || "sqlite:///data/frontier_atlas.db";
@@ -51,7 +69,16 @@ export function loadAtlasConfig(atlasDir: string): AtlasConfig {
     const n = Number(val);
     return Number.isFinite(n) && n > 0 ? Math.floor(n) : def;
   };
+  const parseFloatEnv = (val: string | undefined, def: number) => {
+    const n = Number(val);
+    return Number.isFinite(n) && n > 0 ? n : def;
+  };
+  const parseBoolEnv = (val: string | undefined, def: boolean) => {
+    if (val === undefined || val === "") return def;
+    return !["false", "0", "no", "off"].includes(val.trim().toLowerCase());
+  };
   return {
+    rootDir,
     atlasDir,
     dataDir,
     exportsDir,
@@ -62,13 +89,18 @@ export function loadAtlasConfig(atlasDir: string): AtlasConfig {
     targetResearchPapers: 1000,
     userAgent: process.env.USER_AGENT || "FrontierAtlasBot/1.0 (+https://github.com/frontier-atlas)",
     requestTimeoutMs: parseIntEnv(process.env.REQUEST_TIMEOUT_SECONDS, 20) * 1000,
-    maxConcurrency: Math.min(8, Math.max(1, parseIntEnv(process.env.MAX_CONCURRENCY, 6))),
+    maxConcurrency: Math.min(12, Math.max(1, parseIntEnv(process.env.MAX_CONCURRENCY, 8))),
+    rateLimitPerSecond: Math.min(20, Math.max(0.5, parseFloatEnv(process.env.RATE_LIMIT_PER_SECOND, 4))),
+    respectRobotsTxt: parseBoolEnv(process.env.RESPECT_ROBOTS_TXT, true),
     geminiApiKey: process.env.GEMINI_API_KEY?.trim() || null,
-    geminiModel: process.env.GEMINI_MODEL?.trim() || "gemini-4-hydrogen",
+    geminiModel: process.env.GEMINI_MODEL?.trim() || "gemini-2.5-flash",
     groqApiKey: process.env.GROQ_API_KEY?.trim() || null,
+    groqModel: process.env.GROQ_MODEL?.trim() || "llama-3.3-70b-versatile",
     deepseekApiKey: process.env.DEEPSEEK_API_KEY?.trim() || null,
+    deepseekModel: process.env.DEEPSEEK_MODEL?.trim() || "deepseek-chat",
     githubToken: process.env.GITHUB_TOKEN?.trim() || null,
     googleSheetsCredentialsPath: process.env.GOOGLE_SHEETS_CREDENTIALS_PATH?.trim() || null,
+    googleSheetsCredentialsJson: process.env.GOOGLE_SHEETS_CREDENTIALS_JSON?.trim() || null,
     googleSheetsSpreadsheetId: process.env.GOOGLE_SHEETS_SPREADSHEET_ID?.trim() || null,
     googleSheetsSpreadsheetName:
       process.env.GOOGLE_SHEETS_SPREADSHEET_NAME?.trim() || "FrontierAtlas Intelligence",
@@ -161,27 +193,57 @@ function findFirstGithubRepo(...texts: Array<string | null | undefined>): string
   return null;
 }
 
-function parseUtcDatetime(raw: unknown): Date | null {
+export function parseUtcDatetime(raw: unknown): Date | null {
   if (raw === null || raw === undefined) return null;
-  if (raw instanceof Date) return Number.isNaN(raw.getTime()) ? null : raw;
+  if (raw instanceof Date) {
+    if (Number.isNaN(raw.getTime())) return null;
+    const yr = raw.getUTCFullYear();
+    return yr >= 1970 && yr <= 2100 ? raw : null;
+  }
   if (typeof raw === "number" && Number.isFinite(raw)) {
+    if (raw < 10_000_000) return null; // Reject small non-epoch numbers like "2025"
     const ms = raw > 1e12 ? raw : raw * 1000;
     const d = new Date(ms);
-    return Number.isNaN(d.getTime()) ? null : d;
+    if (Number.isNaN(d.getTime())) return null;
+    const yr = d.getUTCFullYear();
+    return yr >= 1970 && yr <= 2100 ? d : null;
   }
   const s = String(raw).trim();
-  if (!s) return null;
+  if (!s || UNKNOWN_PLACEHOLDERS.has(s.toLowerCase())) return null;
+  // Reject vague relative or bare-year strings cleanly
+  if (/\b(?:ago|today|yesterday|recent|soon|just now)\b/i.test(s) || /^\d{4}$/.test(s)) {
+    return null;
+  }
   if (/^\d+(\.\d+)?$/.test(s)) {
     const n = Number(s);
+    if (n < 10_000_000) return null;
     const ms = n > 1e12 ? n : n * 1000;
     const d = new Date(ms);
+    if (Number.isNaN(d.getTime())) return null;
+    const yr = d.getUTCFullYear();
+    return yr >= 1970 && yr <= 2100 ? d : null;
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    const d = new Date(`${s}T00:00:00.000Z`);
     return Number.isNaN(d.getTime()) ? null : d;
   }
-  const d = new Date(s);
-  return Number.isNaN(d.getTime()) ? null : d;
+  if (/^\d{4}-\d{2}$/.test(s)) {
+    const d = new Date(`${s}-01T00:00:00.000Z`);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  // If ISO datetime omits timezone offset/Z, treat explicitly as UTC rather than host local time
+  const normalizedIso =
+    /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/.test(s)
+      ? `${s.replace(" ", "T")}Z`
+      : s;
+  const parsed = Date.parse(normalizedIso);
+  if (Number.isNaN(parsed)) return null;
+  const d = new Date(parsed);
+  const yr = d.getUTCFullYear();
+  return yr >= 1970 && yr <= 2100 ? d : null;
 }
 
-function isWithinFreshnessWindow(
+export function isWithinFreshnessWindow(
   dt: Date | null,
   ref: Date,
   windowHours = 24,
@@ -266,74 +328,24 @@ function extractXmlTags(block: string, tagName: string): string[] {
   return results;
 }
 
-async function fetchWithTimeout(
-  url: string,
-  opts: { headers?: Record<string, string>; timeoutMs?: number; userAgent?: string } = {}
-): Promise<{
-  url: string;
-  status: number;
-  ok: boolean;
-  content: string;
-  contentType: string;
-  error: string | null;
-}> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), opts.timeoutMs ?? 15000);
-  try {
-    const resp = await fetch(url, {
-      method: "GET",
-      redirect: "follow",
-      signal: controller.signal,
-      headers: {
-        "User-Agent": opts.userAgent || "FrontierAtlasBot/1.0 (+https://github.com/frontier-atlas)",
-        Accept: "application/json, text/html, application/xml, text/xml;q=0.9, */*;q=0.8",
-        ...opts.headers,
-      },
-    });
-    const contentType = resp.headers.get("content-type") || "";
-    const status = resp.status;
-    if (status === 401 || status === 403 || status === 451) {
-      return {
-        url: resp.url || url,
-        status,
-        ok: false,
-        content: "",
-        contentType,
-        error: `access_restricted_http_${status}`,
-      };
-    }
-    const content = await resp.text();
-    if (!resp.ok) {
-      return {
-        url: resp.url || url,
-        status,
-        ok: false,
-        content: content.slice(0, 500),
-        contentType,
-        error: `http_${status}`,
-      };
-    }
-    return {
-      url: resp.url || url,
-      status,
-      ok: true,
-      content,
-      contentType,
-      error: null,
-    };
-  } catch (err) {
-    const msg = err instanceof Error ? (err.name === "AbortError" ? "timeout" : err.message) : String(err);
-    return {
-      url,
-      status: 0,
-      ok: false,
-      content: "",
-      contentType: "",
-      error: msg,
-    };
-  } finally {
-    clearTimeout(timeout);
-  }
+function createLLMRouter(config: AtlasConfig): LLMRouter {
+  return new LLMRouter([
+    new GeminiLLMProvider(config.geminiApiKey, config.geminiModel),
+    new OpenAICompatibleLLMProvider({
+      providerName: "groq",
+      apiKey: config.groqApiKey,
+      model: config.groqModel,
+      endpointUrl: "https://api.groq.com/openai/v1/chat/completions",
+      timeoutMs: config.requestTimeoutMs,
+    }),
+    new OpenAICompatibleLLMProvider({
+      providerName: "deepseek",
+      apiKey: config.deepseekApiKey,
+      model: config.deepseekModel,
+      endpointUrl: "https://api.deepseek.com/v1/chat/completions",
+      timeoutMs: config.requestTimeoutMs,
+    }),
+  ]);
 }
 
 async function mapConcurrent<T, R>(
@@ -355,23 +367,22 @@ async function mapConcurrent<T, R>(
   return results;
 }
 
-// Optional Gemini extraction helper (server-side only via @google/genai)
+// Multi-tier LLM extraction helper with token-aware chunking and Gemini -> Groq -> DeepSeek fallback
 export async function extractStructuredWithGemini(
   config: AtlasConfig,
   rawText: string,
-  instruction: string
-): Promise<string | null> {
-  if (!config.geminiApiKey) return null;
-  try {
-    const ai = new GoogleGenAI({ apiKey: config.geminiApiKey });
-    const response = await ai.models.generateContent({
-      model: config.geminiModel,
-      contents: `${instruction}\n\n${rawText.slice(0, 8000)}`,
-    });
-    return response.text ?? null;
-  } catch {
-    return null;
-  }
+  category: string,
+  sourceUrl = "https://unknown.invalid"
+): Promise<Array<Record<string, unknown>>> {
+  const router = createLLMRouter(config);
+  if (!router.isConfigured()) return [];
+  const res = await router.extractStructured({
+    category,
+    sourceUrl,
+    sourceName: "llm_extraction",
+    sourceText: rawText,
+  });
+  return res.records;
 }
 
 // ---------- Source Verification ----------
@@ -535,10 +546,11 @@ interface SourceSnapshot {
   title: string | null;
   text: string;
   jsonPayload: unknown;
+  xmlItems: string[] | null;
   error: string | null;
 }
 
-function flattenJsonText(payload: unknown, maxChars = 120000): string {
+function flattenJsonText(payload: unknown, maxChars = 200000): string {
   const parts: string[] = [];
   let total = 0;
   const walk = (node: unknown): void => {
@@ -570,17 +582,25 @@ function extractJsonFeedTitle(payload: unknown): string | null {
   return null;
 }
 
+function stringifyObjectValues(item: Record<string, unknown>): string {
+  return Object.values(item)
+    .filter((v) => v !== null && v !== undefined)
+    .map((v) => (typeof v === "object" ? JSON.stringify(v) : String(v)))
+    .join(" ");
+}
+
 function matchJsonItemText(
   payload: unknown,
   primaryValue: string,
-  fallbackUrl?: string | null
+  fallbackUrl?: string | null,
+  sourceUrlHint?: string | null
 ): string | null {
   let items: Array<Record<string, unknown>> = [];
   if (Array.isArray(payload)) {
     items = payload.filter((x): x is Record<string, unknown> => Boolean(x && typeof x === "object"));
   } else if (payload && typeof payload === "object") {
     const obj = payload as Record<string, unknown>;
-    for (const key of ["items", "results", "jobs", "data", "hits"]) {
+    for (const key of ["items", "results", "jobs", "data", "hits", "works", "papers"]) {
       const v = obj[key];
       if (Array.isArray(v)) {
         items = v.filter((x): x is Record<string, unknown> => Boolean(x && typeof x === "object"));
@@ -590,22 +610,52 @@ function matchJsonItemText(
     if (items.length === 0) return null;
   }
   const targetNorm = normText(primaryValue);
+  const urlHints = [fallbackUrl, sourceUrlHint]
+    .filter((u): u is string => Boolean(u && typeof u === "string"))
+    .map((u) => u.toLowerCase());
+
   for (const item of items) {
+    const targetObj =
+      item.paper && typeof item.paper === "object" && !Array.isArray(item.paper)
+        ? (item.paper as Record<string, unknown>)
+        : item;
     const itemJson = JSON.stringify(item).toLowerCase();
-    if (fallbackUrl && itemJson.includes(fallbackUrl.toLowerCase())) {
-      return Object.values(item)
-        .filter((v) => v !== null && v !== undefined)
-        .map((v) => (typeof v === "object" ? JSON.stringify(v) : String(v)))
-        .join(" ");
-    }
-    for (const key of ["name", "title", "headline", "full_name"]) {
-      const v = item[key];
-      if (typeof v === "string" && normText(v) === targetNorm) {
-        return Object.values(item)
-          .filter((val) => val !== null && val !== undefined)
-          .map((val) => (typeof val === "object" ? JSON.stringify(val) : String(val)))
-          .join(" ");
+    for (const hint of urlHints) {
+      if (itemJson.includes(hint)) {
+        return stringifyObjectValues(item);
       }
+    }
+    for (const key of ["name", "title", "headline", "full_name", "jobTitle", "position", "text", "id"]) {
+      const v = targetObj[key] ?? item[key];
+      if (typeof v === "string" && targetNorm && (normText(v) === targetNorm || normText(v).endsWith(`/${targetNorm}`))) {
+        return stringifyObjectValues(item);
+      }
+    }
+  }
+  return null;
+}
+
+function matchXmlItemText(
+  xmlItems: string[],
+  primaryValue: string,
+  fallbackUrl?: string | null,
+  sourceUrlHint?: string | null
+): string | null {
+  const targetNorm = normText(primaryValue);
+  const urlHints = [fallbackUrl, sourceUrlHint]
+    .filter((u): u is string => Boolean(u && typeof u === "string"))
+    .map((u) => u.toLowerCase());
+
+  for (const item of xmlItems) {
+    const lowerItem = item.toLowerCase();
+    for (const hint of urlHints) {
+      if (lowerItem.includes(hint)) {
+        return stripHtmlToText(item);
+      }
+    }
+    const titleText = extractXmlTag(item, "title") ?? "";
+    if (targetNorm && (normText(titleText) === targetNorm || normText(titleText).includes(targetNorm))) {
+      return stripHtmlToText(item);
     }
   }
   return null;
@@ -614,9 +664,107 @@ function matchJsonItemText(
 class LiveSourceVerifier {
   private readonly cache = new Map<string, SourceSnapshot>();
   private readonly config: AtlasConfig;
+  private readonly http: PoliteHttpClient;
 
-  constructor(config: AtlasConfig) {
+  constructor(config: AtlasConfig, http: PoliteHttpClient) {
     this.config = config;
+    this.http = http;
+  }
+
+  public seedSnapshot(url: string, status: number, content: string, contentType: string): void {
+    if (!url || this.cache.has(url)) return;
+    const snap = this.buildSnapshot(url, status, true, content, contentType, null);
+    this.cache.set(url, snap);
+  }
+
+  private buildSnapshot(
+    url: string,
+    status: number,
+    ok: boolean,
+    body: string,
+    contentType: string,
+    error: string | null
+  ): SourceSnapshot {
+    if (!ok) {
+      return {
+        url,
+        status,
+        accessible: false,
+        title: null,
+        text: "",
+        jsonPayload: null,
+        xmlItems: null,
+        error: error || `http_${status}`,
+      };
+    }
+
+    const ctype = (contentType || "").toLowerCase();
+    const stripped = body.trimStart();
+
+    if (ctype.includes("application/pdf") || stripped.startsWith("%PDF-")) {
+      return {
+        url,
+        status,
+        accessible: true,
+        title: "PDF Document",
+        text: "",
+        jsonPayload: null,
+        xmlItems: null,
+        error: "pdf_binary_not_text",
+      };
+    }
+
+    if (ctype.includes("json") || stripped.startsWith("{") || stripped.startsWith("[")) {
+      try {
+        const payload = JSON.parse(body);
+        return {
+          url,
+          status,
+          accessible: true,
+          title: extractJsonFeedTitle(payload),
+          text: flattenJsonText(payload),
+          jsonPayload: payload,
+          xmlItems: null,
+          error: null,
+        };
+      } catch {
+        // Fall through to HTML/text extraction
+      }
+    }
+
+    if (
+      ctype.includes("xml") ||
+      stripped.startsWith("<?xml") ||
+      stripped.startsWith("<feed") ||
+      stripped.startsWith("<rss")
+    ) {
+      const title = extractXmlTag(body, "title");
+      const items = extractXmlTags(body, "item");
+      const entries = items.length > 0 ? items : extractXmlTags(body, "entry");
+      return {
+        url,
+        status,
+        accessible: true,
+        title,
+        text: stripHtmlToText(body).slice(0, 200000),
+        jsonPayload: null,
+        xmlItems: entries.length > 0 ? entries : null,
+        error: null,
+      };
+    }
+
+    const title = extractHtmlTitle(body);
+    const text = `${title ?? ""} ${stripHtmlToText(body)}`.trim();
+    return {
+      url,
+      status,
+      accessible: true,
+      title,
+      text,
+      jsonPayload: null,
+      xmlItems: null,
+      error: null,
+    };
   }
 
   private isPlaceholderUrl(url: string | null | undefined): boolean {
@@ -627,102 +775,23 @@ class LiveSourceVerifier {
     return /\.(?:example|test|invalid|localhost)$/.test(dom);
   }
 
-  private async fetchSnapshot(url: string): Promise<SourceSnapshot> {
+  private async fetchSnapshot(url: string, opts: { maxAttempts?: number; timeoutMs?: number } = {}): Promise<SourceSnapshot> {
     if (!isValidHttpUrl(url)) {
-      return { url, status: 0, accessible: false, title: null, text: "", jsonPayload: null, error: "invalid_url" };
+      return { url, status: 0, accessible: false, title: null, text: "", jsonPayload: null, xmlItems: null, error: "invalid_url" };
     }
     const existing = this.cache.get(url);
     if (existing) return existing;
 
-    const res = await fetchWithTimeout(url, {
-      timeoutMs: Math.min(this.config.requestTimeoutMs, 18000),
-      userAgent: this.config.userAgent,
-      headers: this.config.githubToken && url.includes("api.github.com")
-        ? { Authorization: `Bearer ${this.config.githubToken}` }
-        : undefined,
+    const res = await this.http.fetch(url, {
+      timeoutMs: opts.timeoutMs ?? Math.min(this.config.requestTimeoutMs, 10000),
+      maxAttempts: opts.maxAttempts ?? 2,
+      headers:
+        this.config.githubToken && url.includes("api.github.com")
+          ? { Authorization: `Bearer ${this.config.githubToken}` }
+          : undefined,
     });
 
-    let snap: SourceSnapshot;
-    if (!res.ok) {
-      snap = {
-        url: res.url || url,
-        status: res.status,
-        accessible: false,
-        title: null,
-        text: "",
-        jsonPayload: null,
-        error: res.error || `http_${res.status}`,
-      };
-    } else {
-      const body = res.content || "";
-      const ctype = (res.contentType || "").toLowerCase();
-      const stripped = body.trimStart();
-
-      if (ctype.includes("application/pdf") || stripped.startsWith("%PDF-")) {
-        snap = {
-          url: res.url || url,
-          status: res.status,
-          accessible: true,
-          title: "PDF Document",
-          text: "",
-          jsonPayload: null,
-          error: "pdf_binary_not_text",
-        };
-      } else if (ctype.includes("json") || stripped.startsWith("{") || stripped.startsWith("[")) {
-        try {
-          const payload = JSON.parse(body);
-          snap = {
-            url: res.url || url,
-            status: res.status,
-            accessible: true,
-            title: extractJsonFeedTitle(payload),
-            text: flattenJsonText(payload),
-            jsonPayload: payload,
-            error: null,
-          };
-        } catch {
-          snap = {
-            url: res.url || url,
-            status: res.status,
-            accessible: true,
-            title: extractHtmlTitle(body),
-            text: stripHtmlToText(body),
-            jsonPayload: null,
-            error: null,
-          };
-        }
-      } else if (
-        ctype.includes("xml") ||
-        stripped.startsWith("<?xml") ||
-        stripped.startsWith("<feed") ||
-        stripped.startsWith("<rss")
-      ) {
-        const title = extractXmlTag(body, "title");
-        const text = stripHtmlToText(body).slice(0, 120000);
-        snap = {
-          url: res.url || url,
-          status: res.status,
-          accessible: true,
-          title,
-          text,
-          jsonPayload: null,
-          error: null,
-        };
-      } else {
-        const title = extractHtmlTitle(body);
-        const text = `${title ?? ""} ${stripHtmlToText(body)}`.trim();
-        snap = {
-          url: res.url || url,
-          status: res.status,
-          accessible: true,
-          title,
-          text,
-          jsonPayload: null,
-          error: null,
-        };
-      }
-    }
-
+    const snap = this.buildSnapshot(res.url || url, res.status, res.ok, res.content || "", res.contentType || "", res.error);
     this.cache.set(url, snap);
     return snap;
   }
@@ -730,7 +799,7 @@ class LiveSourceVerifier {
   public async verifyRecord(
     category: "startups" | "products" | "research_papers" | "jobs" | "news",
     rec: Record<string, unknown>,
-    opts: { liveCheck: boolean; duplicateOf?: string | null; checkedAtIso: string }
+    opts: { liveCheck: boolean; bulkSnapshotOnly?: boolean; duplicateOf?: string | null; checkedAtIso: string }
   ): Promise<Record<string, unknown>> {
     const now = new Date(opts.checkedAtIso);
     const sourceUrl = String(rec.source_url ?? "");
@@ -856,28 +925,40 @@ class LiveSourceVerifier {
     const fetchSourceUrl = sourceUrl.startsWith("http://arxiv.org/")
       ? `https://${sourceUrl.slice("http://".length)}`
       : sourceUrl;
-    const primarySnap = await this.fetchSnapshot(fetchSourceUrl);
+    const seededApiUrl = typeof meta.api_url === "string" && isValidHttpUrl(meta.api_url) ? meta.api_url : null;
+    const useSeededApiSnapshot =
+      Boolean(opts.bulkSnapshotOnly && seededApiUrl && this.cache.has(seededApiUrl) && !this.cache.has(fetchSourceUrl));
+
+    if (useSeededApiSnapshot) {
+      meta.verification_mode = "live_api_snapshot_check";
+    }
+
+    const primarySnap = useSeededApiSnapshot
+      ? this.cache.get(seededApiUrl!)!
+      : await this.fetchSnapshot(fetchSourceUrl);
 
     let secondaryUrl: string | null = null;
-    if (category === "startups" || category === "products") {
-      secondaryUrl = ((out.official_website as string | null) || (out.website as string | null)) ?? null;
-    } else if (category === "jobs") {
-      secondaryUrl = (rec.application_url as string | null) ?? null;
-    } else if (category === "news") {
-      secondaryUrl = (rec.article_url as string | null) ?? null;
-    } else if (category === "research_papers") {
-      let cand = (meta.openalex_api_url as string | null) || (rec.official_website as string | null) || null;
-      if (cand && cand.includes("openalex.org/W") && !cand.includes("api.openalex.org")) {
-        const wId = cand.replace(/\/+$/, "").split("/").pop();
-        cand = `https://api.openalex.org/works/${wId}`;
+    if (!useSeededApiSnapshot) {
+      if (category === "startups" || category === "products") {
+        secondaryUrl = ((out.official_website as string | null) || (out.website as string | null)) ?? null;
+      } else if (category === "jobs") {
+        secondaryUrl = (rec.application_url as string | null) ?? null;
+      } else if (category === "news") {
+        secondaryUrl = (rec.article_url as string | null) ?? null;
+      } else if (category === "research_papers") {
+        let cand = (meta.openalex_api_url as string | null) || (rec.official_website as string | null) || null;
+        if (cand && cand.includes("openalex.org/W") && !cand.includes("api.openalex.org")) {
+          const wId = cand.replace(/\/+$/, "").split("/").pop();
+          cand = `https://api.openalex.org/works/${wId}`;
+        }
+        if (!cand && rec.arxiv_id) {
+          cand = `https://export.arxiv.org/api/query?id_list=${rec.arxiv_id}`;
+        }
+        if (!cand && rec.doi) {
+          cand = `https://api.crossref.org/works/${rec.doi}`;
+        }
+        secondaryUrl = cand;
       }
-      if (!cand && rec.arxiv_id) {
-        cand = `https://export.arxiv.org/api/query?id_list=${rec.arxiv_id}`;
-      }
-      if (!cand && rec.doi) {
-        cand = `https://api.crossref.org/works/${rec.doi}`;
-      }
-      secondaryUrl = cand;
     }
 
     if (secondaryUrl === sourceUrl || secondaryUrl === fetchSourceUrl) {
@@ -885,7 +966,9 @@ class LiveSourceVerifier {
     }
 
     const secondarySnap =
-      secondaryUrl && isValidHttpUrl(secondaryUrl) ? await this.fetchSnapshot(secondaryUrl) : null;
+      secondaryUrl && isValidHttpUrl(secondaryUrl)
+        ? await this.fetchSnapshot(secondaryUrl, { maxAttempts: 1, timeoutMs: 5500 })
+        : null;
 
     meta.source_http_status = primarySnap.status;
     if (primarySnap.error) meta.source_error = primarySnap.error;
@@ -944,8 +1027,11 @@ class LiveSourceVerifier {
     const primaryClaim = String(rec.name ?? rec.title ?? rec.headline ?? "");
     let primaryEvidenceText = primarySnap.text;
     if (primarySnap.jsonPayload !== null) {
-      const matchedItem = matchJsonItemText(primarySnap.jsonPayload, primaryClaim, secondaryUrl);
+      const matchedItem = matchJsonItemText(primarySnap.jsonPayload, primaryClaim, secondaryUrl, fetchSourceUrl);
       primaryEvidenceText = matchedItem ?? "";
+    } else if (primarySnap.xmlItems !== null) {
+      const matchedXml = matchXmlItemText(primarySnap.xmlItems, primaryClaim, secondaryUrl, fetchSourceUrl);
+      primaryEvidenceText = matchedXml ?? primarySnap.text;
     }
     const combinedText = [primaryEvidenceText, secondarySnap?.accessible ? secondarySnap.text : ""]
       .filter(Boolean)
@@ -1632,23 +1718,99 @@ class EntityResolver {
 type RawRecord = Record<string, unknown>;
 type CollectorError = { source: string; url: string; error: string };
 
+const AI_ROLE_TITLE_OR_TAG_RE =
+  /\b(ai|artificial intelligence|machine learning|deep learning|llm|large language model|generative ai|genai|nlp|natural language|computer vision|mlops|ai\/ml|data scien|robotics|foundation model|research scientist|research engineer|inference|alignment|transformer|rag|agentic|pytorch|tensorflow|neural|copilot|autonomous)\b/i;
+
+const AI_DESC_STRONG_RE =
+  /\b(artificial intelligence|machine learning|deep learning|large language model|generative ai|computer vision|natural language processing|mlops|ai engineer|ai architect|ai scientist|ai researcher|llm|neural network|foundation model)\b/i;
+
+const AI_NEWS_RE =
+  /\b(ai|artificial intelligence|machine learning|deep learning|llm|llms|large language model|generative|chatgpt|openai|anthropic|claude|gemini|deepseek|mistral|hugging face|huggingface|pytorch|neural|transformer|diffusion|robotics|autonomous|nvidia|agentic|rag|reasoning model|copilot|midjourney|meta ai|xai|grok|cohere|perplexity|alignment|safety benchmark)\b/i;
+
+function isAiNativeJobBoard(sourceName: string): boolean {
+  return /^(?:greenhouse|ashby):(?:anthropic|scaleai|xai|togetherai|openai|perplexity|cohere|cursor|elevenlabs|harvey)$/.test(
+    sourceName
+  );
+}
+
+function isQualifyingAiJob(
+  sourceName: string,
+  title: string,
+  tagsOrSkills: string[],
+  category: string,
+  description: string | null
+): boolean {
+  if (isAiNativeJobBoard(sourceName)) return true;
+  if (AI_ROLE_TITLE_OR_TAG_RE.test(title)) return true;
+  if (AI_ROLE_TITLE_OR_TAG_RE.test(category)) return true;
+  if (tagsOrSkills.some((t) => AI_ROLE_TITLE_OR_TAG_RE.test(t))) return true;
+  if (description && AI_DESC_STRONG_RE.test(description.slice(0, 1200))) return true;
+  return false;
+}
+
+function isQualifyingAiNews(sourceName: string, headline: string, summary: string | null): boolean {
+  const dedicatedAiFeeds = new Set([
+    "huggingface_blog",
+    "mit_news_ai",
+    "google_blog",
+    "techcrunch_ai",
+    "openai_news",
+    "wired_ai",
+    "marktechpost",
+    "the_decoder",
+    "theverge_ai",
+    "siliconangle_ai",
+  ]);
+  if (dedicatedAiFeeds.has(sourceName)) return true;
+  return AI_NEWS_RE.test(headline) || Boolean(summary && AI_NEWS_RE.test(summary.slice(0, 800)));
+}
+
+function parseLinkNextUrl(linkHeader: string | null | undefined): string | null {
+  if (!linkHeader) return null;
+  for (const part of linkHeader.split(",")) {
+    if (part.includes('rel="next"') || part.includes("rel='next'")) {
+      const m = part.match(/<([^>]+)>/);
+      if (m?.[1] && isValidHttpUrl(m[1])) return m[1];
+    }
+  }
+  return null;
+}
+
 async function collectStartups(
   config: AtlasConfig,
+  http: PoliteHttpClient,
+  llmRouter: LLMRouter,
+  verifier: LiveSourceVerifier,
   limit: number,
   page: number
 ): Promise<{ records: RawRecord[]; errors: CollectorError[]; hasMore: boolean }> {
   const url = "https://yc-oss.github.io/api/companies/all.json";
-  const res = await fetchWithTimeout(url, { timeoutMs: config.requestTimeoutMs, userAgent: config.userAgent });
-  if (!res.ok) return { records: [], errors: [{ source: "yc_oss_directory", url, error: res.error || "fetch_failed" }], hasMore: false };
+  const res = await http.fetch(url, { timeoutMs: config.requestTimeoutMs });
+  if (!res.ok) {
+    return {
+      records: [],
+      errors: [{ source: "yc_oss_directory", url, error: res.error || "fetch_failed" }],
+      hasMore: false,
+    };
+  }
+  verifier.seedSnapshot(url, res.status, res.content, res.contentType);
 
   let companies: unknown;
   try {
     companies = JSON.parse(res.content);
   } catch (err) {
-    return { records: [], errors: [{ source: "yc_oss_directory", url, error: `invalid_json: ${String(err)}` }], hasMore: false };
+    return {
+      records: [],
+      errors: [{ source: "yc_oss_directory", url, error: `invalid_json: ${String(err)}` }],
+      hasMore: false,
+    };
   }
   if (!Array.isArray(companies)) {
-    return { records: [], errors: [{ source: "yc_oss_directory", url, error: "unexpected_payload_shape" }], hasMore: false };
+    return {
+      records: [],
+      errors: [{ source: "yc_oss_directory", url, error: "unexpected_payload_shape" }],
+      hasMore: false,
+    };
   }
 
   const ordered = companies
@@ -1696,6 +1858,7 @@ async function collectStartups(
       source_url: normalizeUrl(sourceUrl),
       collected_at: nowIso,
       source_metadata: {
+        api_url: url,
         batch: item.batch ?? null,
         status: item.status ?? null,
         team_size: item.team_size ?? null,
@@ -1704,91 +1867,206 @@ async function collectStartups(
       },
     });
   }
+
+  // Optional polite LLM enrichment for small runs when records lack descriptions
+  if (llmRouter.isConfigured() && limit <= 25) {
+    const incomplete = records.filter((r) => (!r.description || r.industry === "Unknown") && r.website).slice(0, 3);
+    for (const rec of incomplete) {
+      const siteUrl = String(rec.website);
+      const pageRes = await http.fetch(siteUrl, { timeoutMs: 7000, maxAttempts: 1, deduplicate: true });
+      if (!pageRes.ok || !pageRes.content) continue;
+      const text = stripHtmlToText(pageRes.content).slice(0, 12000);
+      if (text.length < 100) continue;
+      const llmRes = await llmRouter.extractStructured({
+        category: "startups",
+        sourceUrl: siteUrl,
+        sourceName: "yc_oss_directory_llm",
+        sourceText: text,
+      });
+      const hit = llmRes.records[0];
+      if (hit) {
+        if (!rec.description && typeof hit.description === "string" && hit.description.trim()) {
+          rec.description = hit.description.trim().slice(0, 3500);
+        }
+        if (rec.industry === "Unknown" && typeof hit.industry === "string" && hit.industry.trim()) {
+          rec.industry = normalizeUnknownText(hit.industry);
+        }
+        const meta = (rec.source_metadata as Record<string, unknown>) || {};
+        meta.llm_enrichment_provider = llmRes.providerUsed;
+        rec.source_metadata = meta;
+      }
+    }
+  }
+
   return { records, errors: [], hasMore };
 }
 
 async function collectProducts(
   config: AtlasConfig,
+  http: PoliteHttpClient,
+  verifier: LiveSourceVerifier,
   limit: number,
   page: number
 ): Promise<{ records: RawRecord[]; errors: CollectorError[]; hasMore: boolean }> {
   const safePage = Math.max(1, page);
-  const ghTarget = Math.max(1, Math.round(limit * 0.7));
-  const hnTarget = Math.max(0, limit - ghTarget);
   const errors: CollectorError[] = [];
+  const hfRecords: RawRecord[] = [];
   const ghRecords: RawRecord[] = [];
   const hnRecords: RawRecord[] = [];
   const nowIso = new Date().toISOString();
 
-  const ghHeaders: Record<string, string> = { Accept: "application/vnd.github+json" };
-  if (config.githubToken) ghHeaders.Authorization = `Bearer ${config.githubToken}`;
+  const ghTarget = config.githubToken ? Math.round(limit * 0.4) : Math.min(250, Math.round(limit * 0.3));
+  const hnTarget = Math.min(500, Math.round(limit * 0.3));
+  const hfTarget = Math.max(limit - ghTarget - hnTarget, Math.round(limit * 0.45));
 
-  const seenUrls = new Set<string>();
-  for (const query of ["topic:ai stars:>100", "topic:developer-tools stars:>200"]) {
-    let curPage = safePage;
-    while (ghRecords.length < ghTarget && curPage < safePage + 5) {
-      const perPage = Math.min(100, ghTarget - ghRecords.length);
-      const url = `https://api.github.com/search/repositories?q=${encodeURIComponent(query)}&sort=stars&order=desc&per_page=${perPage}&page=${curPage}`;
-      const res = await fetchWithTimeout(url, {
-        headers: ghHeaders,
-        timeoutMs: config.requestTimeoutMs,
-        userAgent: config.userAgent,
-      });
+  // Source A: Hugging Face Spaces (cursor paginated, fast, no auth needed)
+  const fetchHfSpaces = async () => {
+    let nextUrl: string | null = `https://huggingface.co/api/spaces?sort=likes&direction=-1&limit=100`;
+    let pageIdx = 1;
+    // Skip cursor pages if page > 1
+    const maxPagesToWalk = safePage + Math.ceil((hfTarget + 200) / 100) + 2;
+    const seenHf = new Set<string>();
+
+    while (nextUrl && pageIdx <= maxPagesToWalk && hfRecords.length < limit) {
+      const curUrl = nextUrl;
+      const res = await http.fetch(curUrl, { timeoutMs: config.requestTimeoutMs });
       if (!res.ok) {
-        errors.push({ source: "github_search", url, error: res.error || "fetch_failed" });
+        errors.push({ source: "huggingface_spaces", url: curUrl, error: res.error || "fetch_failed" });
         break;
       }
-      let payload: Record<string, unknown>;
-      try {
-        payload = JSON.parse(res.content);
-      } catch (err) {
-        errors.push({ source: "github_search", url, error: `invalid_json: ${String(err)}` });
-        break;
-      }
-      const items = Array.isArray(payload.items) ? (payload.items as Array<Record<string, unknown>>) : [];
-      if (items.length === 0) break;
-      for (const repo of items) {
-        const name = String(repo.name ?? "").trim();
-        const htmlUrl = String(repo.html_url ?? "").trim();
-        if (!name || !htmlUrl || seenUrls.has(htmlUrl)) continue;
-        seenUrls.add(htmlUrl);
-        const homepage = validateOptionalUrl(repo.homepage);
-        const topics = Array.isArray(repo.topics) ? repo.topics : [];
-        const category = normalizeUnknownText(topics[0] ?? repo.language);
-        const owner = normalizeUnknownText((repo.owner as Record<string, unknown> | undefined)?.login);
-        ghRecords.push({
-          name,
-          description: String(repo.description ?? "").trim() || null,
-          website: homepage || htmlUrl,
-          official_website: homepage || htmlUrl,
-          category,
-          company_name: owner,
-          source_name: "github_repositories",
-          source_url: normalizeUrl(htmlUrl),
-          collected_at: nowIso,
-          source_metadata: {
-            stars: repo.stargazers_count ?? null,
-            language: repo.language ?? null,
-            full_name: repo.full_name ?? null,
-          },
-        });
-      }
-      if (items.length < perPage) break;
-      curPage++;
-    }
-  }
+      verifier.seedSnapshot(curUrl, res.status, res.content, res.contentType);
 
-  if (hnTarget > 0) {
-    const hnPage = Math.max(0, safePage - 1);
-    const perPage = Math.min(100, hnTarget);
-    const url = `https://hn.algolia.com/api/v1/search_by_date?tags=show_hn&hitsPerPage=${perPage}&page=${hnPage}`;
-    const res = await fetchWithTimeout(url, { timeoutMs: config.requestTimeoutMs, userAgent: config.userAgent });
-    if (!res.ok) {
-      errors.push({ source: "show_hn", url, error: res.error || "fetch_failed" });
-    } else {
+      try {
+        const items = JSON.parse(res.content);
+        if (!Array.isArray(items) || items.length === 0) break;
+        if (pageIdx >= safePage) {
+          for (const sp of items as Array<Record<string, unknown>>) {
+            const spId = String(sp.id ?? "").trim();
+            if (!spId || seenHf.has(spId)) continue;
+            seenHf.add(spId);
+            const parts = spId.split("/");
+            const owner = parts.length > 1 ? parts[0] : "HuggingFace";
+            const name = parts.length > 1 ? parts.slice(1).join("/") : spId;
+            const spaceUrl = normalizeUrl(`https://huggingface.co/spaces/${spId}`);
+            const sdk = normalizeUnknownText(sp.sdk || "AI Space");
+            const likes = typeof sp.likes === "number" ? sp.likes : null;
+            const runtimeStage = (sp.runtime as Record<string, unknown> | undefined)?.stage ?? null;
+            hfRecords.push({
+              name: name.slice(0, 200),
+              description: `Hugging Face Space (${sdk})${likes !== null ? ` with ${likes} likes` : ""} by ${owner}.`,
+              website: spaceUrl,
+              official_website: spaceUrl,
+              category: sdk === "Unknown" ? "AI Space" : sdk,
+              company_name: normalizeUnknownText(owner),
+              source_name: "huggingface_spaces",
+              source_url: spaceUrl,
+              collected_at: nowIso,
+              source_metadata: {
+                api_url: curUrl,
+                space_id: spId,
+                likes,
+                sdk: sp.sdk ?? null,
+                runtime_stage: runtimeStage,
+                created_at: sp.createdAt ?? null,
+              },
+            });
+          }
+        }
+      } catch (err) {
+        errors.push({ source: "huggingface_spaces", url: curUrl, error: `invalid_json: ${String(err)}` });
+        break;
+      }
+      nextUrl = parseLinkNextUrl(res.headers.link);
+      pageIdx++;
+    }
+  };
+
+  // Source B: GitHub Repositories Search (respects 403/429 gracefully)
+  const fetchGithubProducts = async () => {
+    const ghHeaders: Record<string, string> = { Accept: "application/vnd.github+json" };
+    if (config.githubToken) ghHeaders.Authorization = `Bearer ${config.githubToken}`;
+    const seenUrls = new Set<string>();
+    const queries = [
+      "topic:ai stars:>100",
+      "topic:llm stars:>50",
+      "topic:developer-tools stars:>200",
+      "topic:machine-learning stars:>200",
+    ];
+    let hitRateLimit = false;
+    for (const query of queries) {
+      if (hitRateLimit || ghRecords.length >= Math.max(ghTarget, limit * 0.45)) break;
+      let curPage = safePage;
+      while (ghRecords.length < Math.max(ghTarget, limit * 0.45) && curPage < safePage + 4) {
+        const url = `https://api.github.com/search/repositories?q=${encodeURIComponent(query)}&sort=stars&order=desc&per_page=100&page=${curPage}`;
+        const res = await http.fetch(url, {
+          headers: ghHeaders,
+          timeoutMs: config.requestTimeoutMs,
+          maxAttempts: 2,
+        });
+        if (!res.ok) {
+          errors.push({ source: "github_search", url, error: res.error || "fetch_failed" });
+          if (res.status === 403 || res.status === 429) hitRateLimit = true;
+          break;
+        }
+        verifier.seedSnapshot(url, res.status, res.content, res.contentType);
+        try {
+          const payload = JSON.parse(res.content) as Record<string, unknown>;
+          const items = Array.isArray(payload.items) ? (payload.items as Array<Record<string, unknown>>) : [];
+          if (items.length === 0) break;
+          for (const repo of items) {
+            const name = String(repo.name ?? "").trim();
+            const htmlUrl = String(repo.html_url ?? "").trim();
+            if (!name || !htmlUrl || seenUrls.has(htmlUrl)) continue;
+            seenUrls.add(htmlUrl);
+            const homepage = validateOptionalUrl(repo.homepage);
+            const topics = Array.isArray(repo.topics) ? repo.topics : [];
+            const category = normalizeUnknownText(topics[0] ?? repo.language);
+            const owner = normalizeUnknownText((repo.owner as Record<string, unknown> | undefined)?.login);
+            ghRecords.push({
+              name,
+              description: String(repo.description ?? "").trim() || null,
+              website: homepage || htmlUrl,
+              official_website: homepage || htmlUrl,
+              category,
+              company_name: owner,
+              source_name: "github_repositories",
+              source_url: normalizeUrl(htmlUrl),
+              collected_at: nowIso,
+              source_metadata: {
+                api_url: url,
+                stars: repo.stargazers_count ?? null,
+                forks: repo.forks_count ?? null,
+                language: repo.language ?? null,
+                full_name: repo.full_name ?? null,
+              },
+            });
+          }
+          if (items.length < 100) break;
+          curPage++;
+        } catch (err) {
+          errors.push({ source: "github_search", url, error: `invalid_json: ${String(err)}` });
+          break;
+        }
+      }
+    }
+  };
+
+  // Source C: Show HN Algolia (multi-page)
+  const fetchShowHn = async () => {
+    const pagesToFetch = Math.min(6, Math.max(1, Math.ceil(hnTarget / 80)));
+    for (let offset = 0; offset < pagesToFetch && hnRecords.length < limit; offset++) {
+      const hnPage = Math.max(0, safePage - 1) + offset;
+      const url = `https://hn.algolia.com/api/v1/search_by_date?tags=show_hn&hitsPerPage=100&page=${hnPage}`;
+      const res = await http.fetch(url, { timeoutMs: config.requestTimeoutMs });
+      if (!res.ok) {
+        errors.push({ source: "show_hn", url, error: res.error || "fetch_failed" });
+        break;
+      }
+      verifier.seedSnapshot(url, res.status, res.content, res.contentType);
       try {
         const payload = JSON.parse(res.content) as Record<string, unknown>;
         const hits = Array.isArray(payload.hits) ? (payload.hits as Array<Record<string, unknown>>) : [];
+        if (hits.length === 0) break;
         for (const hit of hits) {
           const rawTitle = String(hit.title ?? "").trim();
           const productUrl = validateOptionalUrl(hit.url);
@@ -1805,17 +2083,46 @@ async function collectProducts(
             source_name: "show_hn",
             source_url: normalizeUrl(hnItemUrl),
             collected_at: nowIso,
-            source_metadata: { points: hit.points ?? null, created_at: hit.created_at ?? null },
+            source_metadata: {
+              api_url: url,
+              points: hit.points ?? null,
+              created_at: hit.created_at ?? null,
+            },
           });
         }
       } catch (err) {
         errors.push({ source: "show_hn", url, error: `invalid_json: ${String(err)}` });
+        break;
       }
     }
+  };
+
+  await Promise.all([fetchHfSpaces(), fetchGithubProducts(), fetchShowHn()]);
+
+  // Blend cleanly across all sources and backfill up to limit from whichever sources succeeded
+  const merged: RawRecord[] = [];
+  const seenKey = new Set<string>();
+  const pushUnique = (rec: RawRecord) => {
+    const key = `${String(rec.name).toLowerCase()}|${String(rec.source_url).toLowerCase()}`;
+    if (seenKey.has(key)) return false;
+    seenKey.add(key);
+    merged.push(rec);
+    return true;
+  };
+
+  for (const r of ghRecords.slice(0, ghTarget)) pushUnique(r);
+  for (const r of hnRecords.slice(0, hnTarget)) pushUnique(r);
+  for (const r of hfRecords) {
+    if (merged.length >= limit) break;
+    pushUnique(r);
+  }
+  for (const r of [...ghRecords.slice(ghTarget), ...hnRecords.slice(hnTarget)]) {
+    if (merged.length >= limit) break;
+    pushUnique(r);
   }
 
-  const combined = [...ghRecords.slice(0, ghTarget), ...hnRecords.slice(0, hnTarget)].slice(0, limit);
-  return { records: combined, errors, hasMore: combined.length >= limit };
+  const finalRecords = merged.slice(0, limit);
+  return { records: finalRecords, errors, hasMore: finalRecords.length >= limit };
 }
 
 function reconstructOpenAlexAbstract(inv: unknown): string | null {
@@ -1834,24 +2141,91 @@ function reconstructOpenAlexAbstract(inv: unknown): string | null {
 
 async function collectResearchPapers(
   config: AtlasConfig,
+  http: PoliteHttpClient,
+  verifier: LiveSourceVerifier,
   limit: number,
   page: number
 ): Promise<{ records: RawRecord[]; errors: CollectorError[]; hasMore: boolean }> {
   const safePage = Math.max(1, page);
-  const perSource = Math.max(1, Math.floor(limit / 3) + 1);
   const errors: CollectorError[] = [];
-  const all: RawRecord[] = [];
+  const hfPapers: RawRecord[] = [];
+  const arxivPapers: RawRecord[] = [];
+  const oaPapers: RawRecord[] = [];
+  const crPapers: RawRecord[] = [];
   const nowIso = new Date().toISOString();
 
-  // 1. arXiv Atom API
-  {
-    const start = (safePage - 1) * perSource;
-    const arxivUrl = `https://export.arxiv.org/api/query?search_query=${encodeURIComponent("cat:cs.AI OR cat:cs.LG OR cat:cs.CL")}&start=${start}&max_results=${Math.min(50, perSource)}&sortBy=submittedDate&sortOrder=descending`;
-    const res = await fetchWithTimeout(arxivUrl, { timeoutMs: config.requestTimeoutMs, userAgent: config.userAgent });
+  // 1. Hugging Face Daily Papers (includes direct githubRepo + githubStars!)
+  const fetchHfPapers = async () => {
+    const url = "https://huggingface.co/api/daily_papers?limit=100";
+    const res = await http.fetch(url, { timeoutMs: config.requestTimeoutMs });
     if (!res.ok) {
-      errors.push({ source: "arxiv", url: arxivUrl, error: res.error || "fetch_failed" });
-    } else {
+      errors.push({ source: "huggingface_daily_papers", url, error: res.error || "fetch_failed" });
+      return;
+    }
+    verifier.seedSnapshot(url, res.status, res.content, res.contentType);
+    try {
+      const arr = JSON.parse(res.content);
+      if (!Array.isArray(arr)) return;
+      for (const item of arr as Array<Record<string, unknown>>) {
+        const paper = (item.paper as Record<string, unknown> | undefined) ?? item;
+        const paperIdRaw = String(paper.id ?? "").trim();
+        const title = String(paper.title ?? item.title ?? "").replace(/\s+/g, " ").trim();
+        if (!title || !paperIdRaw) continue;
+        const isArxivId = /^\d{4}\.\d{4,5}/.test(paperIdRaw);
+        const sourceUrl = isArxivId
+          ? `https://arxiv.org/abs/${paperIdRaw}`
+          : `https://huggingface.co/papers/${paperIdRaw}`;
+        const authorsRaw = Array.isArray(paper.authors) ? (paper.authors as Array<Record<string, unknown>>) : [];
+        const authors = authorsRaw
+          .map((a) => String(a.name ?? (a.user as Record<string, unknown> | undefined)?.fullname ?? "").trim())
+          .filter(Boolean);
+        const abstract = String(paper.summary ?? item.summary ?? "").replace(/\s+/g, " ").trim() || null;
+        const pubDt = parseUtcDatetime(paper.publishedAt ?? item.publishedAt);
+        const pubDate = pubDt ? pubDt.toISOString().slice(0, 10) : null;
+        const ghRepo = validateOptionalUrl(paper.githubRepo) || findFirstGithubRepo(abstract);
+        const ghStars = typeof paper.githubStars === "number" && paper.githubStars >= 0 ? paper.githubStars : null;
+        hfPapers.push({
+          title,
+          abstract,
+          authors,
+          publication_date: pubDate,
+          doi: null,
+          arxiv_id: isArxivId ? paperIdRaw : null,
+          github_repository: ghRepo ? findFirstGithubRepo(ghRepo) || ghRepo : null,
+          github_stars: ghStars,
+          official_website: `https://huggingface.co/papers/${paperIdRaw}`,
+          source_name: "huggingface_daily_papers",
+          source_url: normalizeUrl(sourceUrl),
+          collected_at: nowIso,
+          source_metadata: {
+            api_url: url,
+            upvotes: paper.upvotes ?? null,
+            ai_keywords: Array.isArray(paper.ai_keywords) ? paper.ai_keywords : [],
+            github_metrics: ghRepo ? { stars: ghStars, source: "huggingface_daily_papers" } : null,
+          },
+        });
+      }
+    } catch (err) {
+      errors.push({ source: "huggingface_daily_papers", url, error: `invalid_json: ${String(err)}` });
+    }
+  };
+
+  // 2. arXiv Atom API (100/page)
+  const fetchArxiv = async () => {
+    const pagesNeeded = Math.min(6, Math.max(1, Math.ceil((limit * 0.4) / 100)));
+    for (let offset = 0; offset < pagesNeeded && arxivPapers.length < limit; offset++) {
+      const pIdx = safePage - 1 + offset;
+      const start = pIdx * 100;
+      const maxRes = Math.min(100, Math.max(10, limit));
+      const arxivUrl = `https://export.arxiv.org/api/query?search_query=${encodeURIComponent("cat:cs.AI OR cat:cs.LG OR cat:cs.CL")}&start=${start}&max_results=${maxRes}&sortBy=submittedDate&sortOrder=descending`;
+      const res = await http.fetch(arxivUrl, { timeoutMs: Math.max(config.requestTimeoutMs, 25000) });
+      if (!res.ok) {
+        errors.push({ source: "arxiv", url: arxivUrl, error: res.error || "fetch_failed" });
+        break;
+      }
+      verifier.seedSnapshot(arxivUrl, res.status, res.content, res.contentType);
       const entries = extractXmlTags(res.content, "entry");
+      if (entries.length === 0) break;
       for (const entry of entries) {
         const title = (extractXmlTag(entry, "title") ?? "").replace(/\s+/g, " ").trim();
         let idUrl = (extractXmlTag(entry, "id") ?? "").trim();
@@ -1867,7 +2241,7 @@ async function collectResearchPapers(
           .map((a) => extractXmlTag(a, "name")?.trim() || "")
           .filter(Boolean);
         const githubRepo = findFirstGithubRepo(summary, comment);
-        all.push({
+        arxivPapers.push({
           title,
           abstract: summary,
           authors,
@@ -1880,23 +2254,30 @@ async function collectResearchPapers(
           source_name: "arxiv",
           source_url: normalizeUrl(idUrl),
           collected_at: nowIso,
-          source_metadata: { comment },
+          source_metadata: { api_url: arxivUrl, comment },
         });
       }
     }
-  }
+  };
 
-  // 2. OpenAlex API
-  {
-    const oaUrl = `https://api.openalex.org/works?search=${encodeURIComponent("artificial intelligence")}&per-page=${Math.min(50, Math.max(10, perSource))}&page=${safePage}&sort=publication_date:desc`;
-    const res = await fetchWithTimeout(oaUrl, { timeoutMs: config.requestTimeoutMs, userAgent: config.userAgent });
-    if (!res.ok) {
-      errors.push({ source: "openalex", url: oaUrl, error: res.error || "fetch_failed" });
-    } else {
+  // 3. OpenAlex API (100/page)
+  const fetchOpenAlex = async () => {
+    const pagesNeeded = Math.min(10, Math.max(1, Math.ceil((limit * 0.7) / 100)));
+    for (let offset = 0; offset < pagesNeeded && oaPapers.length < limit; offset++) {
+      const curPage = safePage + offset;
+      const perPage = Math.min(100, Math.max(15, limit));
+      const oaUrl = `https://api.openalex.org/works?search=${encodeURIComponent("artificial intelligence")}&per-page=${perPage}&page=${curPage}&sort=publication_date:desc`;
+      const res = await http.fetch(oaUrl, { timeoutMs: config.requestTimeoutMs });
+      if (!res.ok) {
+        errors.push({ source: "openalex", url: oaUrl, error: res.error || "fetch_failed" });
+        break;
+      }
+      verifier.seedSnapshot(oaUrl, res.status, res.content, res.contentType);
       try {
         const payload = JSON.parse(res.content) as Record<string, unknown>;
         const works = Array.isArray(payload.results) ? (payload.results as Array<Record<string, unknown>>) : [];
-        for (const work of works.slice(0, perSource)) {
+        if (works.length === 0) break;
+        for (const work of works) {
           const title = String(work.title ?? "").trim();
           const primaryLoc = (work.primary_location as Record<string, unknown>) || {};
           const landingUrl = String(primaryLoc.landing_page_url || work.id || "").trim();
@@ -1918,7 +2299,7 @@ async function collectResearchPapers(
           const arxivId = landingUrl.toLowerCase().includes("arxiv")
             ? landingUrl.replace(/\/+$/, "").split("/").pop() ?? null
             : null;
-          all.push({
+          oaPapers.push({
             title,
             abstract,
             authors,
@@ -1932,6 +2313,7 @@ async function collectResearchPapers(
             source_url: normalizeUrl(landingUrl),
             collected_at: nowIso,
             source_metadata: {
+              api_url: oaUrl,
               openalex_id: oaId,
               openalex_api_url: oaApiUrl,
               cited_by_count: work.cited_by_count ?? null,
@@ -1941,24 +2323,30 @@ async function collectResearchPapers(
         }
       } catch (err) {
         errors.push({ source: "openalex", url: oaUrl, error: `invalid_json: ${String(err)}` });
+        break;
       }
     }
-  }
+  };
 
-  // 3. Crossref API
-  {
-    const rows = Math.min(50, Math.max(5, perSource));
-    const offset = (safePage - 1) * rows;
-    const crUrl = `https://api.crossref.org/works?query=${encodeURIComponent("large language model")}&rows=${rows}&offset=${offset}&sort=published&order=desc`;
-    const res = await fetchWithTimeout(crUrl, { timeoutMs: config.requestTimeoutMs, userAgent: config.userAgent });
-    if (!res.ok) {
-      errors.push({ source: "crossref", url: crUrl, error: res.error || "fetch_failed" });
-    } else {
+  // 4. Crossref API (100/page)
+  const fetchCrossref = async () => {
+    const pagesNeeded = Math.min(6, Math.max(1, Math.ceil((limit * 0.4) / 100)));
+    for (let offsetIdx = 0; offsetIdx < pagesNeeded && crPapers.length < limit; offsetIdx++) {
+      const rows = Math.min(100, Math.max(10, limit));
+      const offset = (safePage - 1 + offsetIdx) * rows;
+      const crUrl = `https://api.crossref.org/works?query=${encodeURIComponent("large language model")}&rows=${rows}&offset=${offset}&sort=published&order=desc`;
+      const res = await http.fetch(crUrl, { timeoutMs: config.requestTimeoutMs });
+      if (!res.ok) {
+        errors.push({ source: "crossref", url: crUrl, error: res.error || "fetch_failed" });
+        break;
+      }
+      verifier.seedSnapshot(crUrl, res.status, res.content, res.contentType);
       try {
         const payload = JSON.parse(res.content) as Record<string, unknown>;
         const items =
           ((payload.message as Record<string, unknown> | undefined)?.items as Array<Record<string, unknown>>) || [];
-        for (const item of items.slice(0, perSource)) {
+        if (items.length === 0) break;
+        for (const item of items) {
           const titles = Array.isArray(item.title) ? item.title : [];
           const title = titles[0] ? String(titles[0]).trim() : "";
           const itemUrl = String(item.URL ?? "").trim();
@@ -1976,7 +2364,7 @@ async function collectResearchPapers(
             Array.isArray(dateParts) && dateParts.length > 0
               ? dateParts.map((p, idx) => (idx > 0 ? String(p).padStart(2, "0") : String(p))).join("-")
               : null;
-          all.push({
+          crPapers.push({
             title,
             abstract,
             authors,
@@ -1989,50 +2377,102 @@ async function collectResearchPapers(
             source_name: "crossref",
             source_url: normalizeUrl(itemUrl),
             collected_at: nowIso,
-            source_metadata: { publisher: item.publisher ?? null, type: item.type ?? null },
+            source_metadata: { api_url: crUrl, publisher: item.publisher ?? null, type: item.type ?? null },
           });
         }
       } catch (err) {
         errors.push({ source: "crossref", url: crUrl, error: `invalid_json: ${String(err)}` });
+        break;
       }
     }
+  };
+
+  await Promise.all([fetchHfPapers(), fetchArxiv(), fetchOpenAlex(), fetchCrossref()]);
+
+  // Interleave & deduplicate by normalized title / source_url
+  const all: RawRecord[] = [];
+  const seenKeys = new Set<string>();
+  const addPaper = (rec: RawRecord) => {
+    const key = String(rec.source_url).toLowerCase();
+    const titleKey = normText(String(rec.title ?? ""));
+    if (seenKeys.has(key) || (titleKey && seenKeys.has(`t:${titleKey}`))) return;
+    seenKeys.add(key);
+    if (titleKey) seenKeys.add(`t:${titleKey}`);
+    all.push(rec);
+  };
+
+  // Prioritize HF daily papers (which contain GitHub stars), then round-robin across arXiv, OpenAlex, Crossref
+  for (const r of hfPapers) addPaper(r);
+  const maxLen = Math.max(arxivPapers.length, oaPapers.length, crPapers.length);
+  for (let i = 0; i < maxLen && all.length < limit; i++) {
+    if (arxivPapers[i]) addPaper(arxivPapers[i]);
+    if (all.length >= limit) break;
+    if (oaPapers[i]) addPaper(oaPapers[i]);
+    if (all.length >= limit) break;
+    if (crPapers[i]) addPaper(crPapers[i]);
   }
 
-  // Optional GitHub stars enrichment (respects rate limits cleanly)
   const limited = all.slice(0, limit);
-  let rateLimited = false;
+
+  // Enrich associated GitHub repository metrics & stars concurrently (respects rate limits cleanly)
+  const slugToRecords = new Map<string, RawRecord[]>();
   for (const rec of limited) {
-    if (rateLimited || !rec.github_repository) continue;
+    if (!rec.github_repository) continue;
     const slug = extractGithubRepoSlug(String(rec.github_repository));
     if (!slug) continue;
+    // Skip re-querying GitHub API if Hugging Face already supplied stars unless GITHUB_TOKEN is configured
+    if (!config.githubToken && typeof rec.github_stars === "number") continue;
+    const arr = slugToRecords.get(slug) ?? [];
+    arr.push(rec);
+    slugToRecords.set(slug, arr);
+  }
+
+  const maxSlugsToEnrich = config.githubToken ? 200 : 40;
+  const slugsToEnrich = Array.from(slugToRecords.keys()).slice(0, maxSlugsToEnrich);
+  let ghRateLimited = false;
+  await mapConcurrent(slugsToEnrich, 4, async (slug) => {
+    if (ghRateLimited) return;
     const headers: Record<string, string> = { Accept: "application/vnd.github+json" };
     if (config.githubToken) headers.Authorization = `Bearer ${config.githubToken}`;
-    const ghRes = await fetchWithTimeout(`https://api.github.com/repos/${slug}`, {
+    const ghRes = await http.fetch(`https://api.github.com/repos/${slug}`, {
       headers,
       timeoutMs: 8000,
-      userAgent: config.userAgent,
+      maxAttempts: 1,
     });
     if (ghRes.status === 403 || ghRes.status === 429) {
-      rateLimited = true;
-      continue;
+      ghRateLimited = true;
+      return;
     }
-    if (ghRes.ok) {
-      try {
-        const ghJson = JSON.parse(ghRes.content) as Record<string, unknown>;
-        if (typeof ghJson.stargazers_count === "number" && ghJson.stargazers_count >= 0) {
-          rec.github_stars = ghJson.stargazers_count;
-        }
-      } catch {
-        // Ignore parse error
+    if (!ghRes.ok) return;
+    try {
+      const ghJson = JSON.parse(ghRes.content) as Record<string, unknown>;
+      const stars = typeof ghJson.stargazers_count === "number" ? ghJson.stargazers_count : null;
+      const metrics = {
+        stars,
+        forks: typeof ghJson.forks_count === "number" ? ghJson.forks_count : null,
+        open_issues: typeof ghJson.open_issues_count === "number" ? ghJson.open_issues_count : null,
+        watchers: typeof ghJson.subscribers_count === "number" ? ghJson.subscribers_count : null,
+        language: ghJson.language ?? null,
+        updated_at: ghJson.updated_at ?? null,
+      };
+      for (const rec of slugToRecords.get(slug) ?? []) {
+        if (stars !== null && stars >= 0) rec.github_stars = stars;
+        const meta = (rec.source_metadata as Record<string, unknown>) || {};
+        meta.github_metrics = metrics;
+        rec.source_metadata = meta;
       }
+    } catch {
+      // Ignore parse error
     }
-  }
+  });
 
   return { records: limited, errors, hasMore: limited.length >= limit };
 }
 
 async function collectJobs(
   config: AtlasConfig,
+  http: PoliteHttpClient,
+  verifier: LiveSourceVerifier,
   limit: number,
   page: number
 ): Promise<{ records: RawRecord[]; errors: CollectorError[]; hasMore: boolean }> {
@@ -2041,13 +2481,18 @@ async function collectJobs(
   const combined: RawRecord[] = [];
   const nowIso = new Date().toISOString();
 
+  const tasks: Array<Promise<void>> = [];
+
   // 1. Remotive
-  {
-    const remUrl = `https://remotive.com/api/remote-jobs?limit=${Math.min(200, Math.max(50, limit))}`;
-    const res = await fetchWithTimeout(remUrl, { timeoutMs: config.requestTimeoutMs, userAgent: config.userAgent });
-    if (!res.ok) {
-      errors.push({ source: "remotive", url: remUrl, error: res.error || "fetch_failed" });
-    } else {
+  tasks.push(
+    (async () => {
+      const remUrl = `https://remotive.com/api/remote-jobs?limit=${Math.min(200, Math.max(100, limit))}`;
+      const res = await http.fetch(remUrl, { timeoutMs: config.requestTimeoutMs });
+      if (!res.ok) {
+        errors.push({ source: "remotive", url: remUrl, error: res.error || "fetch_failed" });
+        return;
+      }
+      verifier.seedSnapshot(remUrl, res.status, res.content, res.contentType);
       try {
         const payload = JSON.parse(res.content) as Record<string, unknown>;
         const jobs = Array.isArray(payload.jobs) ? (payload.jobs as Array<Record<string, unknown>>) : [];
@@ -2057,109 +2502,406 @@ async function collectJobs(
           const appUrl = validateOptionalUrl(job.url);
           const postedAt = parseUtcDatetime(job.publication_date);
           if (!title || !company || !appUrl || !postedAt) continue;
+          const desc = job.description ? stripHtmlToText(String(job.description)).slice(0, 4000) : null;
+          const cat = normalizeUnknownText(job.category);
+          const tags = Array.isArray(job.tags) ? job.tags.map(String) : [];
+          if (!isQualifyingAiJob("remotive", title, tags, cat, desc)) continue;
           combined.push({
             title,
             company,
             location: normalizeUnknownText(job.candidate_required_location || "Remote"),
             employment_type: normalizeUnknownText(job.job_type),
-            description: job.description ? stripHtmlToText(String(job.description)).slice(0, 4000) : null,
+            description: desc,
             posted_at: postedAt.toISOString(),
             application_url: appUrl,
             source_name: "remotive",
             source_url: appUrl,
             collected_at: nowIso,
-            source_metadata: { category: job.category ?? null, remotive_id: job.id ?? null, api_url: remUrl },
+            source_metadata: { board: "remotive", category: job.category ?? null, remotive_id: job.id ?? null, api_url: remUrl },
           });
         }
       } catch (err) {
         errors.push({ source: "remotive", url: remUrl, error: `invalid_json: ${String(err)}` });
       }
-    }
-  }
+    })()
+  );
 
-  // 2. Arbeitnow
-  for (let p = safePage; p < safePage + 2; p++) {
-    const arbUrl = `https://www.arbeitnow.com/api/job-board-api?page=${p}`;
-    const res = await fetchWithTimeout(arbUrl, { timeoutMs: config.requestTimeoutMs, userAgent: config.userAgent });
-    if (!res.ok) {
-      errors.push({ source: "arbeitnow", url: arbUrl, error: res.error || "fetch_failed" });
-      break;
-    }
-    try {
-      const payload = JSON.parse(res.content) as Record<string, unknown>;
-      const items = Array.isArray(payload.data) ? (payload.data as Array<Record<string, unknown>>) : [];
-      if (items.length === 0) break;
-      for (const job of items) {
-        const title = String(job.title ?? "").trim();
-        const company = String(job.company_name ?? "").trim();
-        const appUrl = validateOptionalUrl(job.url);
-        const postedAt = parseUtcDatetime(job.created_at);
-        if (!title || !company || !appUrl || !postedAt) continue;
-        const jobTypes = Array.isArray(job.job_types) ? job.job_types : [];
-        const empType = normalizeUnknownText(jobTypes[0] ?? (job.remote ? "Remote" : null));
+  // 2. Arbeitnow (multi-page)
+  tasks.push(
+    (async () => {
+      for (let p = safePage; p < safePage + 4; p++) {
+        const arbUrl = `https://www.arbeitnow.com/api/job-board-api?page=${p}`;
+        const res = await http.fetch(arbUrl, { timeoutMs: config.requestTimeoutMs });
+        if (!res.ok) {
+          errors.push({ source: "arbeitnow", url: arbUrl, error: res.error || "fetch_failed" });
+          break;
+        }
+        verifier.seedSnapshot(arbUrl, res.status, res.content, res.contentType);
+        try {
+          const payload = JSON.parse(res.content) as Record<string, unknown>;
+          const items = Array.isArray(payload.data) ? (payload.data as Array<Record<string, unknown>>) : [];
+          if (items.length === 0) break;
+          for (const job of items) {
+            const title = String(job.title ?? "").trim();
+            const company = String(job.company_name ?? "").trim();
+            const appUrl = validateOptionalUrl(job.url);
+            const postedAt = parseUtcDatetime(job.created_at);
+            if (!title || !company || !appUrl || !postedAt) continue;
+            const desc = job.description ? stripHtmlToText(String(job.description)).slice(0, 4000) : null;
+            const tags = Array.isArray(job.tags) ? job.tags.map(String) : [];
+            if (!isQualifyingAiJob("arbeitnow", title, tags, "", desc)) continue;
+            const jobTypes = Array.isArray(job.job_types) ? job.job_types : [];
+            const empType = normalizeUnknownText(jobTypes[0] ?? (job.remote ? "Remote" : null));
+            combined.push({
+              title,
+              company,
+              location: normalizeUnknownText(job.location),
+              employment_type: empType,
+              description: desc,
+              posted_at: postedAt.toISOString(),
+              application_url: appUrl,
+              source_name: "arbeitnow",
+              source_url: appUrl,
+              collected_at: nowIso,
+              source_metadata: { board: "arbeitnow", tags: job.tags ?? [], remote: job.remote ?? null, api_url: arbUrl },
+            });
+          }
+        } catch (err) {
+          errors.push({ source: "arbeitnow", url: arbUrl, error: `invalid_json: ${String(err)}` });
+          break;
+        }
+      }
+    })()
+  );
+
+  // 3. We Work Remotely RSS
+  tasks.push(
+    (async () => {
+      const wwrUrl = "https://weworkremotely.com/remote-jobs.rss";
+      const res = await http.fetch(wwrUrl, { timeoutMs: config.requestTimeoutMs });
+      if (!res.ok) {
+        errors.push({ source: "weworkremotely", url: wwrUrl, error: res.error || "fetch_failed" });
+        return;
+      }
+      verifier.seedSnapshot(wwrUrl, res.status, res.content, res.contentType);
+      const items = extractXmlTags(res.content, "item");
+      for (const item of items) {
+        const rawTitle = (extractXmlTag(item, "title") ?? "").trim();
+        const appUrl = validateOptionalUrl(extractXmlTag(item, "link"));
+        const postedAt = parseUtcDatetime(extractXmlTag(item, "pubDate"));
+        if (!rawTitle || !appUrl || !postedAt) continue;
+        const colonIdx = rawTitle.indexOf(": ");
+        const company = colonIdx > 0 ? rawTitle.slice(0, colonIdx).trim() : "Unknown";
+        const title = colonIdx > 0 ? rawTitle.slice(colonIdx + 2).trim() : rawTitle;
+        const cat = normalizeUnknownText(extractXmlTag(item, "category"));
+        const skillsRaw = extractXmlTag(item, "skills") ?? "";
+        const skills = skillsRaw.split(/[,/]/).map((s) => s.trim()).filter(Boolean);
+        const descRaw = extractXmlTag(item, "description");
+        const desc = descRaw ? stripHtmlToText(descRaw).slice(0, 4000) : null;
+        if (!isQualifyingAiJob("weworkremotely", title, skills, cat, desc)) continue;
+        const region = extractXmlTag(item, "region") || extractXmlTag(item, "country") || "Remote";
         combined.push({
           title,
-          company,
-          location: normalizeUnknownText(job.location),
-          employment_type: empType,
-          description: job.description ? stripHtmlToText(String(job.description)).slice(0, 4000) : null,
+          company: normalizeUnknownText(company),
+          location: normalizeUnknownText(region),
+          employment_type: normalizeUnknownText(extractXmlTag(item, "type")),
+          description: desc,
           posted_at: postedAt.toISOString(),
           application_url: appUrl,
-          source_name: "arbeitnow",
+          source_name: "weworkremotely",
           source_url: appUrl,
           collected_at: nowIso,
-          source_metadata: { tags: job.tags ?? [], remote: job.remote ?? null, api_url: arbUrl },
+          source_metadata: { board: "weworkremotely", category: cat, api_url: wwrUrl },
         });
       }
-    } catch (err) {
-      errors.push({ source: "arbeitnow", url: arbUrl, error: `invalid_json: ${String(err)}` });
-      break;
-    }
+    })()
+  );
+
+  // 4. Jobicy API
+  tasks.push(
+    (async () => {
+      for (const jUrl of [
+        "https://jobicy.com/api/v2/remote-jobs?count=50&tag=ai",
+        "https://jobicy.com/api/v2/remote-jobs?count=50",
+      ]) {
+        const res = await http.fetch(jUrl, { timeoutMs: config.requestTimeoutMs });
+        if (!res.ok) {
+          errors.push({ source: "jobicy", url: jUrl, error: res.error || "fetch_failed" });
+          continue;
+        }
+        verifier.seedSnapshot(jUrl, res.status, res.content, res.contentType);
+        try {
+          const payload = JSON.parse(res.content) as Record<string, unknown>;
+          const jobs = Array.isArray(payload.jobs) ? (payload.jobs as Array<Record<string, unknown>>) : [];
+          for (const job of jobs) {
+            const title = String(job.jobTitle ?? "").trim();
+            const company = String(job.companyName ?? "").trim();
+            const appUrl = validateOptionalUrl(job.url);
+            const postedAt = parseUtcDatetime(job.pubDate);
+            if (!title || !company || !appUrl || !postedAt) continue;
+            const desc = job.jobDescription ? stripHtmlToText(String(job.jobDescription)).slice(0, 4000) : null;
+            const inds = Array.isArray(job.jobIndustry) ? job.jobIndustry.map(String) : [];
+            if (!isQualifyingAiJob("jobicy", title, inds, inds[0] ?? "", desc)) continue;
+            const jobType = Array.isArray(job.jobType) ? job.jobType[0] : job.jobType;
+            combined.push({
+              title,
+              company,
+              location: normalizeUnknownText(job.jobGeo || "Remote"),
+              employment_type: normalizeUnknownText(jobType),
+              description: desc,
+              posted_at: postedAt.toISOString(),
+              application_url: appUrl,
+              source_name: "jobicy",
+              source_url: appUrl,
+              collected_at: nowIso,
+              source_metadata: { board: "jobicy", job_id: job.id ?? null, api_url: jUrl },
+            });
+          }
+        } catch (err) {
+          errors.push({ source: "jobicy", url: jUrl, error: `invalid_json: ${String(err)}` });
+        }
+      }
+    })()
+  );
+
+  // 5. Greenhouse AI company boards
+  for (const board of ["anthropic", "scaleai", "xai", "togetherai"]) {
+    tasks.push(
+      (async () => {
+        const ghUrl = `https://boards-api.greenhouse.io/v1/boards/${board}/jobs?content=true`;
+        const res = await http.fetch(ghUrl, { timeoutMs: config.requestTimeoutMs });
+        if (!res.ok) {
+          errors.push({ source: `greenhouse:${board}`, url: ghUrl, error: res.error || "fetch_failed" });
+          return;
+        }
+        verifier.seedSnapshot(ghUrl, res.status, res.content, res.contentType);
+        try {
+          const payload = JSON.parse(res.content) as Record<string, unknown>;
+          const jobs = Array.isArray(payload.jobs) ? (payload.jobs as Array<Record<string, unknown>>) : [];
+          for (const job of jobs) {
+            const title = String(job.title ?? "").trim();
+            const appUrl = validateOptionalUrl(job.absolute_url);
+            const postedAt = parseUtcDatetime(job.updated_at || job.first_published);
+            if (!title || !appUrl || !postedAt) continue;
+            const locName = (job.location as Record<string, unknown> | undefined)?.name;
+            combined.push({
+              title,
+              company: board.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()),
+              location: normalizeUnknownText(locName),
+              employment_type: "Full-Time",
+              description: job.content ? stripHtmlToText(String(job.content)).slice(0, 4000) : null,
+              posted_at: postedAt.toISOString(),
+              application_url: appUrl,
+              source_name: `greenhouse:${board}`,
+              source_url: appUrl,
+              collected_at: nowIso,
+              source_metadata: { board: "greenhouse", greenhouse_id: job.id ?? null, api_url: ghUrl },
+            });
+          }
+        } catch (err) {
+          errors.push({ source: `greenhouse:${board}`, url: ghUrl, error: `invalid_json: ${String(err)}` });
+        }
+      })()
+    );
   }
 
-  // 3. Greenhouse boards
-  for (const board of ["anthropic", "huggingface", "scaleai", "weightsandbiases"]) {
-    const ghUrl = `https://boards-api.greenhouse.io/v1/boards/${board}/jobs?content=true`;
-    const res = await fetchWithTimeout(ghUrl, { timeoutMs: config.requestTimeoutMs, userAgent: config.userAgent });
-    if (!res.ok) {
-      errors.push({ source: `greenhouse:${board}`, url: ghUrl, error: res.error || "fetch_failed" });
-      continue;
-    }
-    try {
-      const payload = JSON.parse(res.content) as Record<string, unknown>;
-      const jobs = Array.isArray(payload.jobs) ? (payload.jobs as Array<Record<string, unknown>>) : [];
-      for (const job of jobs) {
-        const title = String(job.title ?? "").trim();
-        const appUrl = validateOptionalUrl(job.absolute_url);
-        const postedAt = parseUtcDatetime(job.updated_at || job.first_published);
-        if (!title || !appUrl || !postedAt) continue;
-        const locName = (job.location as Record<string, unknown> | undefined)?.name;
-        combined.push({
-          title,
-          company: board.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()),
-          location: normalizeUnknownText(locName),
-          employment_type: "Unknown",
-          description: job.content ? stripHtmlToText(String(job.content)).slice(0, 4000) : null,
-          posted_at: postedAt.toISOString(),
-          application_url: appUrl,
-          source_name: `greenhouse:${board}`,
-          source_url: appUrl,
-          collected_at: nowIso,
-          source_metadata: { greenhouse_id: job.id ?? null, api_url: ghUrl },
-        });
-      }
-    } catch (err) {
-      errors.push({ source: `greenhouse:${board}`, url: ghUrl, error: `invalid_json: ${String(err)}` });
-    }
+  // 6. Ashby AI company boards
+  for (const board of ["openai", "perplexity", "cohere", "cursor", "elevenlabs", "harvey"]) {
+    tasks.push(
+      (async () => {
+        const ashUrl = `https://api.ashbyhq.com/posting-api/job-board/${board}`;
+        const res = await http.fetch(ashUrl, { timeoutMs: Math.max(config.requestTimeoutMs, 25000) });
+        if (!res.ok) {
+          errors.push({ source: `ashby:${board}`, url: ashUrl, error: res.error || "fetch_failed" });
+          return;
+        }
+        verifier.seedSnapshot(ashUrl, res.status, res.content, res.contentType);
+        try {
+          const payload = JSON.parse(res.content) as Record<string, unknown>;
+          const jobs = Array.isArray(payload.jobs) ? (payload.jobs as Array<Record<string, unknown>>) : [];
+          for (const job of jobs) {
+            const title = String(job.title ?? "").trim();
+            const appUrl = validateOptionalUrl(job.jobUrl || job.applyUrl);
+            const postedAt = parseUtcDatetime(job.publishedAt);
+            if (!title || !appUrl || !postedAt) continue;
+            const desc =
+              typeof job.descriptionPlain === "string"
+                ? job.descriptionPlain.slice(0, 4000)
+                : typeof job.descriptionHtml === "string"
+                ? stripHtmlToText(job.descriptionHtml).slice(0, 4000)
+                : null;
+            combined.push({
+              title,
+              company: board.replace(/\b\w/g, (c) => c.toUpperCase()),
+              location: normalizeUnknownText(job.location || (job.isRemote ? "Remote" : null)),
+              employment_type: normalizeUnknownText(job.employmentType || "Full-Time"),
+              description: desc,
+              posted_at: postedAt.toISOString(),
+              application_url: appUrl,
+              source_name: `ashby:${board}`,
+              source_url: appUrl,
+              collected_at: nowIso,
+              source_metadata: { board: "ashby", department: job.department ?? null, api_url: ashUrl },
+            });
+          }
+        } catch (err) {
+          errors.push({ source: `ashby:${board}`, url: ashUrl, error: `invalid_json: ${String(err)}` });
+        }
+      })()
+    );
   }
+
+  // 7. Himalayas API
+  tasks.push(
+    (async () => {
+      const himUrl = "https://himalayas.app/jobs/api/search?q=ai";
+      const res = await http.fetch(himUrl, { timeoutMs: config.requestTimeoutMs });
+      if (!res.ok) {
+        errors.push({ source: "himalayas", url: himUrl, error: res.error || "fetch_failed" });
+        return;
+      }
+      verifier.seedSnapshot(himUrl, res.status, res.content, res.contentType);
+      try {
+        const payload = JSON.parse(res.content) as Record<string, unknown>;
+        const jobs = Array.isArray(payload.jobs) ? (payload.jobs as Array<Record<string, unknown>>) : [];
+        for (const job of jobs) {
+          const title = String(job.title ?? "").trim();
+          const company = String(job.companyName ?? "").trim();
+          const appUrl = validateOptionalUrl(job.applicationLink || job.guid);
+          const postedAt = parseUtcDatetime(job.pubDate);
+          if (!title || !company || !appUrl || !postedAt) continue;
+          const descRaw = String(job.description ?? job.excerpt ?? "");
+          const desc = descRaw ? stripHtmlToText(descRaw).slice(0, 4000) : null;
+          const cats = Array.isArray(job.categories) ? job.categories.map(String) : [];
+          if (!isQualifyingAiJob("himalayas", title, cats, cats[0] ?? "", desc)) continue;
+          const locs = Array.isArray(job.locationRestrictions) && job.locationRestrictions.length > 0
+            ? job.locationRestrictions.join(", ")
+            : "Remote";
+          combined.push({
+            title,
+            company,
+            location: normalizeUnknownText(locs),
+            employment_type: normalizeUnknownText(job.employmentType),
+            description: desc,
+            posted_at: postedAt.toISOString(),
+            application_url: appUrl,
+            source_name: "himalayas",
+            source_url: appUrl,
+            collected_at: nowIso,
+            source_metadata: { board: "himalayas", api_url: himUrl },
+          });
+        }
+      } catch (err) {
+        errors.push({ source: "himalayas", url: himUrl, error: `invalid_json: ${String(err)}` });
+      }
+    })()
+  );
+
+  // 8. RemoteOK API
+  tasks.push(
+    (async () => {
+      const rokUrl = "https://remoteok.com/api";
+      const res = await http.fetch(rokUrl, { timeoutMs: config.requestTimeoutMs });
+      if (!res.ok) {
+        errors.push({ source: "remoteok", url: rokUrl, error: res.error || "fetch_failed" });
+        return;
+      }
+      verifier.seedSnapshot(rokUrl, res.status, res.content, res.contentType);
+      try {
+        const arr = JSON.parse(res.content);
+        if (!Array.isArray(arr)) return;
+        for (const job of arr as Array<Record<string, unknown>>) {
+          const title = String(job.position ?? "").trim();
+          const company = String(job.company ?? "").trim();
+          const appUrl = validateOptionalUrl(job.url || job.apply_url);
+          const postedAt = parseUtcDatetime(job.date ?? job.epoch);
+          if (!title || !company || !appUrl || !postedAt) continue;
+          const desc = job.description ? stripHtmlToText(String(job.description)).slice(0, 4000) : null;
+          const tags = Array.isArray(job.tags) ? job.tags.map(String) : [];
+          if (!isQualifyingAiJob("remoteok", title, tags, "", desc)) continue;
+          combined.push({
+            title,
+            company,
+            location: normalizeUnknownText(job.location || "Remote"),
+            employment_type: "Remote",
+            description: desc,
+            posted_at: postedAt.toISOString(),
+            application_url: appUrl,
+            source_name: "remoteok",
+            source_url: appUrl,
+            collected_at: nowIso,
+            source_metadata: { board: "remoteok", tags, api_url: rokUrl },
+          });
+        }
+      } catch (err) {
+        errors.push({ source: "remoteok", url: rokUrl, error: `invalid_json: ${String(err)}` });
+      }
+    })()
+  );
+
+  // 9. Lever boards
+  for (const board of ["palantir", "zoox"]) {
+    tasks.push(
+      (async () => {
+        const levUrl = `https://api.lever.co/v0/postings/${board}?mode=json`;
+        const res = await http.fetch(levUrl, { timeoutMs: config.requestTimeoutMs });
+        if (!res.ok) {
+          errors.push({ source: `lever:${board}`, url: levUrl, error: res.error || "fetch_failed" });
+          return;
+        }
+        verifier.seedSnapshot(levUrl, res.status, res.content, res.contentType);
+        try {
+          const jobs = JSON.parse(res.content);
+          if (!Array.isArray(jobs)) return;
+          for (const job of jobs as Array<Record<string, unknown>>) {
+            const title = String(job.text ?? "").trim();
+            const appUrl = validateOptionalUrl(job.hostedUrl || job.applyUrl);
+            const postedAt = parseUtcDatetime(job.createdAt);
+            if (!title || !appUrl || !postedAt) continue;
+            const cats = (job.categories as Record<string, unknown> | undefined) ?? {};
+            const desc =
+              typeof job.descriptionPlain === "string"
+                ? job.descriptionPlain.slice(0, 4000)
+                : typeof job.description === "string"
+                ? stripHtmlToText(job.description).slice(0, 4000)
+                : null;
+            if (!isQualifyingAiJob(`lever:${board}`, title, [String(cats.team ?? "")], String(cats.department ?? ""), desc)) {
+              continue;
+            }
+            combined.push({
+              title,
+              company: board.replace(/\b\w/g, (c) => c.toUpperCase()),
+              location: normalizeUnknownText(cats.location),
+              employment_type: normalizeUnknownText(cats.commitment),
+              description: desc,
+              posted_at: postedAt.toISOString(),
+              application_url: appUrl,
+              source_name: `lever:${board}`,
+              source_url: appUrl,
+              collected_at: nowIso,
+              source_metadata: { board: "lever", team: cats.team ?? null, api_url: levUrl },
+            });
+          }
+        } catch (err) {
+          errors.push({ source: `lever:${board}`, url: levUrl, error: `invalid_json: ${String(err)}` });
+        }
+      })()
+    );
+  }
+
+  await Promise.all(tasks);
 
   combined.sort((a, b) => String(b.posted_at).localeCompare(String(a.posted_at)));
-  const sliced = combined.slice(0, limit);
-  return { records: sliced, errors, hasMore: combined.length > limit };
+  // Keep newest fresh records first (or all qualifying AI records up to Math.max(limit, 250) when freshness filtering will narrow further)
+  const cap = Math.max(limit, 500);
+  const sliced = combined.slice(0, cap);
+  return { records: sliced, errors, hasMore: combined.length > cap };
 }
 
 async function collectNews(
   config: AtlasConfig,
+  http: PoliteHttpClient,
+  verifier: LiveSourceVerifier,
   limit: number,
   page: number
 ): Promise<{ records: RawRecord[]; errors: CollectorError[]; hasMore: boolean }> {
@@ -2169,308 +2911,132 @@ async function collectNews(
   const nowIso = new Date().toISOString();
 
   const rssSources = [
+    { name: "techcrunch_ai", url: "https://techcrunch.com/category/artificial-intelligence/feed/", publisher: "TechCrunch", category: "Startups & AI" },
+    { name: "theverge_ai", url: "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml", publisher: "The Verge", category: "AI & Tech" },
+    { name: "wired_ai", url: "https://www.wired.com/feed/tag/ai/latest/rss", publisher: "WIRED", category: "AI" },
+    { name: "marktechpost", url: "https://www.marktechpost.com/feed/", publisher: "MarkTechPost", category: "AI Research & Engineering" },
+    { name: "the_decoder", url: "https://the-decoder.com/feed/", publisher: "The Decoder", category: "AI Industry" },
+    { name: "siliconangle_ai", url: "https://siliconangle.com/category/ai/feed/", publisher: "SiliconANGLE", category: "Enterprise AI" },
+    { name: "simonwillison", url: "https://simonwillison.net/atom/everything/", publisher: "Simon Willison", category: "LLMs & Engineering" },
     { name: "huggingface_blog", url: "https://huggingface.co/blog/feed.xml", publisher: "Hugging Face Blog", category: "AI Research & Engineering" },
     { name: "mit_news_ai", url: "https://news.mit.edu/topic/mitartificial-intelligence2-rss.xml", publisher: "MIT News", category: "AI Research" },
     { name: "google_blog", url: "https://blog.google/technology/ai/rss/", publisher: "Google AI Blog", category: "AI" },
-    { name: "techcrunch_ai", url: "https://techcrunch.com/category/artificial-intelligence/feed/", publisher: "TechCrunch", category: "Startups & AI" },
+    { name: "openai_news", url: "https://openai.com/news/rss.xml", publisher: "OpenAI News", category: "AI" },
+    { name: "arstechnica_tech", url: "https://feeds.arstechnica.com/arstechnica/technology-lab", publisher: "Ars Technica", category: "AI & Technology" },
   ];
 
-  if (safePage === 1) {
-    for (const src of rssSources) {
-      const res = await fetchWithTimeout(src.url, { timeoutMs: config.requestTimeoutMs, userAgent: config.userAgent });
-      if (!res.ok) {
-        errors.push({ source: src.name, url: src.url, error: res.error || "fetch_failed" });
-        continue;
-      }
-      const items = extractXmlTags(res.content, "item");
-      if (items.length > 0) {
-        for (const item of items) {
-          const title = (extractXmlTag(item, "title") ?? "").trim();
-          const link = validateOptionalUrl(extractXmlTag(item, "link"));
-          const pubDt = parseUtcDatetime(extractXmlTag(item, "pubDate") || extractXmlTag(item, "dc:date"));
-          const descRaw = (extractXmlTag(item, "description") ?? "").trim();
-          const summary = descRaw ? stripHtmlToText(descRaw).slice(0, 2000) || null : null;
-          if (!title || !link || !pubDt) continue;
-          records.push({
-            headline: title,
-            summary,
-            publisher: src.publisher,
-            published_at: pubDt.toISOString(),
-            article_url: link,
-            category: src.category,
-            source_name: src.name,
-            source_url: src.url,
-            collected_at: nowIso,
-            source_metadata: { feed_type: "rss" },
-          });
-        }
-      } else {
-        const entries = extractXmlTags(res.content, "entry");
-        for (const entry of entries) {
-          const title = (extractXmlTag(entry, "title") ?? "").trim();
-          const linkMatch = entry.match(/<link[^>]+href=["']([^"']+)["']/i);
-          const link = validateOptionalUrl(linkMatch?.[1] ?? extractXmlTag(entry, "link"));
-          const pubDt = parseUtcDatetime(extractXmlTag(entry, "published") || extractXmlTag(entry, "updated"));
-          const sumRaw = extractXmlTag(entry, "summary") || extractXmlTag(entry, "content");
-          const summary = sumRaw ? stripHtmlToText(sumRaw).slice(0, 2000) || null : null;
-          if (!title || !link || !pubDt) continue;
-          records.push({
-            headline: title,
-            summary,
-            publisher: src.publisher,
-            published_at: pubDt.toISOString(),
-            article_url: link,
-            category: src.category,
-            source_name: src.name,
-            source_url: src.url,
-            collected_at: nowIso,
-            source_metadata: { feed_type: "atom" },
-          });
-        }
-      }
-    }
-  }
+  const feedTasks =
+    safePage === 1
+      ? rssSources.map(async (src) => {
+          const res = await http.fetch(src.url, { timeoutMs: config.requestTimeoutMs });
+          if (!res.ok) {
+            errors.push({ source: src.name, url: src.url, error: res.error || "fetch_failed" });
+            return;
+          }
+          verifier.seedSnapshot(src.url, res.status, res.content, res.contentType);
+          const items = extractXmlTags(res.content, "item");
+          if (items.length > 0) {
+            for (const item of items) {
+              const title = (extractXmlTag(item, "title") ?? "").trim();
+              const link = validateOptionalUrl(extractXmlTag(item, "link"));
+              const pubDt = parseUtcDatetime(extractXmlTag(item, "pubDate") || extractXmlTag(item, "dc:date"));
+              const descRaw = (extractXmlTag(item, "description") ?? "").trim();
+              const summary = descRaw ? stripHtmlToText(descRaw).slice(0, 2000) || null : null;
+              if (!title || !link || !pubDt) continue;
+              if (!isQualifyingAiNews(src.name, title, summary)) continue;
+              records.push({
+                headline: title,
+                summary,
+                publisher: src.publisher,
+                published_at: pubDt.toISOString(),
+                article_url: link,
+                category: src.category,
+                source_name: src.name,
+                source_url: src.url,
+                collected_at: nowIso,
+                source_metadata: { feed_type: "rss", api_url: src.url },
+              });
+            }
+          } else {
+            const entries = extractXmlTags(res.content, "entry");
+            for (const entry of entries) {
+              const title = (extractXmlTag(entry, "title") ?? "").trim();
+              const linkMatch = entry.match(/<link[^>]+href=["']([^"']+)["']/i);
+              const link = validateOptionalUrl(linkMatch?.[1] ?? extractXmlTag(entry, "link"));
+              const pubDt = parseUtcDatetime(extractXmlTag(entry, "published") || extractXmlTag(entry, "updated"));
+              const sumRaw = extractXmlTag(entry, "summary") || extractXmlTag(entry, "content");
+              const summary = sumRaw ? stripHtmlToText(sumRaw).slice(0, 2000) || null : null;
+              if (!title || !link || !pubDt) continue;
+              if (!isQualifyingAiNews(src.name, title, summary)) continue;
+              records.push({
+                headline: title,
+                summary,
+                publisher: src.publisher,
+                published_at: pubDt.toISOString(),
+                article_url: link,
+                category: src.category,
+                source_name: src.name,
+                source_url: src.url,
+                collected_at: nowIso,
+                source_metadata: { feed_type: "atom", api_url: src.url },
+              });
+            }
+          }
+        })
+      : [];
 
-  // Hacker News Algolia stories
-  const hnPage = Math.max(0, safePage - 1);
-  const hnUrl = `https://hn.algolia.com/api/v1/search_by_date?tags=story&hitsPerPage=${Math.min(100, Math.max(20, limit))}&page=${hnPage}`;
-  const hnRes = await fetchWithTimeout(hnUrl, { timeoutMs: config.requestTimeoutMs, userAgent: config.userAgent });
+  // Hacker News Algolia stories (filtered for qualifying AI news)
   let gotHn = false;
-  if (!hnRes.ok) {
-    errors.push({ source: "hn_algolia", url: hnUrl, error: hnRes.error || "fetch_failed" });
-  } else {
-    try {
-      const payload = JSON.parse(hnRes.content) as Record<string, unknown>;
-      const hits = Array.isArray(payload.hits) ? (payload.hits as Array<Record<string, unknown>>) : [];
-      gotHn = hits.length > 0;
-      for (const hit of hits) {
-        const title = String(hit.title ?? "").trim();
-        const articleUrl = validateOptionalUrl(hit.url);
-        const pubDt = parseUtcDatetime(hit.created_at);
-        if (!title || !articleUrl || !pubDt) continue;
-        const objId = hit.objectID ? String(hit.objectID) : null;
-        records.push({
-          headline: title,
-          summary: null,
-          publisher: "Hacker News",
-          published_at: pubDt.toISOString(),
-          article_url: articleUrl,
-          category: "Technology",
-          source_name: "hn_algolia",
-          source_url: objId ? `https://news.ycombinator.com/item?id=${objId}` : hnUrl,
-          collected_at: nowIso,
-          source_metadata: { points: hit.points ?? null, objectID: objId, api_url: hnUrl },
-        });
+  const hnTask = (async () => {
+    for (let offset = 0; offset < 2; offset++) {
+      const hnPage = Math.max(0, safePage - 1) + offset;
+      const hnUrl = `https://hn.algolia.com/api/v1/search_by_date?tags=story&hitsPerPage=100&page=${hnPage}`;
+      const hnRes = await http.fetch(hnUrl, { timeoutMs: config.requestTimeoutMs });
+      if (!hnRes.ok) {
+        errors.push({ source: "hn_algolia", url: hnUrl, error: hnRes.error || "fetch_failed" });
+        break;
       }
-    } catch (err) {
-      errors.push({ source: "hn_algolia", url: hnUrl, error: `invalid_json: ${String(err)}` });
+      verifier.seedSnapshot(hnUrl, hnRes.status, hnRes.content, hnRes.contentType);
+      try {
+        const payload = JSON.parse(hnRes.content) as Record<string, unknown>;
+        const hits = Array.isArray(payload.hits) ? (payload.hits as Array<Record<string, unknown>>) : [];
+        if (hits.length > 0) gotHn = true;
+        for (const hit of hits) {
+          const title = String(hit.title ?? "").trim();
+          const articleUrl = validateOptionalUrl(hit.url);
+          const pubDt = parseUtcDatetime(hit.created_at);
+          if (!title || !articleUrl || !pubDt) continue;
+          const summary = typeof hit.story_text === "string" && hit.story_text.trim()
+            ? stripHtmlToText(hit.story_text).slice(0, 1500)
+            : null;
+          if (!isQualifyingAiNews("hn_algolia", title, summary)) continue;
+          const objId = hit.objectID ? String(hit.objectID) : null;
+          records.push({
+            headline: title,
+            summary,
+            publisher: "Hacker News",
+            published_at: pubDt.toISOString(),
+            article_url: articleUrl,
+            category: "AI & Technology",
+            source_name: "hn_algolia",
+            source_url: objId ? `https://news.ycombinator.com/item?id=${objId}` : hnUrl,
+            collected_at: nowIso,
+            source_metadata: { points: hit.points ?? null, objectID: objId, api_url: hnUrl },
+          });
+        }
+      } catch (err) {
+        errors.push({ source: "hn_algolia", url: hnUrl, error: `invalid_json: ${String(err)}` });
+        break;
+      }
     }
-  }
+  })();
+
+  await Promise.all([...feedTasks, hnTask]);
 
   records.sort((a, b) => String(b.published_at).localeCompare(String(a.published_at)));
-  const sliced = records.slice(0, limit);
-  return { records: sliced, errors, hasMore: records.length > limit || gotHn };
-}
-
-// ---------- CSV & Google Sheets Exporters ----------
-
-interface ExportSpec {
-  tableName: string;
-  tabName: string;
-  csvFilename: string;
-  idColumn: string;
-  columns: string[];
-}
-
-const TRACEABILITY_EXPORT_COLUMNS = [
-  "official_website",
-  "source_title",
-  "last_checked_at",
-  "supported_fields",
-  "verification_status",
-  "verification_reason",
-  "rejection_reason",
-];
-
-const EXPORT_SPECS: ExportSpec[] = [
-  {
-    tableName: "startups",
-    tabName: "Startups",
-    csvFilename: "startups.csv",
-    idColumn: "startup_id",
-    columns: [
-      "startup_id",
-      "name",
-      "description",
-      "website",
-      "industry",
-      "location",
-      "founding_date",
-      "source_name",
-      "source_url",
-      "collected_at",
-      "canonical_entity_id",
-      ...TRACEABILITY_EXPORT_COLUMNS,
-    ],
-  },
-  {
-    tableName: "products",
-    tabName: "Products",
-    csvFilename: "products.csv",
-    idColumn: "product_id",
-    columns: [
-      "product_id",
-      "name",
-      "description",
-      "website",
-      "category",
-      "company_name",
-      "source_name",
-      "source_url",
-      "collected_at",
-      "canonical_entity_id",
-      ...TRACEABILITY_EXPORT_COLUMNS,
-    ],
-  },
-  {
-    tableName: "research_papers",
-    tabName: "Research Papers",
-    csvFilename: "research_papers.csv",
-    idColumn: "paper_id",
-    columns: [
-      "paper_id",
-      "title",
-      "abstract",
-      "authors",
-      "publication_date",
-      "doi",
-      "arxiv_id",
-      "github_repository",
-      "github_stars",
-      "source_name",
-      "source_url",
-      "collected_at",
-      ...TRACEABILITY_EXPORT_COLUMNS,
-    ],
-  },
-  {
-    tableName: "jobs",
-    tabName: "Jobs",
-    csvFilename: "jobs.csv",
-    idColumn: "job_id",
-    columns: [
-      "job_id",
-      "title",
-      "company",
-      "location",
-      "employment_type",
-      "description",
-      "posted_at",
-      "application_url",
-      "source_name",
-      "source_url",
-      "collected_at",
-      ...TRACEABILITY_EXPORT_COLUMNS,
-    ],
-  },
-  {
-    tableName: "news",
-    tabName: "News",
-    csvFilename: "news.csv",
-    idColumn: "news_id",
-    columns: [
-      "news_id",
-      "headline",
-      "summary",
-      "publisher",
-      "published_at",
-      "article_url",
-      "category",
-      "source_name",
-      "source_url",
-      "collected_at",
-      ...TRACEABILITY_EXPORT_COLUMNS,
-    ],
-  },
-  {
-    tableName: "entity_mapping_log",
-    tabName: "Entity Mapping Log",
-    csvFilename: "entity_mapping_log.csv",
-    idColumn: "mapping_id",
-    columns: [
-      "mapping_id",
-      "raw_name",
-      "normalized_name",
-      "canonical_name",
-      "canonical_id",
-      "entity_type",
-      "source_url",
-      "match_method",
-      "confidence",
-      "decision",
-      "match_reason",
-      "timestamp",
-    ],
-  },
-];
-
-function formatCell(col: string, row: Record<string, unknown>, forSheets: boolean): string | number {
-  if (col === "authors") {
-    const raw = row.authors_json ?? row.authors;
-    if (typeof raw === "string") {
-      try {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) return parsed.map(String).join("; ");
-      } catch {
-        return raw;
-      }
-    } else if (Array.isArray(raw)) {
-      return raw.map(String).join("; ");
-    }
-    return "";
-  }
-  if (col === "supported_fields") {
-    const raw = row.supported_fields_json ?? row.supported_fields;
-    if (typeof raw === "string") {
-      try {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) return parsed.map(String).join("; ");
-      } catch {
-        return raw;
-      }
-    } else if (Array.isArray(raw)) {
-      return raw.map(String).join("; ");
-    }
-    return "";
-  }
-  if (col === "official_website") {
-    const v = row.official_website ?? row.website;
-    return v === null || v === undefined ? "" : String(v);
-  }
-  if (col === "verification_reason") {
-    if (row.rejection_reason) return String(row.rejection_reason);
-    if (typeof row.source_metadata_json === "string" && row.source_metadata_json.trim()) {
-      try {
-        const meta = JSON.parse(row.source_metadata_json) as Record<string, unknown>;
-        const reason = meta.verification_reason || meta.source_error;
-        if (reason) return String(reason);
-      } catch {
-        // Ignore
-      }
-    }
-    return "";
-  }
-  const val = row[col];
-  if (val === null || val === undefined) return "";
-  if (col === "github_stars") {
-    const n = Number(val);
-    return forSheets ? n : String(Math.trunc(n));
-  }
-  if (col === "confidence") {
-    const n = Number(val);
-    return forSheets ? Number(n.toFixed(4)) : n.toFixed(4);
-  }
-  return String(val);
+  const cap = Math.max(limit, 300);
+  const sliced = records.slice(0, cap);
+  return { records: sliced, errors, hasMore: records.length > cap || gotHn };
 }
 
 function csvEscape(val: string | number): string {
@@ -2486,11 +3052,32 @@ function csvEscape(val: string | number): string {
 export class AtlasBackendService {
   private readonly config: AtlasConfig;
   private readonly db: AtlasDatabase;
+  private readonly http: PoliteHttpClient;
+  private readonly llmRouter: LLMRouter;
+  private readonly sheets: GoogleSheetsService;
 
   constructor(atlasDir: string) {
     this.config = loadAtlasConfig(atlasDir);
     this.db = new AtlasDatabase(this.config.dbPath);
     this.db.initializeSchema();
+    this.http = new PoliteHttpClient({
+      userAgent: this.config.userAgent,
+      timeoutMs: this.config.requestTimeoutMs,
+      rateLimitPerSecond: this.config.rateLimitPerSecond,
+      respectRobotsTxt: this.config.respectRobotsTxt,
+    });
+    this.llmRouter = createLLMRouter(this.config);
+    this.sheets = new GoogleSheetsService(
+      {
+        atlasDir: this.config.atlasDir,
+        rootDir: this.config.rootDir,
+        credentialsPath: this.config.googleSheetsCredentialsPath,
+        credentialsJson: this.config.googleSheetsCredentialsJson,
+        spreadsheetId: this.config.googleSheetsSpreadsheetId,
+        spreadsheetName: this.config.googleSheetsSpreadsheetName,
+      },
+      this.db
+    );
   }
 
   public getStatus(): Record<string, unknown> {
@@ -2517,9 +3104,7 @@ export class AtlasBackendService {
           .sort()
       : [];
 
-    const sheetsCredsExists = Boolean(
-      this.config.googleSheetsCredentialsPath && fs.existsSync(this.config.googleSheetsCredentialsPath)
-    );
+    const sheetsStatus: SheetsConnectionStatus = this.sheets.getStatus();
 
     return {
       counts,
@@ -2538,9 +3123,10 @@ export class AtlasBackendService {
         groqConfigured: Boolean(this.config.groqApiKey),
         deepseekConfigured: Boolean(this.config.deepseekApiKey),
         githubTokenConfigured: Boolean(this.config.githubToken),
-        googleSheetsConfigured: sheetsCredsExists,
-        googleSheetsSpreadsheetId: Boolean(this.config.googleSheetsSpreadsheetId),
+        googleSheetsConfigured: this.sheets.isConfigured(),
+        googleSheetsSpreadsheetId: Boolean(this.config.googleSheetsSpreadsheetId || sheetsStatus.spreadsheetId),
       },
+      sheetsStatus,
       storage: {
         backend: "sqlite",
         sqlitePath: this.config.dbPath,
@@ -2584,7 +3170,7 @@ export class AtlasBackendService {
         const rowId = String(row[spec.idColumn] ?? "");
         if (!rowId || seenIds.has(rowId)) continue;
         seenIds.add(rowId);
-        const cells = spec.columns.map((col) => csvEscape(formatCell(col, row, false)));
+        const cells = spec.columns.map((col) => csvEscape(formatExportCell(col, row, false)));
         lines.push(cells.join(","));
         count++;
       }
@@ -2602,151 +3188,38 @@ export class AtlasBackendService {
     };
   }
 
-  public async exportGoogleSheets(): Promise<{
-    success: boolean;
-    spreadsheetId: string | null;
-    spreadsheetUrl: string | null;
-    tabRowCounts: Record<string, number>;
-    error: string | null;
-  }> {
-    const credsPath = this.config.googleSheetsCredentialsPath;
-    if (!credsPath || !fs.existsSync(credsPath)) {
-      return {
-        success: false,
-        spreadsheetId: null,
-        spreadsheetUrl: null,
-        tabRowCounts: {},
-        error:
-          "Google Sheets export skipped: GOOGLE_SHEETS_CREDENTIALS_PATH is not configured or file does not exist.",
-      };
-    }
+  public async exportGoogleSheets(opts?: {
+    oauthAccessToken?: string | null;
+    spreadsheetId?: string | null;
+  }): Promise<SheetsSyncResult> {
+    return this.sheets.exportOrSync("full", opts);
+  }
 
-    try {
-      const creds = JSON.parse(fs.readFileSync(credsPath, "utf-8")) as {
-        client_email?: string;
-        private_key?: string;
-        token_uri?: string;
-      };
-      if (!creds.client_email || !creds.private_key) {
-        throw new Error("Service account JSON is missing client_email or private_key.");
-      }
+  public async syncGoogleSheets(opts?: {
+    oauthAccessToken?: string | null;
+    spreadsheetId?: string | null;
+  }): Promise<SheetsSyncResult> {
+    return this.sheets.exportOrSync("incremental", opts);
+  }
 
-      const now = Math.floor(Date.now() / 1000);
-      const header = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString("base64url");
-      const claim = Buffer.from(
-        JSON.stringify({
-          iss: creds.client_email,
-          scope: "https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file",
-          aud: creds.token_uri || "https://oauth2.googleapis.com/token",
-          exp: now + 3600,
-          iat: now,
-        })
-      ).toString("base64url");
-      const signer = crypto.createSign("RSA-SHA256");
-      signer.update(`${header}.${claim}`);
-      const sig = signer.sign(creds.private_key).toString("base64url");
-      const assertion = `${header}.${claim}.${sig}`;
-
-      const tokenResp = await fetch(creds.token_uri || "https://oauth2.googleapis.com/token", {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({
-          grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-          assertion,
-        }),
-      });
-      const tokenJson = (await tokenResp.json()) as { access_token?: string; error?: string };
-      if (!tokenResp.ok || !tokenJson.access_token) {
-        throw new Error(tokenJson.error || `OAuth token request failed (${tokenResp.status})`);
-      }
-
-      const authHeaders = {
-        Authorization: `Bearer ${tokenJson.access_token}`,
-        "Content-Type": "application/json",
-      };
-
-      let spreadsheetId = this.config.googleSheetsSpreadsheetId;
-      let spreadsheetUrl: string | null = spreadsheetId
-        ? `https://docs.google.com/spreadsheets/d/${spreadsheetId}`
-        : null;
-
-      if (!spreadsheetId) {
-        const createResp = await fetch("https://sheets.googleapis.com/v4/spreadsheets", {
-          method: "POST",
-          headers: authHeaders,
-          body: JSON.stringify({
-            properties: { title: this.config.googleSheetsSpreadsheetName },
-            sheets: EXPORT_SPECS.map((s) => ({ properties: { title: s.tabName } })),
-          }),
-        });
-        const created = (await createResp.json()) as {
-          spreadsheetId?: string;
-          spreadsheetUrl?: string;
-          error?: { message?: string };
-        };
-        if (!createResp.ok || !created.spreadsheetId) {
-          throw new Error(created.error?.message || `Failed to create spreadsheet (${createResp.status})`);
-        }
-        spreadsheetId = created.spreadsheetId;
-        spreadsheetUrl = created.spreadsheetUrl || `https://docs.google.com/spreadsheets/d/${spreadsheetId}`;
-      }
-
-      const tabRowCounts: Record<string, number> = {};
-      for (const spec of EXPORT_SPECS) {
-        const rawRows = this.db.fetchDataset(spec.tableName);
-        const seenIds = new Set<string>();
-        const values: Array<Array<string | number>> = [spec.columns];
-        for (const row of rawRows) {
-          const rid = String(row[spec.idColumn] ?? "");
-          if (!rid || seenIds.has(rid)) continue;
-          seenIds.add(rid);
-          values.push(spec.columns.map((c) => formatCell(c, row, true)));
-        }
-
-        const range = encodeURIComponent(`'${spec.tabName}'!A1`);
-        const updateResp = await fetch(
-          `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${range}?valueInputOption=RAW`,
-          {
-            method: "PUT",
-            headers: authHeaders,
-            body: JSON.stringify({ values }),
-          }
-        );
-        if (!updateResp.ok) {
-          const errJson = (await updateResp.json().catch(() => ({}))) as { error?: { message?: string } };
-          throw new Error(errJson.error?.message || `Sheets update failed on tab ${spec.tabName}`);
-        }
-        tabRowCounts[spec.tabName] = Math.max(0, values.length - 1);
-      }
-
-      return {
-        success: true,
-        spreadsheetId,
-        spreadsheetUrl,
-        tabRowCounts,
-        error: null,
-      };
-    } catch (err) {
-      return {
-        success: false,
-        spreadsheetId: null,
-        spreadsheetUrl: null,
-        tabRowCounts: {},
-        error: err instanceof Error ? err.message : String(err),
-      };
-    }
+  public async verifyGoogleSheetsConnection(opts?: {
+    oauthAccessToken?: string | null;
+    spreadsheetId?: string | null;
+  }): Promise<SheetsConnectionStatus> {
+    return this.sheets.verifyConnection(opts);
   }
 
   public async runPipeline(opts: {
     categories: string[];
     limit: number;
     page: number;
+    skipAutoSheetsSync?: boolean;
     onLog?: (msg: string) => void;
   }): Promise<Record<string, unknown>> {
     const log = opts.onLog ?? (() => {});
     const safePage = Math.max(1, opts.page);
     const limit = Math.max(1, opts.limit);
-    const verifier = new LiveSourceVerifier(this.config);
+    const verifier = new LiveSourceVerifier(this.config, this.http);
     const existingEntities = this.db.fetchDataset("canonical_entities") as unknown as CanonicalEntityRow[];
     const resolver = new EntityResolver(existingEntities);
 
@@ -2765,11 +3238,11 @@ export class AtlasBackendService {
       log(`[${cat}] Collecting page ${safePage} (limit=${limit})...`);
       let batch: { records: RawRecord[]; errors: CollectorError[]; hasMore: boolean };
       try {
-        if (cat === "startups") batch = await collectStartups(this.config, limit, safePage);
-        else if (cat === "products") batch = await collectProducts(this.config, limit, safePage);
-        else if (cat === "research_papers") batch = await collectResearchPapers(this.config, limit, safePage);
-        else if (cat === "jobs") batch = await collectJobs(this.config, limit, safePage);
-        else if (cat === "news") batch = await collectNews(this.config, limit, safePage);
+        if (cat === "startups") batch = await collectStartups(this.config, this.http, this.llmRouter, verifier, limit, safePage);
+        else if (cat === "products") batch = await collectProducts(this.config, this.http, verifier, limit, safePage);
+        else if (cat === "research_papers") batch = await collectResearchPapers(this.config, this.http, verifier, limit, safePage);
+        else if (cat === "jobs") batch = await collectJobs(this.config, this.http, verifier, limit, safePage);
+        else if (cat === "news") batch = await collectNews(this.config, this.http, verifier, limit, safePage);
         else continue;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -2833,7 +3306,7 @@ export class AtlasBackendService {
           rejected_missing_date: rejectedMissing,
           rejected_future_date: rejectedFuture,
         };
-        working = accepted;
+        working = accepted.slice(0, limit);
       }
 
       // Assign deterministic IDs & deduplicate
@@ -2905,13 +3378,18 @@ export class AtlasBackendService {
         }
       }
 
-      log(`[${cat}] Verifying ${uniqueRecords.length} records against live source URLs...`);
+      const bulkSnapshotOnly = uniqueRecords.length > 100;
+      log(
+        `[${cat}] Verifying ${uniqueRecords.length} records against live ${
+          bulkSnapshotOnly ? "API/feed snapshots" : "source URLs & websites"
+        }...`
+      );
       const checkedAtIso = new Date().toISOString();
       const verified = await mapConcurrent(uniqueRecords, this.config.maxConcurrency, (rec) =>
         verifier.verifyRecord(
           cat as "startups" | "products" | "research_papers" | "jobs" | "news",
           rec,
-          { liveCheck: true, checkedAtIso }
+          { liveCheck: true, bulkSnapshotOnly, checkedAtIso }
         )
       );
 
@@ -3002,6 +3480,7 @@ export class AtlasBackendService {
           checked_at: checkedAtIso,
         });
       }
+      // Keep audit inserts fast by sampling/bounding for huge batches if needed, or batch insert all
       this.db.recordAuditEntries(auditEntries);
 
       const nextCursor = batch.hasMore ? `page:${safePage + 1}` : `page:${safePage}`;
@@ -3056,12 +3535,26 @@ export class AtlasBackendService {
     const csvSummary = this.exportAllCsv();
     log("Refreshed CSV exports across all 6 datasets.");
 
+    let sheetsSync: SheetsSyncResult | null = null;
+    if (!opts.skipAutoSheetsSync && this.sheets.isConfigured()) {
+      log("Synchronizing collected records to Google Sheets (incremental mode)...");
+      sheetsSync = await this.sheets.exportOrSync("incremental");
+      if (sheetsSync.success) {
+        log(
+          `Google Sheets synced (+${sheetsSync.rowsAdded} added, ${sheetsSync.rowsUpdated} updated, ${sheetsSync.rowsUnchanged} unchanged).`
+        );
+      } else {
+        log(`Google Sheets sync failed: ${sheetsSync.error ?? "unknown error"}`);
+      }
+    }
+
     return {
       databaseCounts: this.db.countRecords(),
       verificationCounts: this.db.getVerificationCounts(),
       collectorErrors,
       qualityReport,
       csvExportDir: csvSummary.outputDir,
+      sheetsSync,
     };
   }
 
@@ -3070,7 +3563,7 @@ export class AtlasBackendService {
     liveCheck: boolean;
     removeDuplicates?: boolean;
   }): Promise<Record<string, unknown>> {
-    const verifier = new LiveSourceVerifier(this.config);
+    const verifier = new LiveSourceVerifier(this.config, this.http);
     const auditedCategories: Record<string, Record<VerificationStatus, number>> = {};
     const auditEntries: AuditEntryInput[] = [];
     let totalDuplicatesRemoved = 0;
@@ -3172,7 +3665,7 @@ export class AtlasBackendService {
         verifier.verifyRecord(
           cat as "startups" | "products" | "research_papers" | "jobs" | "news",
           rec,
-          { liveCheck: opts.liveCheck, checkedAtIso }
+          { liveCheck: opts.liveCheck, bulkSnapshotOnly: parsedRows.length > 200, checkedAtIso }
         )
       );
 
