@@ -643,6 +643,32 @@ export class AtlasDatabase {
     return this.fetchAll(`SELECT * FROM ${tableName} ORDER BY rowid ASC;`);
   }
 
+  public fetchCanonicalNameMap(): Map<string, string> {
+    this.initializeSchema();
+    const map = new Map<string, string>();
+    const ceRows = this.fetchAll(
+      "SELECT canonical_id, canonical_name FROM canonical_entities WHERE canonical_id IS NOT NULL AND canonical_name IS NOT NULL;"
+    );
+    for (const r of ceRows) {
+      const id = String(r.canonical_id ?? "").trim();
+      const name = String(r.canonical_name ?? "").trim();
+      if (id && name && !map.has(id)) {
+        map.set(id, name);
+      }
+    }
+    const logRows = this.fetchAll(
+      "SELECT canonical_id, canonical_name FROM entity_mapping_log WHERE canonical_id IS NOT NULL AND canonical_name IS NOT NULL;"
+    );
+    for (const r of logRows) {
+      const id = String(r.canonical_id ?? "").trim();
+      const name = String(r.canonical_name ?? "").trim();
+      if (id && name && !map.has(id)) {
+        map.set(id, name);
+      }
+    }
+    return map;
+  }
+
   public fetchDatasetWindow(
     tableName: string,
     opts?: { limit?: number; offset?: number; windowHours?: number | null; refNow?: Date }

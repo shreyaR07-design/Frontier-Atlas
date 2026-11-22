@@ -47,6 +47,7 @@ export const EXPORT_SPECS: ExportSpec[] = [
       "source_url",
       "collected_at",
       "canonical_entity_id",
+      "canonical_entity_name",
       ...TRACEABILITY_EXPORT_COLUMNS,
       "source_metadata_json",
     ],
@@ -67,6 +68,7 @@ export const EXPORT_SPECS: ExportSpec[] = [
       "source_url",
       "collected_at",
       "canonical_entity_id",
+      "canonical_entity_name",
       ...TRACEABILITY_EXPORT_COLUMNS,
       "source_metadata_json",
     ],
@@ -82,6 +84,7 @@ export const EXPORT_SPECS: ExportSpec[] = [
       "abstract",
       "authors",
       "publication_date",
+      "published_at",
       "doi",
       "arxiv_id",
       "github_repository",
@@ -108,6 +111,7 @@ export const EXPORT_SPECS: ExportSpec[] = [
       "posted_at",
       "application_url",
       "canonical_company_id",
+      "canonical_company_name",
       "source_name",
       "source_url",
       "collected_at",
@@ -813,20 +817,32 @@ export class GoogleSheetsService {
     });
   }
 
-  private buildDeduplicatedTabRows(spec: ExportSpec): {
+  private buildDeduplicatedTabRows(
+    spec: ExportSpec,
+    canonicalNames?: Map<string, string>
+  ): {
     orderedIds: string[];
     rowMap: Map<string, Array<string | number>>;
   } {
+    const namesMap = canonicalNames ?? this.db.fetchCanonicalNameMap();
     const rawRows = this.db.fetchDataset(spec.tableName);
     const orderedIds: string[] = [];
     const rowMap = new Map<string, Array<string | number>>();
     for (const row of rawRows) {
       const rid = String(row[spec.idColumn] ?? "").trim();
       if (!rid || rowMap.has(rid)) continue;
+      const enrichedRow: Record<string, unknown> = { ...row };
+      if (spec.tableName === "startups" || spec.tableName === "products") {
+        const cid = String(row.canonical_entity_id ?? "").trim();
+        enrichedRow.canonical_entity_name = cid ? namesMap.get(cid) ?? "" : "";
+      } else if (spec.tableName === "jobs") {
+        const cid = String(row.canonical_company_id ?? "").trim();
+        enrichedRow.canonical_company_name = cid ? namesMap.get(cid) ?? "" : "";
+      }
       orderedIds.push(rid);
       rowMap.set(
         rid,
-        spec.columns.map((c) => formatExportCell(c, row, true))
+        spec.columns.map((c) => formatExportCell(c, enrichedRow, true))
       );
     }
     return { orderedIds, rowMap };

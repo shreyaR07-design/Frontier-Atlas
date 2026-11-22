@@ -1,4 +1,3 @@
-import fs from "node:fs";
 import path from "node:path";
 import dotenv from "dotenv";
 import express from "express";
@@ -346,6 +345,21 @@ async function startServer(): Promise<void> {
     }
   });
 
+  app.get("/api/atlas/download/csv-bundle.zip", (_req, res) => {
+    try {
+      const bundle = atlas.buildCsvZipBundle();
+      res.setHeader("Content-Type", "application/zip");
+      res.setHeader("Content-Disposition", `attachment; filename="${bundle.filename}"`);
+      res.setHeader("Content-Length", String(bundle.buffer.length));
+      res.setHeader("Cache-Control", "no-store");
+      res.status(200).send(bundle.buffer);
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : "ZIP bundle export failed.",
+      });
+    }
+  });
+
   app.get("/api/atlas/download/csv/:filename", (req, res) => {
     const rawName = String(req.params.filename ?? "");
     const safeName = path.basename(rawName);
@@ -359,11 +373,17 @@ async function startServer(): Promise<void> {
       res.status(400).json({ error: "Invalid CSV export path." });
       return;
     }
-    if (!fs.existsSync(target)) {
-      res.status(404).json({ error: `CSV export '${safeName}' has not been generated yet.` });
-      return;
+    try {
+      const exported = atlas.exportSingleCsv(safeName);
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader("Content-Disposition", `attachment; filename="${safeName}"`);
+      res.setHeader("Cache-Control", "no-store");
+      res.status(200).send(exported.content);
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : `Failed to export '${safeName}'.`,
+      });
     }
-    res.download(target, safeName);
   });
 
   if (process.env.NODE_ENV !== "production") {

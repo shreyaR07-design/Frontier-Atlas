@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import {
   AlertTriangle,
+  Archive,
   ArrowRight,
   CalendarClock,
   CheckCircle2,
@@ -14,6 +15,7 @@ import {
   ShieldCheck,
   XCircle,
 } from "lucide-react";
+import { isGoogleOAuthBlockedMessage } from "../lib/googleWorkspaceAuth";
 import type {
   AtlasStatusResponse,
   DatasetCategory,
@@ -62,6 +64,7 @@ interface OverviewPanelProps {
   onExportSheets: () => void;
   onSyncSheets: () => void;
   onExportCsv: () => void;
+  onDownloadAllDatasets: () => void;
   onRetryStatus: () => void;
 }
 
@@ -79,6 +82,19 @@ const DATASET_META: DatasetSummaryMeta[] = [
   { key: "jobs", label: "Jobs", target: null, note: "Last 24h UTC across 9 job boards" },
   { key: "news", label: "News", target: null, note: "Last 24h UTC across 12+ RSS feeds & HN AI" },
   { key: "entity_mapping_log", label: "Entity Mapping Log", target: null, note: "Resolution decisions & confidence audit" },
+];
+
+const CSV_EXPORT_FILES: Array<{
+  key: DatasetCategory;
+  tabName: string;
+  filename: string;
+}> = [
+  { key: "startups", tabName: "Startups", filename: "startups.csv" },
+  { key: "products", tabName: "Products", filename: "products.csv" },
+  { key: "research_papers", tabName: "Research Papers", filename: "research_papers.csv" },
+  { key: "jobs", tabName: "Jobs", filename: "jobs.csv" },
+  { key: "news", tabName: "News", filename: "news.csv" },
+  { key: "entity_mapping_log", tabName: "Entity Mapping Log", filename: "entity_mapping_log.csv" },
 ];
 
 const SHEETS_TABS_ORDER = [
@@ -175,6 +191,7 @@ export function OverviewPanel({
   onExportSheets,
   onSyncSheets,
   onExportCsv,
+  onDownloadAllDatasets,
   onRetryStatus,
 }: OverviewPanelProps) {
   const [scheduleUtcInput, setScheduleUtcInput] = useState(
@@ -338,12 +355,34 @@ export function OverviewPanel({
 
             <button
               type="button"
+              onClick={onDownloadAllDatasets}
+              disabled={csvExporting}
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-60 text-slate-100 text-sm font-medium transition-colors whitespace-nowrap shrink-0 border border-slate-700/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
+              title="Export and download all 6 datasets as separate CSV files directly from SQLite"
+            >
+              <Download className="w-4 h-4 text-sky-400" />
+              <span>{csvExporting ? "Preparing CSVs..." : "Download All Datasets"}</span>
+            </button>
+
+            <a
+              href="/api/atlas/download/csv-bundle.zip"
+              download="frontier-atlas-datasets.zip"
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm font-medium transition-colors whitespace-nowrap shrink-0 border border-slate-700/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
+              title="Download a single ZIP archive containing all 6 CSV datasets from SQLite"
+            >
+              <Archive className="w-4 h-4 text-emerald-400" />
+              <span>Download ZIP</span>
+            </a>
+
+            <button
+              type="button"
               onClick={onExportCsv}
               disabled={csvExporting}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-60 text-slate-200 text-sm font-medium transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
+              className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-800/70 hover:bg-slate-700 disabled:opacity-60 text-slate-300 text-xs font-medium transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
+              title="Refresh CSV files on server disk without triggering browser downloads"
             >
-              <Download className="w-4 h-4" />
-              <span>{csvExporting ? "Exporting CSV..." : "Export CSV"}</span>
+              <RefreshCw className={`w-3.5 h-3.5 ${csvExporting ? "animate-spin" : ""}`} />
+              <span>Refresh CSVs</span>
             </button>
 
             <button
@@ -1032,11 +1071,121 @@ export function OverviewPanel({
               })}
             </div>
 
-            {sheetsStatus.status === "Sync Failed" && sheetsStatus.lastError && (
+            {(sheetsStatus.status === "Sync Failed" && sheetsStatus.lastError) && (
               <p className="text-xs text-rose-300 bg-rose-950/30 border border-rose-800/60 rounded-md p-2">
                 {sheetsStatus.lastError}
               </p>
             )}
+
+            {/* Honest OAuth Restriction Notice & Reliable CSV/ZIP Alternative Workflow */}
+            <div className="mt-4 pt-4 border-t border-slate-800/80 space-y-3">
+              <div
+                className={`rounded-lg border p-3 text-xs flex items-start gap-2.5 ${
+                  (sheetsFeedback && !sheetsFeedback.success && isGoogleOAuthBlockedMessage(sheetsFeedback.message)) ||
+                  (sheetsStatus.lastError && isGoogleOAuthBlockedMessage(sheetsStatus.lastError))
+                    ? "bg-amber-950/35 border-amber-700/60 text-amber-200"
+                    : "bg-[#070D1A] border-slate-800/80 text-slate-300"
+                }`}
+              >
+                <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                <div className="space-y-1">
+                  <div className="font-medium text-amber-300">
+                    {(sheetsFeedback && !sheetsFeedback.success && isGoogleOAuthBlockedMessage(sheetsFeedback.message)) ||
+                    (sheetsStatus.lastError && isGoogleOAuthBlockedMessage(sheetsStatus.lastError))
+                      ? "Google OAuth Blocked (Error 403: access_denied)"
+                      : "Google OAuth & Reliable CSV / ZIP Export Delivery"}
+                  </div>
+                  <p className="text-slate-300 leading-relaxed">
+                    Google OAuth may return <code className="text-amber-200">Error 403: access_denied</code> while the OAuth app has not completed Google verification. Direct Google Sheets API sync remains available for verified sessions, and you can export all <span className="font-mono text-slate-100">{totalRecords.toLocaleString()}</span> live SQLite records below as valid CSVs or a single ZIP archive with full timestamps, source URLs, verification statuses, canonical entity names, and GitHub metrics.
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h3 className="text-xs font-semibold text-slate-200 uppercase tracking-wider">
+                    Download All Datasets (Live SQLite Export)
+                  </h3>
+                  <p className="text-[11px] text-slate-400 mt-0.5">
+                    Includes <code className="text-slate-300">canonical_entity_name</code>, <code className="text-slate-300">canonical_company_name</code>, <code className="text-slate-300">published_at</code>, <code className="text-slate-300">github_repository</code>, <code className="text-slate-300">github_stars</code>, <code className="text-slate-300">source_url</code>, <code className="text-slate-300">verification_status</code>, and <code className="text-slate-300">source_metadata_json</code>.
+                  </p>
+                </div>
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={onDownloadAllDatasets}
+                    disabled={csvExporting}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-sky-600 hover:bg-sky-500 disabled:opacity-60 text-white text-xs font-medium transition-colors"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>{csvExporting ? "Exporting 6 CSVs..." : "Download All Datasets (6 CSVs)"}</span>
+                  </button>
+                  <a
+                    href="/api/atlas/download/csv-bundle.zip"
+                    download="frontier-atlas-datasets.zip"
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-medium transition-colors"
+                  >
+                    <Archive className="w-3.5 h-3.5" />
+                    <span>Download ZIP (All 6 CSVs)</span>
+                  </a>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 text-xs">
+                {CSV_EXPORT_FILES.map((item) => {
+                  const rowCount = status?.counts?.[item.key] ?? 0;
+                  return (
+                    <a
+                      key={item.filename}
+                      href={`/api/atlas/download/csv/${item.filename}`}
+                      download={item.filename}
+                      className="flex items-center justify-between gap-2 rounded-md bg-[#070D1A] border border-slate-800/80 hover:border-sky-500/60 px-2.5 py-2 transition-colors group"
+                    >
+                      <div className="min-w-0">
+                        <div className="text-slate-200 font-medium truncate group-hover:text-sky-300">
+                          {item.tabName}
+                        </div>
+                        <div className="font-mono text-[11px] text-slate-500 truncate">
+                          {item.filename} · {rowCount.toLocaleString()} rows
+                        </div>
+                      </div>
+                      <Download className="w-3.5 h-3.5 text-slate-400 group-hover:text-sky-400 shrink-0" />
+                    </a>
+                  );
+                })}
+              </div>
+
+              <div className="rounded-lg bg-[#070D1A] border border-slate-800/80 p-3 space-y-2 text-xs">
+                <div className="font-medium text-slate-200">
+                  Manual Import Guide: 6 CSVs into One Google Spreadsheet &amp; Share
+                </div>
+                <ol className="list-decimal list-inside space-y-1 text-slate-400 leading-relaxed">
+                  <li>
+                    Click <strong className="text-slate-200">Download ZIP (All 6 CSVs)</strong> and unzip <code className="text-slate-300">frontier-atlas-datasets.zip</code>, or click <strong className="text-slate-200">Download All Datasets (6 CSVs)</strong> above.
+                  </li>
+                  <li>
+                    Open Google Sheets (<code className="text-slate-300">sheets.new</code>) and create one blank spreadsheet (for example, <code className="text-slate-300">FrontierAtlas Intelligence</code>).
+                  </li>
+                  <li>
+                    Rename the first tab to <code className="text-slate-200">Startups</code>, then click <strong className="text-slate-200">File &rarr; Import &rarr; Upload</strong>, select <code className="text-slate-300">startups.csv</code>, choose <strong className="text-slate-200">Replace current sheet</strong> (Separator type: Detect automatically), and click <strong className="text-slate-200">Import data</strong>.
+                  </li>
+                  <li>
+                    Create five additional tabs named exactly{" "}
+                    <code className="text-slate-200">Products</code>,{" "}
+                    <code className="text-slate-200">Research Papers</code>,{" "}
+                    <code className="text-slate-200">Jobs</code>,{" "}
+                    <code className="text-slate-200">News</code>, and{" "}
+                    <code className="text-slate-200">Entity Mapping Log</code>, and import <code className="text-slate-300">products.csv</code>, <code className="text-slate-300">research_papers.csv</code>, <code className="text-slate-300">jobs.csv</code>, <code className="text-slate-300">news.csv</code>, and <code className="text-slate-300">entity_mapping_log.csv</code> into each matching tab using <strong className="text-slate-200">Replace current sheet</strong>.
+                  </li>
+                  <li>
+                    Verify all 6 tab names and data row counts match the SQLite counts displayed above ({totalRecords.toLocaleString()} total data rows across 6 tabs).
+                  </li>
+                  <li>
+                    Click <strong className="text-slate-200">Share</strong> (top right) &rarr; under <strong className="text-slate-200">General access</strong> select <strong className="text-slate-200">Anyone with the link</strong> with role <strong className="text-slate-200">Viewer</strong>, then click <strong className="text-slate-200">Copy link</strong>.
+                  </li>
+                </ol>
+              </div>
+            </div>
           </div>
         </div>
       </section>

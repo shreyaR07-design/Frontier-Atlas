@@ -12,10 +12,12 @@ import { SheetsConfirmModal } from "./components/SheetsConfirmModal";
 import { Sidebar } from "./components/Sidebar";
 import {
   clearGoogleAccessToken,
+  formatGoogleAuthError,
   getGoogleAccessToken,
   googleSignIn,
   googleSignOut,
   initGoogleAuth,
+  isGoogleOAuthBlockedMessage,
   isGoogleTokenValid,
   updateGoogleTokenExpiry,
 } from "./lib/googleWorkspaceAuth";
@@ -475,11 +477,12 @@ export default function App() {
       await handleTestGoogleConnection(accessToken);
     } catch (err) {
       setGoogleHasToken(isGoogleTokenValid());
+      const formatted = formatGoogleAuthError(err);
       setSheetsFeedback({
         success: false,
-        message: err instanceof Error ? err.message : String(err),
+        message: formatted,
         url: null,
-        needsReauth: true,
+        needsReauth: !isGoogleOAuthBlockedMessage(formatted),
       });
     } finally {
       setGoogleSigningIn(false);
@@ -623,14 +626,15 @@ export default function App() {
           setSheetsConfirmMode(mode);
         }
       } catch (err) {
+        const formatted = formatGoogleAuthError(err);
+        const blocked = isGoogleOAuthBlockedMessage(formatted);
         setSheetsFeedback({
           success: false,
-          message:
-            err instanceof Error
-              ? `Google sign-in is required to create or write spreadsheets: ${err.message}`
-              : "Google sign-in is required to create or write spreadsheets.",
+          message: blocked
+            ? formatted
+            : `Google sign-in is required to create or write spreadsheets: ${formatted}`,
           url: null,
-          needsReauth: true,
+          needsReauth: !blocked,
         });
       } finally {
         setGoogleSigningIn(false);
@@ -648,22 +652,56 @@ export default function App() {
     void startSheetsFlow("incremental");
   };
 
-  const handleExportCsv = async () => {
+  const triggerBrowserFileDownload = (url: string, filename: string) => {
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    link.style.display = "none";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  const handleExportCsv = async (downloadSeparateFiles = false) => {
     setCsvExporting(true);
     setSheetsFeedback(null);
     try {
       const resp = await fetch("/api/atlas/export/csv", { method: "POST" });
-      const data = await readJsonSafe<{ rowCounts?: Record<string, number>; error?: string }>(resp);
+      const data = await readJsonSafe<{
+        rowCounts?: Record<string, number>;
+        totalRows?: number;
+        datasets?: Array<{ filename: string; tabName: string; rowCount: number; downloadUrl: string }>;
+        error?: string;
+      }>(resp);
       if (!resp.ok) {
         throw new Error(data.error || `HTTP ${resp.status}`);
       }
       void loadStatus();
+      const totalExported =
+        typeof data.totalRows === "number"
+          ? data.totalRows
+          : Object.values(data.rowCounts || {}).reduce((a: number, b: unknown) => a + Number(b || 0), 0);
+
+      if (downloadSeparateFiles) {
+        const files =
+          Array.isArray(data.datasets) && data.datasets.length > 0
+            ? data.datasets.map((d) => ({ filename: d.filename, downloadUrl: d.downloadUrl }))
+            : Object.values(DATASET_CSV_NAMES).map((filename) => ({
+                filename,
+                downloadUrl: `/api/atlas/download/csv/${filename}`,
+              }));
+        files.forEach((f, idx) => {
+          window.setTimeout(() => {
+            triggerBrowserFileDownload(f.downloadUrl, f.filename);
+          }, idx * 320);
+        });
+      }
+
       setSheetsFeedback({
         success: true,
-        message: `CSV exports refreshed (${Object.values(data.rowCounts || {}).reduce(
-          (a: number, b: unknown) => a + Number(b || 0),
-          0
-        ).toLocaleString()} total rows written to frontier-atlas/data/exports).`,
+        message: downloadSeparateFiles
+          ? `Prepared and started download for all 6 live SQLite CSV datasets (${totalExported.toLocaleString()} total rows). If your browser pauses multiple downloads, use the ZIP bundle or individual file links in the Delivery panel below.`
+          : `All 6 live SQLite CSV exports refreshed (${totalExported.toLocaleString()} total rows). Download individual CSVs or the single ZIP bundle below.`,
       });
     } catch (err) {
       setSheetsFeedback({
@@ -789,7 +827,8 @@ export default function App() {
               onAuditRecords={handleAuditRecords}
               onExportSheets={handleExportSheets}
               onSyncSheets={handleSyncSheets}
-              onExportCsv={handleExportCsv}
+              onExportCsv={() => void handleExportCsv(false)}
+              onDownloadAllDatasets={() => void handleExportCsv(true)}
               onRetryStatus={loadStatus}
             />
           ) : (
@@ -802,7 +841,7 @@ export default function App() {
               loading={datasetLoading}
               error={datasetError}
               hasCsvExport={Boolean(
-                status?.csvExports.includes(DATASET_CSV_NAMES[activeSection])
+                status || datasetRows.length > 0 || datasetTotalCount > 0 || DATASET_CSV_NAMES[activeSection]
               )}
               windowMode={datasetWindow}
               onWindowModeChange={setDatasetWindow}

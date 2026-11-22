@@ -18,6 +18,7 @@ import {
 } from "./atlasDb.ts";
 import {
   EXPORT_SPECS,
+  type ExportSpec,
   GoogleSheetsService,
   type SheetsConnectionStatus,
   type SheetsSyncResult,
@@ -31,6 +32,7 @@ import {
   OpenAICompatibleLLMProvider,
   redactSecrets,
 } from "./llmRouter.ts";
+import { createZipArchive } from "./zipArchive.ts";
 
 export interface AtlasConfig {
   rootDir: string;
@@ -4714,7 +4716,9 @@ export class AtlasBackendService {
             const starsParsed = starsRaw && /^\d+$/.test(starsRaw) ? Number(starsRaw) : null;
             const meta = parseJsonMeta(r.source_metadata_json);
             const publishedAt =
-              typeof meta.published_at_utc === "string" && meta.published_at_utc
+              r.published_at?.trim()
+                ? r.published_at.trim()
+                : typeof meta.published_at_utc === "string" && meta.published_at_utc
                 ? meta.published_at_utc
                 : null;
             return {
@@ -5277,40 +5281,186 @@ export class AtlasBackendService {
     return { entries, count: entries.length };
   }
 
+  private buildCsvForSpec(
+    spec: ExportSpec,
+    canonicalNames: Map<string, string>
+  ): {
+    tableName: string;
+    tabName: string;
+    csvFilename: string;
+    rowCount: number;
+    content: string;
+  } {
+    const rawRows = this.db.fetchDataset(spec.tableName);
+    const seenIds = new Set<string>();
+    const lines: string[] = [spec.columns.map(csvEscape).join(",")];
+    let count = 0;
+
+    for (const row of rawRows) {
+      const rowId = String(row[spec.idColumn] ?? "");
+      if (!rowId || seenIds.has(rowId)) continue;
+      seenIds.add(rowId);
+
+      const enrichedRow: Record<string, unknown> = { ...row };
+      if (spec.tableName === "startups" || spec.tableName === "products") {
+        const cid = String(row.canonical_entity_id ?? "").trim();
+        enrichedRow.canonical_entity_name = cid ? canonicalNames.get(cid) ?? "" : "";
+      } else if (spec.tableName === "jobs") {
+        const cid = String(row.canonical_company_id ?? "").trim();
+        enrichedRow.canonical_company_name = cid ? canonicalNames.get(cid) ?? "" : "";
+      }
+
+      const cells = spec.columns.map((col) => csvEscape(formatExportCell(col, enrichedRow, false)));
+      lines.push(cells.join(","));
+      count++;
+    }
+
+    return {
+      tableName: spec.tableName,
+      tabName: spec.tabName,
+      csvFilename: spec.csvFilename,
+      rowCount: count,
+      content: `${lines.join("\n")}\n`,
+    };
+  }
+
+  public buildAllCsvDatasets(): {
+    datasets: Array<{
+      tableName: string;
+      tabName: string;
+      csvFilename: string;
+      rowCount: number;
+      byteSize: number;
+      content: string;
+    }>;
+    rowCounts: Record<string, number>;
+    totalRows: number;
+  } {
+    const canonicalNames = this.db.fetchCanonicalNameMap();
+    const datasets: Array<{
+      tableName: string;
+      tabName: string;
+      csvFilename: string;
+      rowCount: number;
+      byteSize: number;
+      content: string;
+    }> = [];
+    const rowCounts: Record<string, number> = {};
+    let totalRows = 0;
+
+    for (const spec of EXPORT_SPECS) {
+      const built = this.buildCsvForSpec(spec, canonicalNames);
+      const byteSize = Buffer.byteLength(built.content, "utf-8");
+      datasets.push({ ...built, byteSize });
+      rowCounts[spec.tabName] = built.rowCount;
+      totalRows += built.rowCount;
+    }
+
+    return { datasets, rowCounts, totalRows };
+  }
+
+  public exportSingleCsv(csvFilename: string): {
+    tableName: string;
+    tabName: string;
+    csvFilename: string;
+    rowCount: number;
+    filePath: string;
+    content: string;
+  } {
+    const spec = EXPORT_SPECS.find((s) => s.csvFilename === csvFilename);
+    if (!spec) {
+      throw new Error(`Unsupported CSV filename: ${csvFilename}`);
+    }
+    const canonicalNames = this.db.fetchCanonicalNameMap();
+    const built = this.buildCsvForSpec(spec, canonicalNames);
+    fs.mkdirSync(this.config.exportsDir, { recursive: true });
+    const targetFile = path.resolve(this.config.exportsDir, spec.csvFilename);
+    fs.writeFileSync(targetFile, built.content, "utf-8");
+    return {
+      ...built,
+      filePath: targetFile,
+    };
+  }
+
   public exportAllCsv(): {
     outputDir: string;
     rowCounts: Record<string, number>;
     files: Record<string, string>;
+    totalRows: number;
+    datasets: Array<{
+      tableName: string;
+      tabName: string;
+      filename: string;
+      rowCount: number;
+      byteSize: number;
+      downloadUrl: string;
+    }>;
   } {
     fs.mkdirSync(this.config.exportsDir, { recursive: true });
-    const rowCounts: Record<string, number> = {};
+    const built = this.buildAllCsvDatasets();
     const files: Record<string, string> = {};
+    const datasetSummaries: Array<{
+      tableName: string;
+      tabName: string;
+      filename: string;
+      rowCount: number;
+      byteSize: number;
+      downloadUrl: string;
+    }> = [];
 
-    for (const spec of EXPORT_SPECS) {
-      const rawRows = this.db.fetchDataset(spec.tableName);
-      const seenIds = new Set<string>();
-      const lines: string[] = [spec.columns.map(csvEscape).join(",")];
-      let count = 0;
-
-      for (const row of rawRows) {
-        const rowId = String(row[spec.idColumn] ?? "");
-        if (!rowId || seenIds.has(rowId)) continue;
-        seenIds.add(rowId);
-        const cells = spec.columns.map((col) => csvEscape(formatExportCell(col, row, false)));
-        lines.push(cells.join(","));
-        count++;
-      }
-
-      const targetFile = path.resolve(this.config.exportsDir, spec.csvFilename);
-      fs.writeFileSync(targetFile, `${lines.join("\n")}\n`, "utf-8");
-      rowCounts[spec.tabName] = count;
-      files[spec.tabName] = targetFile;
+    for (const ds of built.datasets) {
+      const targetFile = path.resolve(this.config.exportsDir, ds.csvFilename);
+      fs.writeFileSync(targetFile, ds.content, "utf-8");
+      files[ds.tabName] = targetFile;
+      datasetSummaries.push({
+        tableName: ds.tableName,
+        tabName: ds.tabName,
+        filename: ds.csvFilename,
+        rowCount: ds.rowCount,
+        byteSize: ds.byteSize,
+        downloadUrl: `/api/atlas/download/csv/${ds.csvFilename}`,
+      });
     }
 
     return {
       outputDir: this.config.exportsDir,
-      rowCounts,
+      rowCounts: built.rowCounts,
       files,
+      totalRows: built.totalRows,
+      datasets: datasetSummaries,
+    };
+  }
+
+  public buildCsvZipBundle(): {
+    filename: string;
+    buffer: Buffer;
+    rowCounts: Record<string, number>;
+    fileSizes: Record<string, number>;
+    totalRows: number;
+  } {
+    fs.mkdirSync(this.config.exportsDir, { recursive: true });
+    const built = this.buildAllCsvDatasets();
+    const fileSizes: Record<string, number> = {};
+    const modifiedAt = new Date();
+
+    const entries = built.datasets.map((ds) => {
+      const targetFile = path.resolve(this.config.exportsDir, ds.csvFilename);
+      fs.writeFileSync(targetFile, ds.content, "utf-8");
+      fileSizes[ds.csvFilename] = ds.byteSize;
+      return {
+        filename: ds.csvFilename,
+        content: ds.content,
+        modifiedAt,
+      };
+    });
+
+    const buffer = createZipArchive(entries);
+    return {
+      filename: "frontier-atlas-datasets.zip",
+      buffer,
+      rowCounts: built.rowCounts,
+      fileSizes,
+      totalRows: built.totalRows,
     };
   }
 

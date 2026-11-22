@@ -65,23 +65,50 @@ export function initGoogleAuth(
   });
 }
 
+export function isGoogleOAuthBlockedMessage(messageOrErr: unknown): boolean {
+  const raw =
+    messageOrErr instanceof Error
+      ? messageOrErr.message
+      : typeof messageOrErr === "string"
+      ? messageOrErr
+      : JSON.stringify(messageOrErr ?? "");
+  return /access_denied|403|unverified|verification|org_internal|not completed google|testing|disallowed|unauthorized-client/i.test(
+    raw
+  );
+}
+
 export function formatGoogleAuthError(err: unknown): string {
   const code =
     err && typeof err === "object" && "code" in err ? String((err as { code?: unknown }).code ?? "") : "";
+  const customMsg =
+    err &&
+    typeof err === "object" &&
+    "customData" in err &&
+    (err as { customData?: { message?: unknown } }).customData?.message
+      ? String((err as { customData?: { message?: unknown } }).customData?.message)
+      : "";
   const rawMsg = err instanceof Error ? err.message : String(err);
+  const combined = `${code} ${rawMsg} ${customMsg}`.trim();
 
+  if (
+    /access_denied|\b403\b|unverified|verification process|not completed.*verification|org_internal|disallowed_useragent|unauthorized-client/i.test(
+      combined
+    )
+  ) {
+    return "Google OAuth authorization was blocked (Error 403: access_denied). The OAuth application has not completed Google's verification process, so direct Google Sheets sign-in is restricted. Use Download All Datasets (6 CSVs) or Download ZIP below to import all SQLite records directly into Google Sheets.";
+  }
   if (code === "auth/popup-blocked") {
-    return "Google Sign-In popup was blocked by your browser. Allow popups for this site and click 'Sign in with Google' again.";
+    return "Google Sign-In popup was blocked by your browser. Allow popups for this site and click 'Sign in with Google' again, or use the CSV / ZIP download workflow below.";
   }
   if (code === "auth/popup-closed-by-user" || code === "auth/cancelled-popup-request") {
-    return "Google Sign-In popup was closed before completing authorization. Click 'Sign in with Google' and approve Google Drive & Sheets permissions.";
+    return "Google Sign-In popup was closed before completing authorization. Click 'Sign in with Google' to retry, or use the CSV / ZIP download workflow below.";
   }
   if (code === "auth/unauthorized-domain") {
     const origin = typeof window !== "undefined" ? window.location.origin : "this origin";
-    return `Domain (${origin}) is not authorized in Firebase Auth OAuth settings (auth/unauthorized-domain). Add the preview hostname to Firebase Authentication -> Authorized domains and GCP OAuth Client Authorized JavaScript origins.`;
+    return `Domain (${origin}) is not authorized in Firebase Auth OAuth settings (auth/unauthorized-domain). Add the preview hostname to Firebase Authentication -> Authorized domains, or use the CSV / ZIP download workflow below.`;
   }
   if (code === "auth/network-request-failed") {
-    return "Network error during Google Sign-In. Check your connection and try again.";
+    return "Network error during Google Sign-In. Check your connection and try again, or use the CSV / ZIP download workflow below.";
   }
   return rawMsg;
 }

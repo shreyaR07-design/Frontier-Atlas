@@ -5,6 +5,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import zlib from "node:zlib";
 import {
   AtlasBackendService,
   classifyJobRoleFamily,
@@ -35,7 +36,11 @@ import {
   TransientProviderError,
   type LLMProvider,
 } from "../server/llmRouter.ts";
-import { GOOGLE_WORKSPACE_SCOPES } from "../lib/googleWorkspaceAuth.ts";
+import {
+  formatGoogleAuthError,
+  GOOGLE_WORKSPACE_SCOPES,
+  isGoogleOAuthBlockedMessage,
+} from "../lib/googleWorkspaceAuth.ts";
 
 async function withHttpServer(
   handler: (req: http.IncomingMessage, res: http.ServerResponse, body: string) => void
@@ -2867,4 +2872,254 @@ test("GoogleSheetsService honors createNew=true by ignoring persisted spreadshee
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+function readZipEntriesForTest(zipBuf: Buffer): Map<string, string> {
+  const files = new Map<string, string>();
+  let offset = 0;
+  while (offset + 30 <= zipBuf.length) {
+    const sig = zipBuf.readUInt32LE(offset);
+    if (sig !== 0x04034b50) break;
+    const method = zipBuf.readUInt16LE(offset + 8);
+    const expectedCrc = zipBuf.readUInt32LE(offset + 14);
+    const compSize = zipBuf.readUInt32LE(offset + 18);
+    const uncompSize = zipBuf.readUInt32LE(offset + 22);
+    const nameLen = zipBuf.readUInt16LE(offset + 26);
+    const extraLen = zipBuf.readUInt16LE(offset + 28);
+    const nameStart = offset + 30;
+    const filename = zipBuf.subarray(nameStart, nameStart + nameLen).toString("utf-8");
+    const dataStart = nameStart + nameLen + extraLen;
+    const compBuf = zipBuf.subarray(dataStart, dataStart + compSize);
+    const rawBuf = method === 8 ? zlib.inflateRawSync(compBuf) : compBuf;
+    assert.equal(rawBuf.length, uncompSize, `Size mismatch for ${filename}`);
+    assert.equal(zlib.crc32(rawBuf) >>> 0, expectedCrc, `CRC32 mismatch for ${filename}`);
+    files.set(filename, rawBuf.toString("utf-8"));
+    offset = dataStart + compSize;
+  }
+  return files;
+}
+
+test("All 6 SQLite CSV exports and ZIP bundle preserve canonical names, timestamps, GitHub metrics, URLs, and verification statuses", () => {
+  const tmpAtlasDir = fs.mkdtempSync(path.join(os.tmpdir(), "atlas-csv-zip-test-"));
+  const dataDir = path.join(tmpAtlasDir, "data");
+  fs.mkdirSync(dataDir, { recursive: true });
+  const prevDbUrl = process.env.DATABASE_URL;
+  delete process.env.DATABASE_URL;
+
+  try {
+    const svc = new AtlasBackendService(tmpAtlasDir);
+    const db = (svc as unknown as { db: AtlasDatabase }).db;
+    const nowIso = "2026-11-22T07:00:00.000Z";
+
+    db.upsertCanonicalEntities([
+      {
+        canonical_id: "ent_test_acme",
+        canonical_name: "Acme AI Labs",
+        normalized_name: "acme ai labs",
+        entity_type: "startup",
+        primary_domain: "acme.ai",
+        aliases_json: JSON.stringify(["Acme AI", "Acme AI Labs"]),
+        created_at: nowIso,
+      },
+    ]);
+    db.upsertStartups([
+      {
+        startup_id: "stp_zip_1",
+        name: "Acme AI",
+        description: "Foundation safety tools",
+        website: "https://acme.ai",
+        official_website: "https://acme.ai",
+        industry: "AI Safety",
+        location: "San Francisco, CA",
+        founding_date: "2024-05-01",
+        source_name: "yc_oss",
+        source_url: "https://www.ycombinator.com/companies/acme-ai",
+        source_title: "Acme AI | YC",
+        collected_at: nowIso,
+        last_checked_at: nowIso,
+        supported_fields: ["name", "website", "location"],
+        verification_status: "Verified",
+        rejection_reason: null,
+        canonical_entity_id: "ent_test_acme",
+        source_metadata: { confidence_score: 0.96 },
+      },
+    ]);
+    db.upsertProducts([
+      {
+        product_id: "prd_zip_1",
+        name: "Acme Guard",
+        description: "Runtime guardrail proxy",
+        website: "https://acme.ai/guard",
+        official_website: "https://acme.ai/guard",
+        category: "Security",
+        company_name: "Acme AI Labs",
+        source_name: "github",
+        source_url: "https://github.com/acme/guard",
+        source_title: "acme/guard",
+        collected_at: nowIso,
+        last_checked_at: nowIso,
+        supported_fields: ["name", "website"],
+        verification_status: "Verified",
+        rejection_reason: null,
+        canonical_entity_id: "ent_test_acme",
+        source_metadata: { github_stars: 512 },
+      },
+    ]);
+    db.upsertResearchPapers([
+      {
+        paper_id: "pap_zip_1",
+        title: "Verifiable Runtime Guardrails",
+        abstract: "Open implementation on GitHub.",
+        authors: ["Ada Lovelace", "Grace Hopper"],
+        publication_date: "2026-11-22",
+        published_at: nowIso,
+        doi: "10.1000/guard.2026",
+        arxiv_id: "2611.09999",
+        github_repository: "https://github.com/acme/guard-paper",
+        github_stars: 345,
+        official_website: null,
+        source_name: "arxiv",
+        source_url: "https://arxiv.org/abs/2611.09999",
+        source_title: "Verifiable Runtime Guardrails",
+        collected_at: nowIso,
+        last_checked_at: nowIso,
+        supported_fields: ["title", "github_repository"],
+        verification_status: "Verified",
+        rejection_reason: null,
+        source_metadata: { github_metrics: { stars: 345 } },
+      },
+    ]);
+    db.upsertJobs([
+      {
+        job_id: "job_zip_1",
+        title: "Staff AI Safety Engineer",
+        company: "Acme AI",
+        location: "Remote",
+        employment_type: "Full-Time",
+        description: "Build deterministic safety checks.",
+        posted_at: nowIso,
+        application_url: "https://acme.ai/careers/1",
+        official_website: "https://acme.ai",
+        source_name: "ashby:acme",
+        source_url: "https://acme.ai/careers/1",
+        source_title: "Staff AI Safety Engineer",
+        collected_at: nowIso,
+        last_checked_at: nowIso,
+        supported_fields: ["title", "company"],
+        verification_status: "Verified",
+        rejection_reason: null,
+        canonical_company_id: "ent_test_acme",
+        source_metadata: {},
+      },
+    ]);
+    db.upsertNews([
+      {
+        news_id: "nws_zip_1",
+        headline: "Acme AI Labs Launches Guard v2",
+        summary: "Guard v2 adds zero-latency verification.",
+        publisher: "AI Chronicle",
+        published_at: nowIso,
+        article_url: "https://aichronicle.example/acme-guard-v2",
+        official_website: "https://acme.ai",
+        category: "AI",
+        source_name: "ai_chronicle",
+        source_url: "https://aichronicle.example/rss",
+        source_title: "Acme AI Labs Launches Guard v2",
+        collected_at: nowIso,
+        last_checked_at: nowIso,
+        supported_fields: ["headline", "published_at"],
+        verification_status: "Verified",
+        rejection_reason: null,
+        source_metadata: {},
+      },
+    ]);
+    db.upsertEntityMappingLogs([
+      {
+        mapping_id: "map_zip_1",
+        raw_name: "Acme AI",
+        normalized_name: "acme ai",
+        canonical_name: "Acme AI Labs",
+        canonical_id: "ent_test_acme",
+        source_url: "https://www.ycombinator.com/companies/acme-ai",
+        match_method: "exact_alias",
+        confidence: 0.99,
+        decision: "auto_merge",
+        timestamp: nowIso,
+        entity_type: "startup",
+        match_reason: "Exact domain and alias match",
+      },
+    ]);
+
+    const csvRes = svc.exportAllCsv();
+    assert.equal(csvRes.totalRows, 6);
+    assert.equal(csvRes.datasets.length, 6);
+
+    const zipBundle = svc.buildCsvZipBundle();
+    assert.equal(zipBundle.filename, "frontier-atlas-datasets.zip");
+    assert.equal(zipBundle.totalRows, 6);
+    const extracted = readZipEntriesForTest(zipBundle.buffer);
+    assert.deepEqual(
+      Array.from(extracted.keys()),
+      [
+        "startups.csv",
+        "products.csv",
+        "research_papers.csv",
+        "jobs.csv",
+        "news.csv",
+        "entity_mapping_log.csv",
+      ]
+    );
+
+    const startupsCsv = extracted.get("startups.csv")!;
+    assert.ok(startupsCsv.includes("canonical_entity_name"));
+    assert.ok(startupsCsv.includes("Acme AI Labs"));
+    assert.ok(startupsCsv.includes("https://www.ycombinator.com/companies/acme-ai"));
+    assert.ok(startupsCsv.includes("Verified"));
+
+    const productsCsv = extracted.get("products.csv")!;
+    assert.ok(productsCsv.includes("canonical_entity_name"));
+    assert.ok(productsCsv.includes("Acme AI Labs"));
+
+    const papersCsv = extracted.get("research_papers.csv")!;
+    assert.ok(papersCsv.includes("published_at"));
+    assert.ok(papersCsv.includes(nowIso));
+    assert.ok(papersCsv.includes("https://github.com/acme/guard-paper"));
+    assert.ok(papersCsv.includes("345"));
+
+    const jobsCsv = extracted.get("jobs.csv")!;
+    assert.ok(jobsCsv.includes("canonical_company_name"));
+    assert.ok(jobsCsv.includes("Acme AI Labs"));
+    assert.ok(jobsCsv.includes("https://acme.ai/careers/1"));
+
+    const newsCsv = extracted.get("news.csv")!;
+    assert.ok(newsCsv.includes("Acme AI Labs Launches Guard v2"));
+    assert.ok(newsCsv.includes(nowIso));
+
+    const mappingCsv = extracted.get("entity_mapping_log.csv")!;
+    assert.ok(mappingCsv.includes("Acme AI Labs"));
+    assert.ok(mappingCsv.includes("0.9900"));
+
+    // Single CSV export matches exact ZIP entry content
+    const single = svc.exportSingleCsv("research_papers.csv");
+    assert.equal(single.rowCount, 1);
+    assert.equal(single.content, papersCsv);
+
+    svc.close();
+  } finally {
+    if (prevDbUrl !== undefined) process.env.DATABASE_URL = prevDbUrl;
+    fs.rmSync(tmpAtlasDir, { recursive: true, force: true });
+  }
+});
+
+test("Google OAuth error formatter explicitly detects Error 403 access_denied blocks", () => {
+  const err403 = Object.assign(new Error("Firebase: Error 403 (access_denied) app has not completed Google verification"), {
+    code: "auth/oauth-error",
+  });
+  const msg = formatGoogleAuthError(err403);
+  assert.ok(msg.includes("Error 403: access_denied"));
+  assert.ok(msg.includes("verification"));
+  assert.equal(isGoogleOAuthBlockedMessage(msg), true);
+  assert.equal(isGoogleOAuthBlockedMessage(err403), true);
+  assert.equal(isGoogleOAuthBlockedMessage("Export Successful"), false);
+});
+
 
