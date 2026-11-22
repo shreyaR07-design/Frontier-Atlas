@@ -17,6 +17,7 @@ import type {
 interface DatasetViewProps {
   category: DatasetCategory;
   rows: AnyDatasetRow[];
+  totalCount?: number;
   categoryFailures?: FailureLogRow[];
   loading: boolean;
   error: string | null;
@@ -199,6 +200,7 @@ function VerificationStatusCell({
 export function DatasetView({
   category,
   rows,
+  totalCount,
   categoryFailures = [],
   loading,
   error,
@@ -214,10 +216,15 @@ export function DatasetView({
   const [verificationFilter, setVerificationFilter] = useState<string>("all");
   const [decisionFilter, setDecisionFilter] = useState("all");
   const [githubOnly, setGithubOnly] = useState(false);
+  const [visibleLimit, setVisibleLimit] = useState(250);
   const [selectedRow, setSelectedRow] = useState<AnyDatasetRow | null>(null);
   const [rowAuditTrail, setRowAuditTrail] = useState<AuditTrailEntry[]>([]);
   const [rowAuditLoading, setRowAuditLoading] = useState(false);
   const [showRawFields, setShowRawFields] = useState(false);
+
+  useEffect(() => {
+    setVisibleLimit(250);
+  }, [category, windowMode, search, sourceFilter, verificationFilter, decisionFilter, githubOnly]);
 
   const info = CATEGORY_INFO[category];
   const supportsVerification = category !== "entity_mapping_log";
@@ -252,6 +259,15 @@ export function DatasetView({
       cancelled = true;
     };
   }, [category, selectedRow]);
+
+  useEffect(() => {
+    if (!selectedRow) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setSelectedRow(null);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [selectedRow]);
 
   const availableSources = useMemo(() => {
     const set = new Set<string>();
@@ -329,7 +345,7 @@ export function DatasetView({
           </div>
           <div className="flex items-center gap-3 shrink-0">
             <span className="font-mono text-xs text-slate-400 tabular-nums">
-              {filteredRows.length.toLocaleString()} / {rows.length.toLocaleString()} rows
+              {filteredRows.length.toLocaleString()} / {(totalCount ?? rows.length).toLocaleString()} rows
             </span>
             {hasCsvExport && rows.length > 0 && (
               <a
@@ -636,7 +652,7 @@ export function DatasetView({
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/60">
-                {filteredRows.map((row, idx) => {
+                {filteredRows.slice(0, visibleLimit).map((row, idx) => {
                   if (category === "startups") {
                     const r = row as StartupRow;
                     return (
@@ -1114,6 +1130,30 @@ export function DatasetView({
               </tbody>
             </table>
           </div>
+          {filteredRows.length > visibleLimit && (
+            <div className="border-t border-slate-800/80 bg-[#0B1324] px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs">
+              <span className="font-mono text-slate-400 tabular-nums">
+                Showing {Math.min(visibleLimit, filteredRows.length).toLocaleString()} of{" "}
+                {filteredRows.length.toLocaleString()} matching rows
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setVisibleLimit((v) => v + 250)}
+                  className="px-3 py-1.5 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium transition-colors"
+                >
+                  Show 250 more
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setVisibleLimit(filteredRows.length)}
+                  className="px-3 py-1.5 rounded-md bg-sky-600/80 hover:bg-sky-600 text-white font-medium transition-colors"
+                >
+                  Show All ({filteredRows.length.toLocaleString()})
+                </button>
+              </div>
+            </div>
+          )}
         </div>
 
         {filteredCategoryFailures.length > 0 && (
@@ -1231,8 +1271,14 @@ export function DatasetView({
             : "text-amber-400";
 
         return (
-          <div className="fixed inset-0 z-50 flex justify-end bg-black/60 backdrop-blur-xs">
-            <div className="w-full max-w-xl bg-[#0B1324] border-l border-slate-800 h-full overflow-y-auto p-6 space-y-5">
+          <div
+            className="fixed inset-0 z-50 flex justify-end bg-black/60 backdrop-blur-xs"
+            onClick={() => setSelectedRow(null)}
+          >
+            <div
+              className="w-full max-w-xl bg-[#0B1324] border-l border-slate-800 h-full overflow-y-auto p-6 space-y-5"
+              onClick={(e) => e.stopPropagation()}
+            >
               {/* Drawer Header */}
               <div className="flex items-start justify-between gap-3 border-b border-slate-800 pb-4">
                 <div className="min-w-0 space-y-1">

@@ -51,6 +51,7 @@ export interface AtlasConfig {
   respectRobotsTxt: boolean;
   geminiApiKey: string | null;
   geminiModel: string;
+  geminiFallbackModel: string | null;
   groqApiKey: string | null;
   groqModel: string;
   llama3ApiKey: string | null;
@@ -143,6 +144,11 @@ export function loadAtlasConfig(atlasDir: string): AtlasConfig {
     respectRobotsTxt: parseBoolEnv(process.env.RESPECT_ROBOTS_TXT, true),
     geminiApiKey: process.env.GEMINI_API_KEY?.trim() || null,
     geminiModel: process.env.GEMINI_MODEL?.trim() || "gemini-4-hydrogen",
+    geminiFallbackModel:
+      process.env.GEMINI_FALLBACK_MODEL?.trim() ||
+      ((process.env.GEMINI_MODEL?.trim() || "gemini-4-hydrogen") === "gemini-4-hydrogen"
+        ? "gemini-3.1-flash-lite"
+        : null),
     groqApiKey: process.env.GROQ_API_KEY?.trim() || null,
     groqModel: process.env.GROQ_MODEL?.trim() || "llama-3.3-70b-versatile",
     llama3ApiKey: process.env.LLAMA3_API_KEY?.trim() || null,
@@ -443,7 +449,12 @@ export function createLLMRouter(config: AtlasConfig): LLMRouter {
   const llama3EffectiveKey = config.llama3ApiKey || (llama3UsesGroq ? config.groqApiKey : null);
 
   return new LLMRouter([
-    new GeminiLLMProvider(config.geminiApiKey, config.geminiModel, config.requestTimeoutMs),
+    new GeminiLLMProvider(
+      config.geminiApiKey,
+      config.geminiModel,
+      config.requestTimeoutMs,
+      config.geminiFallbackModel
+    ),
     new OpenAICompatibleLLMProvider({
       providerName: "groq",
       apiKey: config.groqApiKey,
@@ -774,7 +785,21 @@ function matchJsonItemText(
       item.paper && typeof item.paper === "object" && !Array.isArray(item.paper)
         ? (item.paper as Record<string, unknown>)
         : item;
-    for (const urlKey of ["url", "website", "link", "html_url", "source_url", "api_url"]) {
+    for (const urlKey of [
+      "url",
+      "website",
+      "link",
+      "html_url",
+      "source_url",
+      "api_url",
+      "jobUrl",
+      "applyUrl",
+      "absolute_url",
+      "applicationLink",
+      "guid",
+      "URL",
+      "landing_page_url",
+    ]) {
       const uVal = targetObj[urlKey] ?? item[urlKey];
       if (typeof uVal === "string" && uVal) {
         const lowerU = uVal.toLowerCase();
@@ -976,6 +1001,29 @@ class LiveSourceVerifier {
     return /\.(?:example|test|invalid|localhost)$/.test(dom);
   }
 
+  private isPublicApiOrFeedUrl(rawUrl: string): boolean {
+    const lower = rawUrl.toLowerCase();
+    return (
+      lower.includes("yc-oss.github.io/api/") ||
+      lower.includes("export.arxiv.org/api/") ||
+      lower.includes("api.openalex.org/") ||
+      lower.includes("api.crossref.org/") ||
+      lower.includes("api.github.com/") ||
+      lower.includes("huggingface.co/api/") ||
+      lower.includes("hn.algolia.com/api/") ||
+      lower.includes("boards-api.greenhouse.io/") ||
+      lower.includes("api.ashbyhq.com/") ||
+      lower.includes("api.lever.co/") ||
+      lower.includes("remotive.com/api/") ||
+      lower.includes("arbeitnow.com/api/") ||
+      lower.includes("jobicy.com/api/") ||
+      lower.includes("himalayas.app/jobs/api/") ||
+      lower.includes("remoteok.com/api") ||
+      /\/(?:feed|rss)(?:\/|\.(?:xml|rss))?(?:\?|$)/i.test(lower) ||
+      /\.(?:rss|xml|atom)(?:\?|$)/i.test(lower)
+    );
+  }
+
   private async fetchSnapshot(
     url: string,
     opts: { maxAttempts?: number; timeoutMs?: number; maxCrawlDelayMs?: number } = {}
@@ -986,10 +1034,12 @@ class LiveSourceVerifier {
     const existing = this.cache.get(url);
     if (existing) return existing;
 
+    const isApiOrFeed = this.isPublicApiOrFeedUrl(url);
     const res = await this.http.fetch(url, {
       timeoutMs: opts.timeoutMs ?? Math.min(this.config.requestTimeoutMs, 10000),
       maxAttempts: opts.maxAttempts ?? 2,
       maxCrawlDelayMs: opts.maxCrawlDelayMs,
+      checkRobots: !isApiOrFeed,
       headers:
         this.config.githubToken && url.includes("api.github.com")
           ? { Authorization: `Bearer ${this.config.githubToken}` }
@@ -1274,6 +1324,18 @@ class LiveSourceVerifier {
           primarySnap = apiSnap;
           primaryMatch = apiMatch;
           useSeededApiSnapshot = false;
+        }
+      } else if (seededApiUrl && this.cache.has(seededApiUrl)) {
+        const seededSnap = this.cache.get(seededApiUrl)!;
+        const seededMatch = extractMatchedPrimary(seededSnap);
+        if (seededSnap.accessible && seededMatch.ok) {
+          if (!primarySnap.accessible && primarySnap.error) {
+            meta.html_source_error = primarySnap.error;
+          }
+          meta.verification_mode = "live_api_snapshot_check";
+          primarySnap = seededSnap;
+          primaryMatch = seededMatch;
+          useSeededApiSnapshot = true;
         }
       }
     }
@@ -2342,7 +2404,7 @@ async function collectStartups(
   onLog?: (msg: string) => void
 ): Promise<CollectionBatchResult> {
   const url = "https://yc-oss.github.io/api/companies/all.json";
-  const res = await http.fetch(url, { timeoutMs: config.requestTimeoutMs, maxAttempts: 2 });
+  const res = await http.fetch(url, { timeoutMs: config.requestTimeoutMs, maxAttempts: 2, checkRobots: false });
   if (!res.ok) {
     const errText = res.error || "fetch_failed";
     return {
@@ -2536,6 +2598,13 @@ async function collectProducts(
   const hnTarget = Math.min(500, Math.round(limit * 0.3));
   const hfTarget = Math.max(limit - ghTarget - hnTarget, Math.round(limit * 0.45));
 
+  // Track per-source attempts/httpStatus cleanly
+  const srcTelemetry = new Map<string, { attempts: number; httpStatus: number | null }>([
+    ["huggingface_spaces", { attempts: 0, httpStatus: null }],
+    ["github_repositories", { attempts: 0, httpStatus: null }],
+    ["show_hn", { attempts: 0, httpStatus: null }],
+  ]);
+
   // Source A: Hugging Face Spaces (cursor paginated, fast, no auth needed)
   const fetchHfSpaces = async () => {
     let nextUrl: string | null = `https://huggingface.co/api/spaces?sort=likes&direction=-1&limit=100`;
@@ -2543,10 +2612,13 @@ async function collectProducts(
     // Skip cursor pages if page > 1
     const maxPagesToWalk = safePage + Math.ceil((hfTarget + 200) / 100) + 2;
     const seenHf = new Set<string>();
+    const tel = srcTelemetry.get("huggingface_spaces")!;
 
     while (nextUrl && pageIdx <= maxPagesToWalk && hfRecords.length < limit) {
       const curUrl = nextUrl;
-      const res = await http.fetch(curUrl, { timeoutMs: config.requestTimeoutMs });
+      const res = await http.fetch(curUrl, { timeoutMs: config.requestTimeoutMs, checkRobots: false });
+      tel.attempts = Math.max(tel.attempts, res.attempts);
+      tel.httpStatus = res.status || tel.httpStatus;
       if (!res.ok) {
         errors.push({ source: "huggingface_spaces", url: curUrl, error: res.error || "fetch_failed" });
         break;
@@ -2610,6 +2682,7 @@ async function collectProducts(
       "topic:machine-learning stars:>200",
     ];
     let hitRateLimit = false;
+    const tel = srcTelemetry.get("github_repositories")!;
     for (const query of queries) {
       if (hitRateLimit || ghRecords.length >= Math.max(ghTarget, limit * 0.45)) break;
       let curPage = safePage;
@@ -2619,7 +2692,10 @@ async function collectProducts(
           headers: ghHeaders,
           timeoutMs: config.requestTimeoutMs,
           maxAttempts: 2,
+          checkRobots: false,
         });
+        tel.attempts = Math.max(tel.attempts, res.attempts);
+        tel.httpStatus = res.status || tel.httpStatus;
         if (!res.ok) {
           errors.push({ source: "github_search", url, error: res.error || "fetch_failed" });
           if (res.status === 403 || res.status === 429) hitRateLimit = true;
@@ -2671,10 +2747,13 @@ async function collectProducts(
   // Source C: Show HN Algolia (multi-page)
   const fetchShowHn = async () => {
     const pagesToFetch = Math.min(6, Math.max(1, Math.ceil(hnTarget / 80)));
+    const tel = srcTelemetry.get("show_hn")!;
     for (let offset = 0; offset < pagesToFetch && hnRecords.length < limit; offset++) {
       const hnPage = Math.max(0, safePage - 1) + offset;
       const url = `https://hn.algolia.com/api/v1/search_by_date?tags=show_hn&hitsPerPage=100&page=${hnPage}`;
-      const res = await http.fetch(url, { timeoutMs: config.requestTimeoutMs });
+      const res = await http.fetch(url, { timeoutMs: config.requestTimeoutMs, checkRobots: false });
+      tel.attempts = Math.max(tel.attempts, res.attempts);
+      tel.httpStatus = res.status || tel.httpStatus;
       if (!res.ok) {
         errors.push({ source: "show_hn", url, error: res.error || "fetch_failed" });
         break;
@@ -2740,6 +2819,7 @@ async function collectProducts(
 
   const pushSourceSummary = (source: string, url: string, count: number) => {
     const err = errors.find((e) => e.source === source || (source === "github_repositories" && e.source === "github_search"));
+    const tel = srcTelemetry.get(source) ?? { attempts: 1, httpStatus: null };
     if (err && count === 0) {
       sourceOutcomes.push({
         category: "products",
@@ -2747,8 +2827,9 @@ async function collectProducts(
         url: err.url,
         status: "failed",
         discoveredCount: 0,
-        retried: true,
-        attempts: 2,
+        retried: tel.attempts > 1,
+        attempts: Math.max(1, tel.attempts),
+        httpStatus: tel.httpStatus,
         error: err.error,
       });
     } else {
@@ -2758,8 +2839,9 @@ async function collectProducts(
         url,
         status: count > 0 ? "ok" : "empty",
         discoveredCount: count,
-        retried: false,
-        attempts: 1,
+        retried: tel.attempts > 1,
+        attempts: Math.max(1, tel.attempts),
+        httpStatus: tel.httpStatus,
         error: err ? err.error : null,
       });
     }
@@ -2802,10 +2884,17 @@ async function collectResearchPapers(
   const crPapers: RawRecord[] = [];
   const nowIso = new Date().toISOString();
 
+  const refNow = new Date();
+  const maxReasonableYear = refNow.getUTCFullYear() + 1;
+  const countFresh = (recs: RawRecord[]) =>
+    recs.filter((r) =>
+      isWithinFreshnessWindow(parseUtcDatetime(r.published_at ?? r.publication_date, refNow), refNow, config.freshnessWindowHours).ok
+    ).length;
+
   // 1. Hugging Face Daily Papers (includes direct githubRepo + githubStars + exact UTC publishedAt!)
   const fetchHfPapers = async () => {
     const url = "https://huggingface.co/api/daily_papers?limit=100";
-    const res = await http.fetch(url, { timeoutMs: config.requestTimeoutMs, maxAttempts: 2 });
+    const res = await http.fetch(url, { timeoutMs: config.requestTimeoutMs, maxAttempts: 2, checkRobots: false });
     if (!res.ok) {
       const errText = res.error || "fetch_failed";
       errors.push({ source: "huggingface_daily_papers", url, error: errText });
@@ -2815,6 +2904,7 @@ async function collectResearchPapers(
         url,
         status: "failed",
         discoveredCount: 0,
+        freshCount: 0,
         retried: res.attempts > 1,
         attempts: res.attempts,
         httpStatus: res.status || null,
@@ -2832,6 +2922,7 @@ async function collectResearchPapers(
           url,
           status: "empty",
           discoveredCount: 0,
+          freshCount: 0,
           retried: res.attempts > 1,
           attempts: res.attempts,
           httpStatus: res.status || null,
@@ -2854,7 +2945,7 @@ async function collectResearchPapers(
           .filter(Boolean);
         const abstract = String(paper.summary ?? item.summary ?? "").replace(/\s+/g, " ").trim() || null;
         const pubMeta = parseUtcDatetimeWithMeta(paper.publishedAt ?? item.publishedAt);
-        const pubDt = pubMeta.date;
+        const pubDt = pubMeta.date && pubMeta.date.getUTCFullYear() <= maxReasonableYear ? pubMeta.date : null;
         const pubAtIso = pubDt ? pubDt.toISOString() : null;
         const pubDate = pubDt ? pubDt.toISOString().slice(0, 10) : null;
         const ghRepo = validateOptionalUrl(paper.githubRepo) || findFirstGithubRepo(abstract);
@@ -2876,7 +2967,7 @@ async function collectResearchPapers(
           source_metadata: {
             api_url: url,
             published_at_utc: pubAtIso,
-            timestamp_precision: pubMeta.precision,
+            timestamp_precision: pubDt ? pubMeta.precision : "unverified",
             upvotes: paper.upvotes ?? null,
             ai_keywords: Array.isArray(paper.ai_keywords) ? paper.ai_keywords : [],
             github_metrics: ghRepo
@@ -2891,6 +2982,7 @@ async function collectResearchPapers(
         url,
         status: hfPapers.length > 0 ? "ok" : "empty",
         discoveredCount: hfPapers.length,
+        freshCount: countFresh(hfPapers),
         retried: res.attempts > 1,
         attempts: res.attempts,
         httpStatus: res.status || null,
@@ -2905,6 +2997,7 @@ async function collectResearchPapers(
         url,
         status: "failed",
         discoveredCount: 0,
+        freshCount: 0,
         retried: res.attempts > 1,
         attempts: res.attempts,
         httpStatus: res.status || null,
@@ -2928,6 +3021,7 @@ async function collectResearchPapers(
       const res = await http.fetch(arxivUrl, {
         timeoutMs: Math.max(config.requestTimeoutMs, 25000),
         maxAttempts: 2,
+        checkRobots: false,
       });
       totalAttempts = Math.max(totalAttempts, res.attempts);
       lastStatus = res.status || lastStatus;
@@ -2948,9 +3042,9 @@ async function collectResearchPapers(
         const summary = extractXmlTag(entry, "summary")?.replace(/\s+/g, " ").trim() || null;
         const published = extractXmlTag(entry, "published");
         const pubMeta = parseUtcDatetimeWithMeta(published);
-        const pubDt = pubMeta.date;
+        const pubDt = pubMeta.date && pubMeta.date.getUTCFullYear() <= maxReasonableYear ? pubMeta.date : null;
         const pubAtIso = pubDt ? pubDt.toISOString() : null;
-        const pubDate = pubDt ? pubDt.toISOString().slice(0, 10) : published ? published.slice(0, 10) : null;
+        const pubDate = pubDt ? pubDt.toISOString().slice(0, 10) : null;
         const comment = extractXmlTag(entry, "arxiv:comment");
         const doi = extractXmlTag(entry, "arxiv:doi");
         const authors = extractXmlTags(entry, "author")
@@ -2974,7 +3068,7 @@ async function collectResearchPapers(
           source_metadata: {
             api_url: arxivUrl,
             published_at_utc: pubAtIso,
-            timestamp_precision: pubMeta.precision,
+            timestamp_precision: pubDt ? pubMeta.precision : "unverified",
             comment,
           },
         });
@@ -2986,10 +3080,11 @@ async function collectResearchPapers(
       url: baseUrl,
       status: arxivPapers.length > 0 ? "ok" : arxivErr ? "failed" : "empty",
       discoveredCount: arxivPapers.length,
+      freshCount: countFresh(arxivPapers),
       retried: totalAttempts > 1,
       attempts: Math.max(1, totalAttempts),
       httpStatus: lastStatus,
-      error: arxivPapers.length === 0 ? arxivErr : null,
+      error: arxivErr,
     });
   };
 
@@ -3003,8 +3098,12 @@ async function collectResearchPapers(
     for (let offset = 0; offset < pagesNeeded && oaPapers.length < limit; offset++) {
       const curPage = safePage + offset;
       const perPage = Math.min(100, Math.max(15, limit));
-      const oaUrl = `${baseUrl}?search=${encodeURIComponent("artificial intelligence")}&per-page=${perPage}&page=${curPage}&sort=publication_date:desc`;
-      const res = await http.fetch(oaUrl, { timeoutMs: config.requestTimeoutMs, maxAttempts: 2 });
+      const oaUrl = `${baseUrl}?search=${encodeURIComponent("artificial intelligence")}&per-page=${perPage}&page=${curPage}&sort=publication_date:desc&mailto=frontier-atlas@users.noreply.github.com`;
+      const res = await http.fetch(oaUrl, {
+        timeoutMs: Math.max(config.requestTimeoutMs, 25000),
+        maxAttempts: 2,
+        checkRobots: false,
+      });
       totalAttempts = Math.max(totalAttempts, res.attempts);
       lastStatus = res.status || lastStatus;
       if (!res.ok) {
@@ -3040,9 +3139,19 @@ async function collectResearchPapers(
             ? landingUrl.replace(/\/+$/, "").split("/").pop() ?? null
             : null;
           const createdDt = parseUtcDatetimeWithMeta(work.created_date);
-          const pubDate = typeof work.publication_date === "string" ? work.publication_date : null;
+          const rawPubYear = typeof work.publication_date === "string" ? Number(work.publication_date.slice(0, 4)) : NaN;
+          const pubDate =
+            typeof work.publication_date === "string" &&
+            Number.isFinite(rawPubYear) &&
+            rawPubYear >= 1950 &&
+            rawPubYear <= maxReasonableYear
+              ? work.publication_date
+              : null;
           const exactPubAt =
-            createdDt.date && typeof work.created_date === "string" && work.created_date.includes("T")
+            createdDt.date &&
+            createdDt.date.getUTCFullYear() <= maxReasonableYear &&
+            typeof work.created_date === "string" &&
+            work.created_date.includes("T")
               ? createdDt.date.toISOString()
               : null;
           oaPapers.push({
@@ -3082,10 +3191,11 @@ async function collectResearchPapers(
       url: baseUrl,
       status: oaPapers.length > 0 ? "ok" : oaErr ? "failed" : "empty",
       discoveredCount: oaPapers.length,
+      freshCount: countFresh(oaPapers),
       retried: totalAttempts > 1,
       attempts: Math.max(1, totalAttempts),
       httpStatus: lastStatus,
-      error: oaPapers.length === 0 ? oaErr : null,
+      error: oaErr,
     });
   };
 
@@ -3100,7 +3210,7 @@ async function collectResearchPapers(
       const rows = Math.min(100, Math.max(10, limit));
       const offset = (safePage - 1 + offsetIdx) * rows;
       const crUrl = `${baseUrl}?query=${encodeURIComponent("large language model")}&rows=${rows}&offset=${offset}&sort=published&order=desc`;
-      const res = await http.fetch(crUrl, { timeoutMs: config.requestTimeoutMs, maxAttempts: 2 });
+      const res = await http.fetch(crUrl, { timeoutMs: config.requestTimeoutMs, maxAttempts: 2, checkRobots: false });
       totalAttempts = Math.max(totalAttempts, res.attempts);
       lastStatus = res.status || lastStatus;
       if (!res.ok) {
@@ -3128,12 +3238,19 @@ async function collectResearchPapers(
           const dateParts = (
             ((item.published as Record<string, unknown> | undefined)?.["date-parts"] as unknown[][]) || [[]]
           )[0];
+          const rawYear = Array.isArray(dateParts) && dateParts.length > 0 ? Number(dateParts[0]) : NaN;
           const pubDate =
-            Array.isArray(dateParts) && dateParts.length > 0
+            Array.isArray(dateParts) &&
+            dateParts.length > 0 &&
+            Number.isFinite(rawYear) &&
+            rawYear >= 1950 &&
+            rawYear <= maxReasonableYear
               ? dateParts.map((p, idx) => (idx > 0 ? String(p).padStart(2, "0") : String(p))).join("-")
               : null;
           const createdDtRaw = (item.created as Record<string, unknown> | undefined)?.["date-time"];
-          const createdDt = parseUtcDatetime(createdDtRaw);
+          const parsedCreatedDt = parseUtcDatetime(createdDtRaw);
+          const createdDt =
+            parsedCreatedDt && parsedCreatedDt.getUTCFullYear() <= maxReasonableYear ? parsedCreatedDt : null;
           crPapers.push({
             title,
             abstract,
@@ -3169,10 +3286,11 @@ async function collectResearchPapers(
       url: baseUrl,
       status: crPapers.length > 0 ? "ok" : crErr ? "failed" : "empty",
       discoveredCount: crPapers.length,
+      freshCount: countFresh(crPapers),
       retried: totalAttempts > 1,
       attempts: Math.max(1, totalAttempts),
       httpStatus: lastStatus,
-      error: crPapers.length === 0 ? crErr : null,
+      error: crErr,
     });
   };
 
@@ -3255,6 +3373,7 @@ async function collectResearchPapers(
       headers,
       timeoutMs: 8000,
       maxAttempts: 1,
+      checkRobots: false,
     });
     const rlRemaining = ghRes.headers["x-ratelimit-remaining"] ?? null;
     const rlLimit = ghRes.headers["x-ratelimit-limit"] ?? null;
@@ -3355,7 +3474,16 @@ async function collectJobs(
   const errors: CollectorError[] = [];
   const sourceOutcomes: SourceOutcomeRecord[] = [];
   const combined: RawRecord[] = [];
-  const nowIso = new Date().toISOString();
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const srcTelemetry = new Map<string, { attempts: number; httpStatus: number | null }>();
+  const trackTel = (source: string, attempts: number, httpStatus: number) => {
+    const prev = srcTelemetry.get(source) ?? { attempts: 0, httpStatus: null };
+    srcTelemetry.set(source, {
+      attempts: Math.max(prev.attempts, attempts),
+      httpStatus: httpStatus || prev.httpStatus,
+    });
+  };
 
   const recordOutcome = (outcome: SourceOutcomeRecord) => {
     sourceOutcomes.push(outcome);
@@ -3367,11 +3495,12 @@ async function collectJobs(
   tasks.push(
     (async () => {
       const remUrl = `https://remotive.com/api/remote-jobs?limit=${Math.min(200, Math.max(100, limit))}`;
-      const res = await http.fetch(remUrl, { timeoutMs: config.requestTimeoutMs, maxAttempts: 2 });
+      const res = await http.fetch(remUrl, { timeoutMs: config.requestTimeoutMs, maxAttempts: 2, checkRobots: false });
+      trackTel("remotive", res.attempts, res.status);
       if (!res.ok) {
         const err = res.error || "fetch_failed";
         errors.push({ source: "remotive", url: remUrl, error: err });
-        recordOutcome({ category: "jobs", source: "remotive", url: remUrl, status: "failed", discoveredCount: 0, retried: res.attempts > 1, attempts: res.attempts, httpStatus: res.status || null, error: err });
+        recordOutcome({ category: "jobs", source: "remotive", url: remUrl, status: "failed", discoveredCount: 0, freshCount: 0, retried: res.attempts > 1, attempts: res.attempts, httpStatus: res.status || null, error: err });
         return;
       }
       verifier.seedSnapshot(remUrl, res.status, res.content, res.contentType);
@@ -3379,6 +3508,7 @@ async function collectJobs(
         const payload = JSON.parse(res.content) as Record<string, unknown>;
         const jobs = Array.isArray(payload.jobs) ? (payload.jobs as Array<Record<string, unknown>>) : [];
         let added = 0;
+        let freshAdded = 0;
         for (const job of jobs) {
           const title = String(job.title ?? "").trim();
           const company = String(job.company_name ?? "").trim();
@@ -3415,12 +3545,13 @@ async function collectJobs(
             },
           });
           added++;
+          if (isWithinFreshnessWindow(postedAt, now, config.freshnessWindowHours).ok) freshAdded++;
         }
-        recordOutcome({ category: "jobs", source: "remotive", url: remUrl, status: added > 0 ? "ok" : "empty", discoveredCount: added, retried: res.attempts > 1, attempts: res.attempts, httpStatus: res.status || null, error: null });
+        recordOutcome({ category: "jobs", source: "remotive", url: remUrl, status: added > 0 ? "ok" : "empty", discoveredCount: added, freshCount: freshAdded, retried: res.attempts > 1, attempts: res.attempts, httpStatus: res.status || null, error: null });
       } catch (err) {
         const errText = `invalid_json: ${String(err)}`;
         errors.push({ source: "remotive", url: remUrl, error: errText });
-        recordOutcome({ category: "jobs", source: "remotive", url: remUrl, status: "failed", discoveredCount: 0, retried: res.attempts > 1, attempts: res.attempts, httpStatus: res.status || null, error: errText });
+        recordOutcome({ category: "jobs", source: "remotive", url: remUrl, status: "failed", discoveredCount: 0, freshCount: 0, retried: res.attempts > 1, attempts: res.attempts, httpStatus: res.status || null, error: errText });
       }
     })()
   );
@@ -3430,7 +3561,8 @@ async function collectJobs(
     (async () => {
       for (let p = safePage; p < safePage + 4; p++) {
         const arbUrl = `https://www.arbeitnow.com/api/job-board-api?page=${p}`;
-        const res = await http.fetch(arbUrl, { timeoutMs: config.requestTimeoutMs });
+        const res = await http.fetch(arbUrl, { timeoutMs: config.requestTimeoutMs, checkRobots: false });
+        trackTel("arbeitnow", res.attempts, res.status);
         if (!res.ok) {
           errors.push({ source: "arbeitnow", url: arbUrl, error: res.error || "fetch_failed" });
           break;
@@ -3488,7 +3620,8 @@ async function collectJobs(
   tasks.push(
     (async () => {
       const wwrUrl = "https://weworkremotely.com/remote-jobs.rss";
-      const res = await http.fetch(wwrUrl, { timeoutMs: config.requestTimeoutMs });
+      const res = await http.fetch(wwrUrl, { timeoutMs: config.requestTimeoutMs, checkRobots: false });
+      trackTel("weworkremotely", res.attempts, res.status);
       if (!res.ok) {
         errors.push({ source: "weworkremotely", url: wwrUrl, error: res.error || "fetch_failed" });
         return;
@@ -3534,7 +3667,8 @@ async function collectJobs(
         "https://jobicy.com/api/v2/remote-jobs?count=50&tag=ai",
         "https://jobicy.com/api/v2/remote-jobs?count=50",
       ]) {
-        const res = await http.fetch(jUrl, { timeoutMs: config.requestTimeoutMs });
+        const res = await http.fetch(jUrl, { timeoutMs: config.requestTimeoutMs, checkRobots: false });
+        trackTel("jobicy", res.attempts, res.status);
         if (!res.ok) {
           errors.push({ source: "jobicy", url: jUrl, error: res.error || "fetch_failed" });
           continue;
@@ -3579,7 +3713,11 @@ async function collectJobs(
     tasks.push(
       (async () => {
         const ghUrl = `https://boards-api.greenhouse.io/v1/boards/${board}/jobs?content=true`;
-        const res = await http.fetch(ghUrl, { timeoutMs: config.requestTimeoutMs });
+        const res = await http.fetch(ghUrl, {
+          timeoutMs: Math.max(config.requestTimeoutMs, 25000),
+          checkRobots: false,
+        });
+        trackTel(`greenhouse:${board}`, res.attempts, res.status);
         if (!res.ok) {
           errors.push({ source: `greenhouse:${board}`, url: ghUrl, error: res.error || "fetch_failed" });
           return;
@@ -3620,7 +3758,11 @@ async function collectJobs(
     tasks.push(
       (async () => {
         const ashUrl = `https://api.ashbyhq.com/posting-api/job-board/${board}`;
-        const res = await http.fetch(ashUrl, { timeoutMs: Math.max(config.requestTimeoutMs, 25000) });
+        const res = await http.fetch(ashUrl, {
+          timeoutMs: Math.max(config.requestTimeoutMs, 25000),
+          checkRobots: false,
+        });
+        trackTel(`ashby:${board}`, res.attempts, res.status);
         if (!res.ok) {
           errors.push({ source: `ashby:${board}`, url: ashUrl, error: res.error || "fetch_failed" });
           return;
@@ -3665,7 +3807,8 @@ async function collectJobs(
   tasks.push(
     (async () => {
       const himUrl = "https://himalayas.app/jobs/api/search?q=ai";
-      const res = await http.fetch(himUrl, { timeoutMs: config.requestTimeoutMs });
+      const res = await http.fetch(himUrl, { timeoutMs: config.requestTimeoutMs, checkRobots: false });
+      trackTel("himalayas", res.attempts, res.status);
       if (!res.ok) {
         errors.push({ source: "himalayas", url: himUrl, error: res.error || "fetch_failed" });
         return;
@@ -3711,7 +3854,12 @@ async function collectJobs(
   tasks.push(
     (async () => {
       const rokUrl = "https://remoteok.com/api";
-      const res = await http.fetch(rokUrl, { timeoutMs: config.requestTimeoutMs });
+      const res = await http.fetch(rokUrl, {
+        timeoutMs: Math.min(config.requestTimeoutMs, 15000),
+        maxAttempts: 2,
+        checkRobots: false,
+      });
+      trackTel("remoteok", res.attempts, res.status);
       if (!res.ok) {
         errors.push({ source: "remoteok", url: rokUrl, error: res.error || "fetch_failed" });
         return;
@@ -3754,7 +3902,11 @@ async function collectJobs(
     tasks.push(
       (async () => {
         const levUrl = `https://api.lever.co/v0/postings/${board}?mode=json`;
-        const res = await http.fetch(levUrl, { timeoutMs: config.requestTimeoutMs });
+        const res = await http.fetch(levUrl, {
+          timeoutMs: Math.max(config.requestTimeoutMs, 25000),
+          checkRobots: false,
+        });
+        trackTel(`lever:${board}`, res.attempts, res.status);
         if (!res.ok) {
           errors.push({ source: `lever:${board}`, url: levUrl, error: res.error || "fetch_failed" });
           return;
@@ -3799,13 +3951,18 @@ async function collectJobs(
     );
   }
 
-  // Finalize source outcomes for boards 2-9 based on combined + errors
+  // Finalize source outcomes for boards 2-9 based on combined + errors + telemetry
   await Promise.all(tasks);
 
   const countBySource = new Map<string, number>();
+  const freshBySource = new Map<string, number>();
   for (const r of combined) {
     const sn = String(r.source_name ?? "");
     countBySource.set(sn, (countBySource.get(sn) ?? 0) + 1);
+    const dt = parseUtcDatetime(r.posted_at, now);
+    if (isWithinFreshnessWindow(dt, now, config.freshnessWindowHours).ok) {
+      freshBySource.set(sn, (freshBySource.get(sn) ?? 0) + 1);
+    }
   }
   const jobSourceSpecs: Array<[string, string]> = [
     ["arbeitnow", "https://www.arbeitnow.com/api/job-board-api"],
@@ -3825,16 +3982,20 @@ async function collectJobs(
   ];
   for (const [src, url] of jobSourceSpecs) {
     const cnt = countBySource.get(src) ?? 0;
+    const freshCnt = freshBySource.get(src) ?? 0;
     const err = errors.find((e) => e.source === src);
+    const tel = srcTelemetry.get(src) ?? { attempts: 1, httpStatus: null };
     recordOutcome({
       category: "jobs",
       source: src,
       url: err?.url ?? url,
       status: cnt > 0 ? "ok" : err ? "failed" : "empty",
       discoveredCount: cnt,
-      retried: true,
-      attempts: 2,
-      error: cnt === 0 && err ? err.error : null,
+      freshCount: freshCnt,
+      retried: tel.attempts > 1,
+      attempts: Math.max(1, tel.attempts),
+      httpStatus: tel.httpStatus,
+      error: err ? err.error : null,
     });
   }
 
@@ -3856,7 +4017,8 @@ async function collectNews(
   const errors: CollectorError[] = [];
   const sourceOutcomes: SourceOutcomeRecord[] = [];
   const records: RawRecord[] = [];
-  const nowIso = new Date().toISOString();
+  const now = new Date();
+  const nowIso = now.toISOString();
 
   const rssSources = [
     { name: "techcrunch_ai", url: "https://techcrunch.com/category/artificial-intelligence/feed/", publisher: "TechCrunch", category: "Startups & AI" },
@@ -3877,11 +4039,21 @@ async function collectNews(
   const feedTasks =
     safePage === 1
       ? rssSources.map(async (src) => {
-          let res = await http.fetch(src.url, { timeoutMs: Math.min(config.requestTimeoutMs, 12000), maxAttempts: 2 });
+          let res = await http.fetch(src.url, {
+            timeoutMs: Math.min(config.requestTimeoutMs, 12000),
+            maxAttempts: 2,
+            checkRobots: false,
+          });
+          let totalAttempts = res.attempts;
           let retried = res.attempts > 1;
           if (!res.ok) {
             retried = true;
-            res = await http.fetch(src.url, { timeoutMs: Math.min(config.requestTimeoutMs, 15000), maxAttempts: 2 });
+            res = await http.fetch(src.url, {
+              timeoutMs: Math.min(config.requestTimeoutMs, 15000),
+              maxAttempts: 2,
+              checkRobots: false,
+            });
+            totalAttempts += res.attempts;
           }
           if (!res.ok) {
             const err = res.error || "fetch_failed";
@@ -3892,8 +4064,9 @@ async function collectNews(
               url: src.url,
               status: "failed",
               discoveredCount: 0,
+              freshCount: 0,
               retried,
-              attempts: res.attempts,
+              attempts: totalAttempts,
               httpStatus: res.status || null,
               error: err,
             });
@@ -3901,6 +4074,7 @@ async function collectNews(
           }
           verifier.seedSnapshot(src.url, res.status, res.content, res.contentType);
           const beforeCount = records.length;
+          let freshCount = 0;
           const items = extractXmlTags(res.content, "item");
           if (items.length > 0) {
             for (const item of items) {
@@ -3916,6 +4090,7 @@ async function collectNews(
               const summary = bestBody ? stripHtmlToText(bestBody).slice(0, 3000) || null : null;
               if (!title || !link || !pubDt) continue;
               if (!isQualifyingAiNews(src.name, title, summary)) continue;
+              if (isWithinFreshnessWindow(pubDt, now, config.freshnessWindowHours).ok) freshCount++;
               records.push({
                 headline: title,
                 summary,
@@ -3949,6 +4124,7 @@ async function collectNews(
               const summary = sumRaw ? stripHtmlToText(sumRaw).slice(0, 3000) || null : null;
               if (!title || !link || !pubDt) continue;
               if (!isQualifyingAiNews(src.name, title, summary)) continue;
+              if (isWithinFreshnessWindow(pubDt, now, config.freshnessWindowHours).ok) freshCount++;
               records.push({
                 headline: title,
                 summary,
@@ -3974,8 +4150,9 @@ async function collectNews(
             url: src.url,
             status: added > 0 ? "ok" : "empty",
             discoveredCount: added,
+            freshCount,
             retried,
-            attempts: res.attempts,
+            attempts: totalAttempts,
             httpStatus: res.status || null,
             error: null,
           });
@@ -3986,12 +4163,19 @@ async function collectNews(
   let gotHn = false;
   let hnErr: string | null = null;
   let hnCount = 0;
+  let hnFreshCount = 0;
   let hnStatus: number | null = null;
+  let hnMaxAttempts = 1;
   const hnTask = (async () => {
     for (let offset = 0; offset < 2; offset++) {
       const hnPage = Math.max(0, safePage - 1) + offset;
       const hnUrl = `https://hn.algolia.com/api/v1/search_by_date?tags=story&hitsPerPage=100&page=${hnPage}`;
-      const hnRes = await http.fetch(hnUrl, { timeoutMs: config.requestTimeoutMs, maxAttempts: 2 });
+      const hnRes = await http.fetch(hnUrl, {
+        timeoutMs: config.requestTimeoutMs,
+        maxAttempts: 2,
+        checkRobots: false,
+      });
+      hnMaxAttempts = Math.max(hnMaxAttempts, hnRes.attempts);
       hnStatus = hnRes.status || hnStatus;
       if (!hnRes.ok) {
         hnErr = hnRes.error || "fetch_failed";
@@ -4013,6 +4197,7 @@ async function collectNews(
             : null;
           if (!isQualifyingAiNews("hn_algolia", title, summary)) continue;
           const objId = hit.objectID ? String(hit.objectID) : null;
+          if (isWithinFreshnessWindow(pubDt, now, config.freshnessWindowHours).ok) hnFreshCount++;
           records.push({
             headline: title,
             summary,
@@ -4039,8 +4224,9 @@ async function collectNews(
       url: "https://hn.algolia.com/api/v1/search_by_date?tags=story",
       status: hnCount > 0 ? "ok" : hnErr ? "failed" : "empty",
       discoveredCount: hnCount,
-      retried: true,
-      attempts: 2,
+      freshCount: hnFreshCount,
+      retried: hnMaxAttempts > 1,
+      attempts: hnMaxAttempts,
       httpStatus: hnStatus,
       error: hnCount === 0 ? hnErr : null,
     });
@@ -4815,7 +5001,14 @@ export class AtlasBackendService {
 
   public async ensureInitialHealthChecked(): Promise<IntegrationHealthSummary> {
     if (this.latestHealth?.checkedAt) {
-      return this.latestHealth;
+      const hasFailedLlm = ["gemini", "groq", "llama3", "deepseek"].some(
+        (id) => this.latestHealth?.byId?.[id]?.status === "Connection Failed"
+      );
+      const checkedMs = Date.parse(this.latestHealth.checkedAt);
+      const staleAfterFailure = hasFailedLlm && Number.isFinite(checkedMs) && Date.now() - checkedMs > 45_000;
+      if (!staleAfterFailure) {
+        return this.latestHealth;
+      }
     }
     if (this.healthCheckInFlight) {
       return this.healthCheckInFlight;
@@ -4834,10 +5027,11 @@ export class AtlasBackendService {
       const checkedAt = new Date().toISOString();
       const dbStart = Date.now();
       const dbHealth = this.db.checkHealth();
+      const dbLatencyMs = Date.now() - dbStart;
       const totalDbRows = Object.values(dbHealth.tableCounts).reduce((s, n) => s + n, 0);
 
       const [llmProbes, githubProbe, sheetsProbe] = await Promise.all([
-        this.llmRouter.probeProviders({ timeoutMs: 10_000 }),
+        this.llmRouter.probeProviders({ timeoutMs: 12_000 }),
         probeGithubApi(this.http, this.config.githubToken),
         this.sheets.probeHealth(opts),
       ]);
@@ -4887,7 +5081,7 @@ export class AtlasBackendService {
             ? `SQLite (${dbHealth.journalMode.toUpperCase()}) verified: ${totalDbRows.toLocaleString()} records across 6 datasets.`
             : dbHealth.error || "SQLite check failed.",
           error: dbHealth.ok ? null : dbHealth.error,
-          latencyMs: Date.now() - dbStart,
+          latencyMs: dbLatencyMs,
           checkedAt,
           tested: true,
         },
@@ -4952,6 +5146,7 @@ export class AtlasBackendService {
 
   public getStatus(): Record<string, unknown> {
     const counts = this.db.countRecords();
+    const uniqueQualifiedCounts = this.db.countUniqueQualifiedRecords();
     const freshCounts24h = this.db.countFresh24h(this.config.freshnessWindowHours);
     const verificationCounts = this.db.getVerificationCounts();
     const checkpoints = this.db.fetchCheckpoints();
@@ -4991,6 +5186,8 @@ export class AtlasBackendService {
 
     return {
       counts,
+      uniqueQualifiedCounts,
+      latestRunNewCounts: latestCompletedOrPartial?.new_records_counts ?? {},
       freshCounts24h,
       verificationCounts,
       auditTrail,
@@ -5007,6 +5204,23 @@ export class AtlasBackendService {
         products: this.config.targetProducts,
         research_papers: this.config.targetResearchPapers,
       },
+      targetChecks: {
+        startups: {
+          uniqueCount: uniqueQualifiedCounts.startups,
+          target: this.config.targetStartups,
+          met: uniqueQualifiedCounts.startups >= this.config.targetStartups,
+        },
+        products: {
+          uniqueCount: uniqueQualifiedCounts.products,
+          target: this.config.targetProducts,
+          met: uniqueQualifiedCounts.products >= this.config.targetProducts,
+        },
+        research_papers: {
+          uniqueCount: uniqueQualifiedCounts.research_papers,
+          target: this.config.targetResearchPapers,
+          met: uniqueQualifiedCounts.research_papers >= this.config.targetResearchPapers,
+        },
+      },
       freshnessWindowHours: this.config.freshnessWindowHours,
       credentials: {
         geminiConfigured: byId.gemini?.status === "Configured",
@@ -5015,9 +5229,11 @@ export class AtlasBackendService {
         llama3Configured: byId.llama3?.status === "Configured",
         deepseekConfigured: byId.deepseek?.status === "Configured",
         llmChain: this.llmRouter.allProviderNames(),
+        configuredLlmChain: this.llmRouter.configuredProviderNames(),
         llmDemoFallbackActive: !anyLlmLiveVerified && !this.llmRouter.isConfigured(),
         githubTokenConfigured: byId.github?.status === "Configured",
-        googleSheetsConfigured: byId.google_sheets?.status === "Configured",
+        googleSheetsConfigured:
+          byId.google_sheets?.status === "Configured" || sheetsStatus.status === "Connected",
         googleSheetsSpreadsheetId: Boolean(this.config.googleSheetsSpreadsheetId || sheetsStatus.spreadsheetId),
       },
       integrationHealth,
@@ -5036,15 +5252,19 @@ export class AtlasBackendService {
   public getDataset(
     category: string,
     limit: number,
-    window: "all" | "24h" = "all"
+    window: "all" | "24h" = "all",
+    offset = 0
   ): Record<string, unknown> {
     const windowHours = window === "24h" ? this.config.freshnessWindowHours : null;
-    const rows = this.db.fetchDatasetWindow(category, { limit, windowHours });
+    const rows = this.db.fetchDatasetWindow(category, { limit, offset, windowHours });
+    const totalCount = this.db.countDatasetWindow(category, { windowHours });
     return {
       category,
       window,
       rows,
       count: rows.length,
+      totalCount,
+      truncated: offset + rows.length < totalCount,
     };
   }
 
@@ -5094,25 +5314,76 @@ export class AtlasBackendService {
     };
   }
 
+  private syncSheetsHealthFromStatus(st: {
+    status: "Connected" | "Not Connected" | "Sync Failed";
+    credentialSource: "oauth" | "path" | "json_env" | null;
+    verifiedAccountEmail?: string | null;
+    spreadsheetId: string | null;
+    lastError: string | null;
+  }): void {
+    if (!this.latestHealth) return;
+    const mappedStatus: IntegrationConnectionStatus =
+      st.status === "Connected"
+        ? "Configured"
+        : st.status === "Sync Failed"
+        ? "Connection Failed"
+        : "Not Configured";
+    const srcLabel = st.credentialSource === "oauth" ? "Google OAuth" : "Service Account";
+    const detail =
+      mappedStatus === "Configured"
+        ? st.spreadsheetId
+          ? `Verified live ${srcLabel}${st.verifiedAccountEmail ? ` (${st.verifiedAccountEmail})` : ""} access to spreadsheet ${st.spreadsheetId}.`
+          : `Verified live ${srcLabel}${st.verifiedAccountEmail ? ` (${st.verifiedAccountEmail})` : ""} Drive (drive.file) & Sheets readiness.`
+        : mappedStatus === "Connection Failed"
+        ? st.lastError || "Google Workspace verification failed."
+        : "No active Google OAuth token or Service Account credentials. Click 'Sign in with Google' to authorize Drive (drive.file) & Sheets.";
+    const checkedAt = new Date().toISOString();
+    const updatedItem: IntegrationHealthItem = {
+      id: "google_sheets",
+      label: "Google Sheets & Drive OAuth",
+      envKey: "Workspace OAuth (drive.file, spreadsheets)",
+      status: mappedStatus,
+      detail,
+      error: mappedStatus === "Connection Failed" ? st.lastError || detail : null,
+      latencyMs: null,
+      checkedAt,
+      tested: true,
+    };
+    this.latestHealth = {
+      checkedAt: this.latestHealth.checkedAt ?? checkedAt,
+      items: this.latestHealth.items.map((item) => (item.id === "google_sheets" ? updatedItem : item)),
+      byId: { ...this.latestHealth.byId, google_sheets: updatedItem },
+    };
+  }
+
   public async exportGoogleSheets(opts?: {
     oauthAccessToken?: string | null;
     spreadsheetId?: string | null;
+    createNew?: boolean;
   }): Promise<SheetsSyncResult> {
-    return this.sheets.exportOrSync("full", opts);
+    const res = await this.sheets.exportOrSync("full", opts);
+    this.syncSheetsHealthFromStatus(this.sheets.getStatus());
+    return res;
   }
 
   public async syncGoogleSheets(opts?: {
     oauthAccessToken?: string | null;
     spreadsheetId?: string | null;
+    createNew?: boolean;
   }): Promise<SheetsSyncResult> {
-    return this.sheets.exportOrSync("incremental", opts);
+    const res = await this.sheets.exportOrSync("incremental", opts);
+    this.syncSheetsHealthFromStatus(this.sheets.getStatus());
+    return res;
   }
 
   public async verifyGoogleSheetsConnection(opts?: {
     oauthAccessToken?: string | null;
     spreadsheetId?: string | null;
+    createNew?: boolean;
   }): Promise<SheetsConnectionStatus> {
-    return this.sheets.verifyConnection(opts);
+    const res = await this.sheets.verifyConnection(opts);
+    this.syncSheetsHealthFromStatus(res);
+    return res;
   }
 
   public startBackgroundRun(opts: {
@@ -5439,7 +5710,7 @@ export class AtlasBackendService {
             }
           }
 
-          const bulkSnapshotOnly = cat === "news" ? uniqueRecords.length > 150 : uniqueRecords.length > 100;
+          const bulkSnapshotOnly = uniqueRecords.length >= 20;
           log(
             `[${cat}] Verifying ${uniqueRecords.length} records against live ${
               bulkSnapshotOnly ? "API/feed snapshots" : "source URLs & websites"
@@ -5556,6 +5827,11 @@ export class AtlasBackendService {
 
           const persistedCounts = this.db.countRecords();
           const persistedTotal = persistedCounts[cat] ?? 0;
+          const uniqueQualified = this.db.countUniqueQualifiedRecords();
+          const uniqueTotal =
+            cat === "startups" || cat === "products" || cat === "research_papers"
+              ? uniqueQualified[cat]
+              : persistedTotal;
           const targetMin =
             cat === "startups"
               ? this.config.targetStartups
@@ -5572,8 +5848,9 @@ export class AtlasBackendService {
             rejected: rejectedCount,
             duplicates,
             persisted_total: persistedTotal,
+            unique_qualified_total: uniqueTotal,
             target_minimum: targetMin,
-            target_met: targetMin !== null ? persistedTotal >= targetMin : null,
+            target_met: targetMin !== null ? uniqueTotal >= targetMin : null,
             verification_breakdown: verBreakdown,
             missing_fields: missingFields,
             source_distribution: sourceDistribution,
@@ -5607,6 +5884,11 @@ export class AtlasBackendService {
 
         const finalHistorical = this.db.countRecords();
         const finalFresh24h = this.db.countFresh24h(this.config.freshnessWindowHours);
+        const newRecordsCounts: Record<string, number> = {};
+        for (const k of ["startups", "products", "research_papers", "jobs", "news", "entity_mapping_log"]) {
+          newRecordsCounts[k] = Math.max(0, (finalHistorical[k] ?? 0) - (initialHistorical[k] ?? 0));
+        }
+        const totalNewInserted = Object.values(newRecordsCounts).reduce((s, n) => s + n, 0);
         const failedOutcomes = allSourceOutcomes.filter((s) => s.status === "failed");
         const okOrEmptyOutcomes = allSourceOutcomes.filter((s) => s.status !== "failed");
         const hasErrors = failedOutcomes.length > 0 || collectorErrors.length > 0 || Boolean(sheetsSync && !sheetsSync.success);
@@ -5620,9 +5902,9 @@ export class AtlasBackendService {
         const completedAt = new Date().toISOString();
         const summaryText =
           runStatus === "completed"
-            ? `Completed cleanly (${totalPersistedThisRun} rows processed across ${opts.categories.length} dataset(s)).`
+            ? `Completed cleanly (${totalNewInserted} new, ${totalPersistedThisRun} processed across ${opts.categories.length} dataset(s)).`
             : runStatus === "partial"
-            ? `Partial collection (${totalPersistedThisRun} rows processed; ${failedOutcomes.length} source error(s)).`
+            ? `Partial collection (${totalNewInserted} new, ${totalPersistedThisRun} processed; ${failedOutcomes.length} source error(s)).`
             : `Collection failed (${collectorErrors.length} error(s)); historical DB records preserved.`;
 
         this.db.completePipelineRun({
@@ -5630,6 +5912,7 @@ export class AtlasBackendService {
           completedAt,
           status: runStatus,
           historicalCounts: finalHistorical,
+          newRecordsCounts,
           fresh24hCounts: finalFresh24h,
           errors: collectorErrors,
           sourceOutcomes: allSourceOutcomes,
@@ -5648,6 +5931,7 @@ export class AtlasBackendService {
           runId,
           runStatus,
           databaseCounts: finalHistorical,
+          newRecordsCounts,
           freshCounts24h: finalFresh24h,
           verificationCounts: this.db.getVerificationCounts(),
           collectorErrors,
@@ -6037,6 +6321,7 @@ export class AtlasBackendService {
 
     const latestVer = this.db.getVerificationCounts();
     const counts = this.db.countRecords();
+    const uniqueQualified = this.db.countUniqueQualifiedRecords();
     const targets: Record<string, number | null> = {
       startups: this.config.targetStartups,
       products: this.config.targetProducts,
@@ -6057,13 +6342,18 @@ export class AtlasBackendService {
           ? { ...(rawOverride as Record<string, unknown>) }
           : {};
       const persistedTotal = counts[catName] ?? 0;
+      const uniqueTotal =
+        catName === "startups" || catName === "products" || catName === "research_papers"
+          ? uniqueQualified[catName]
+          : persistedTotal;
       const targetMin = targets[catName] ?? null;
       categories[catName] = {
         ...existing,
         ...override,
         persisted_total: persistedTotal,
+        unique_qualified_total: uniqueTotal,
         target_minimum: targetMin,
-        target_met: targetMin !== null ? persistedTotal >= targetMin : null,
+        target_met: targetMin !== null ? uniqueTotal >= targetMin : null,
         verification_breakdown: latestVer.byCategory[catName] ?? {},
       };
     }

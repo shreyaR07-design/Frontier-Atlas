@@ -403,6 +403,21 @@ export class PoliteHttpClient {
         const contentType = respHeaders["content-type"] || "";
         const status = resp.status;
 
+        if (status === 413) {
+          return {
+            url: resp.url || canonical,
+            status,
+            ok: false,
+            content: "",
+            contentType,
+            headers: respHeaders,
+            error: "payload_too_large_413",
+            blockedByRobots: false,
+            skippedDuplicate: false,
+            attempts: attempt,
+          };
+        }
+
         if (RESTRICTED_STATUSES.has(status)) {
           // Strictly do not bypass access controls / auth gates
           return {

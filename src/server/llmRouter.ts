@@ -11,7 +11,7 @@
  *   + Honest heuristic demo fallback when zero API keys are configured (marked Unverified)
  */
 
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 
 export type IntegrationConnectionStatus = "Configured" | "Not Configured" | "Connection Failed";
 
@@ -84,7 +84,7 @@ export function redactSecrets(input: string): string {
     .replace(/\bsk-[0-9A-Za-z_-]{12,}\b/g, "[REDACTED_KEY]")
     .replace(/\bgh[pou]_[0-9A-Za-z]{16,}\b/g, "[REDACTED_TOKEN]")
     .replace(/\bgithub_pat_[0-9A-Za-z_]{16,}\b/g, "[REDACTED_TOKEN]")
-    .replace(/\bya29\.[0-9A-Za-z_-]{16,}\b/g, "[REDACTED_TOKEN]")
+    .replace(/\bya29\.[0-9A-Za-z_.-]{12,}/g, "[REDACTED_TOKEN]")
     .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, "$1[REDACTED]")
     .replace(/([?&](?:key|api_key|token|access_token)=)[^&\s"']+/gi, "$1[REDACTED]");
 }
@@ -300,29 +300,35 @@ function classifyHttpError(providerName: string, status: number, bodyText: strin
 export class GeminiLLMProvider implements LLMProvider {
   public readonly providerName = "gemini";
   public readonly model: string;
+  public readonly fallbackModel: string | null;
   public readonly via = "google-genai";
   private readonly apiKey: string | null;
   private readonly timeoutMs: number;
 
-  constructor(apiKey: string | null, model: string, timeoutMs = 25_000) {
+  constructor(
+    apiKey: string | null,
+    model: string,
+    timeoutMs = 25_000,
+    fallbackModel?: string | null
+  ) {
     this.apiKey = apiKey;
     this.model = model;
     this.timeoutMs = timeoutMs;
+    this.fallbackModel = fallbackModel && fallbackModel.trim() && fallbackModel.trim() !== model
+      ? fallbackModel.trim()
+      : null;
   }
 
   public isConfigured(): boolean {
     return Boolean(this.apiKey && this.apiKey.trim());
   }
 
-  public async generateJson(
+  private async generateWithModel(
+    modelName: string,
     prompt: string,
-    systemInstruction = SYSTEM_INSTRUCTION,
-    opts?: { timeoutMs?: number }
+    systemInstruction: string,
+    effectiveTimeoutMs: number
   ): Promise<Record<string, unknown>> {
-    if (!this.isConfigured()) {
-      throw new FatalProviderError("GEMINI_API_KEY is not configured");
-    }
-    const effectiveTimeoutMs = opts?.timeoutMs ?? this.timeoutMs;
     const ai = new GoogleGenAI({
       apiKey: this.apiKey!,
       httpOptions: {
@@ -337,20 +343,21 @@ export class GeminiLLMProvider implements LLMProvider {
     const timeoutPromise = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
         controller.abort();
-        reject(new TransientProviderError(`gemini request timeout after ${effectiveTimeoutMs}ms`));
+        reject(new TransientProviderError(`gemini (${modelName}) request timeout after ${effectiveTimeoutMs}ms`));
       }, effectiveTimeoutMs);
     });
 
-    const isGemini4Series = this.model.startsWith("gemini-4-");
+    const isGemini4Series = modelName.startsWith("gemini-4-");
     try {
       const response = await Promise.race([
         ai.models.generateContent({
-          model: this.model,
+          model: modelName,
           contents: prompt,
           config: isGemini4Series
             ? {
                 systemInstruction,
                 responseMimeType: "application/json",
+                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
                 abortSignal: controller.signal,
               }
             : {
@@ -376,13 +383,22 @@ export class GeminiLLMProvider implements LLMProvider {
       const msg = redactSecrets(err instanceof Error ? err.message : String(err));
       const lower = msg.toLowerCase();
       if (err instanceof Error && err.name === "AbortError") {
-        throw new TransientProviderError(`gemini request timeout after ${effectiveTimeoutMs}ms`);
+        throw new TransientProviderError(`gemini (${modelName}) request timeout after ${effectiveTimeoutMs}ms`);
       }
       if (lower.includes("413") || lower.includes("token") || lower.includes("context") || lower.includes("too large")) {
         throw new PayloadTooLargeError(`gemini context/payload limit: ${msg}`);
       }
       if (lower.includes("429") || lower.includes("quota") || lower.includes("resource_exhausted")) {
         throw new RateLimitError(`gemini rate limit (429): ${msg}`);
+      }
+      if (
+        lower.includes("503") ||
+        lower.includes("unavailable") ||
+        lower.includes("high demand") ||
+        lower.includes("overloaded") ||
+        lower.includes("service unavailable")
+      ) {
+        throw new TransientProviderError(`gemini service unavailable (503) on ${modelName}: ${msg}`);
       }
       if (
         lower.includes("401") ||
@@ -395,9 +411,43 @@ export class GeminiLLMProvider implements LLMProvider {
       ) {
         throw new FatalProviderError(`gemini auth/model error: ${msg}`);
       }
-      throw new TransientProviderError(`gemini request error: ${msg}`);
+      throw new TransientProviderError(`gemini (${modelName}) request error: ${msg}`);
     } finally {
       if (timer) clearTimeout(timer);
+    }
+  }
+
+  public async generateJson(
+    prompt: string,
+    systemInstruction = SYSTEM_INSTRUCTION,
+    opts?: { timeoutMs?: number }
+  ): Promise<Record<string, unknown>> {
+    if (!this.isConfigured()) {
+      throw new FatalProviderError("GEMINI_API_KEY is not configured");
+    }
+    const effectiveTimeoutMs = opts?.timeoutMs ?? this.timeoutMs;
+    try {
+      return await this.generateWithModel(this.model, prompt, systemInstruction, effectiveTimeoutMs);
+    } catch (primaryErr) {
+      if (
+        this.fallbackModel &&
+        (primaryErr instanceof TransientProviderError || primaryErr instanceof RateLimitError)
+      ) {
+        try {
+          return await this.generateWithModel(
+            this.fallbackModel,
+            prompt,
+            systemInstruction,
+            effectiveTimeoutMs
+          );
+        } catch (fallbackErr) {
+          if (fallbackErr instanceof FatalProviderError) {
+            throw primaryErr;
+          }
+          throw fallbackErr;
+        }
+      }
+      throw primaryErr;
     }
   }
 }
@@ -719,7 +769,10 @@ export class LLMRouter {
 
         const startedAt = Date.now();
         try {
-          await provider.generateJson(probePrompt, probeSystem, { timeoutMs });
+          await runWithRetry(
+            () => provider.generateJson(probePrompt, probeSystem, { timeoutMs }),
+            2
+          );
           return {
             provider: provider.providerName,
             model,

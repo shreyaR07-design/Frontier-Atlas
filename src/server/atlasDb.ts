@@ -227,6 +227,7 @@ const SCHEMA_DDL_STATEMENTS: string[] = [
     completed_at TEXT,
     status TEXT NOT NULL,
     historical_counts_json TEXT NOT NULL DEFAULT '{}',
+    new_records_counts_json TEXT NOT NULL DEFAULT '{}',
     fresh_24h_counts_json TEXT NOT NULL DEFAULT '{}',
     errors_json TEXT NOT NULL DEFAULT '[]',
     source_outcomes_json TEXT NOT NULL DEFAULT '[]',
@@ -339,6 +340,7 @@ export interface PipelineRunRecord {
   completed_at: string | null;
   status: "running" | "completed" | "partial" | "failed";
   historical_counts: Record<string, number>;
+  new_records_counts: Record<string, number>;
   fresh_24h_counts: Record<string, number>;
   errors: Array<Record<string, unknown>>;
   source_outcomes: SourceOutcomeRecord[];
@@ -525,6 +527,12 @@ export class AtlasDatabase {
       }
       conn.exec("CREATE INDEX IF NOT EXISTS idx_papers_published_at ON research_papers(published_at);");
 
+      const runInfoRows = conn.prepare("PRAGMA table_info(pipeline_runs);").all() as Array<{ name: string }>;
+      const runCols = new Set(runInfoRows.map((r) => String(r.name)));
+      if (!runCols.has("new_records_counts_json")) {
+        conn.exec("ALTER TABLE pipeline_runs ADD COLUMN new_records_counts_json TEXT NOT NULL DEFAULT '{}';");
+      }
+
       conn.exec("COMMIT");
       this.initialized = true;
     } catch (err) {
@@ -637,17 +645,23 @@ export class AtlasDatabase {
 
   public fetchDatasetWindow(
     tableName: string,
-    opts?: { limit?: number; windowHours?: number | null; refNow?: Date }
+    opts?: { limit?: number; offset?: number; windowHours?: number | null; refNow?: Date }
   ): Array<Record<string, unknown>> {
     if (!ALLOWED_DATASET_TABLES.has(tableName)) {
       throw new Error(`Unsupported dataset table: ${tableName}`);
     }
+    const offset = Math.max(0, opts?.offset ?? 0);
     const windowHours = opts?.windowHours ?? null;
     if (
       !windowHours ||
       (tableName !== "jobs" && tableName !== "news" && tableName !== "research_papers")
     ) {
-      return this.fetchDataset(tableName, opts?.limit);
+      if (offset === 0) {
+        return this.fetchDataset(tableName, opts?.limit);
+      }
+      const limitSql = opts?.limit !== undefined ? `LIMIT ? OFFSET ?` : `LIMIT -1 OFFSET ?`;
+      const params = opts?.limit !== undefined ? [opts.limit, offset] : [offset];
+      return this.fetchAll(`SELECT * FROM ${tableName} ORDER BY rowid ASC ${limitSql};`, ...params);
     }
     const refMs = (opts?.refNow ?? new Date()).getTime();
     const minMs = refMs - windowHours * 3600_000;
@@ -660,14 +674,48 @@ export class AtlasDatabase {
         : "ORDER BY COALESCE(published_at, publication_date) DESC, rowid DESC";
     const allRows = this.fetchAll(`SELECT * FROM ${tableName} ${orderSql};`);
     const filtered: Array<Record<string, unknown>> = [];
+    let skipped = 0;
     for (const row of allRows) {
       const ts = this.parseRowTimestampMs(row, tableName);
       if (ts !== null && ts >= minMs && ts <= maxMs) {
+        if (skipped < offset) {
+          skipped++;
+          continue;
+        }
         filtered.push(row);
         if (opts?.limit !== undefined && filtered.length >= opts.limit) break;
       }
     }
     return filtered;
+  }
+
+  public countDatasetWindow(
+    tableName: string,
+    opts?: { windowHours?: number | null; refNow?: Date }
+  ): number {
+    if (!ALLOWED_DATASET_TABLES.has(tableName)) {
+      throw new Error(`Unsupported dataset table: ${tableName}`);
+    }
+    this.initializeSchema();
+    const windowHours = opts?.windowHours ?? null;
+    if (
+      !windowHours ||
+      (tableName !== "jobs" && tableName !== "news" && tableName !== "research_papers")
+    ) {
+      const rows = this.fetchAll(`SELECT COUNT(*) AS cnt FROM ${tableName};`);
+      return Number(rows[0]?.cnt ?? 0);
+    }
+    const refMs = (opts?.refNow ?? new Date()).getTime();
+    const minMs = refMs - windowHours * 3600_000;
+    const maxMs = refMs + 5 * 60_000;
+    const col = tableName === "jobs" ? "posted_at" : "published_at";
+    const rows = this.fetchAll(`SELECT ${col} FROM ${tableName};`);
+    let cnt = 0;
+    for (const r of rows) {
+      const ts = this.parseRowTimestampMs(r, tableName);
+      if (ts !== null && ts >= minMs && ts <= maxMs) cnt++;
+    }
+    return cnt;
   }
 
   public countFresh24h(
@@ -693,6 +741,34 @@ export class AtlasDatabase {
       jobs: countTable("jobs", "posted_at"),
       news: countTable("news", "published_at"),
       research_papers: countTable("research_papers", "published_at"),
+    };
+  }
+
+  public countUniqueQualifiedRecords(): {
+    startups: number;
+    products: number;
+    research_papers: number;
+  } {
+    this.initializeSchema();
+    const startupsRows = this.fetchAll(
+      `SELECT COUNT(DISTINCT COALESCE(NULLIF(TRIM(canonical_entity_id), ''), LOWER(TRIM(name)) || '|' || LOWER(TRIM(COALESCE(NULLIF(website, ''), source_url))))) AS cnt
+       FROM startups
+       WHERE verification_status != 'Rejected' AND TRIM(name) != '';`
+    );
+    const productsRows = this.fetchAll(
+      `SELECT COUNT(DISTINCT COALESCE(NULLIF(TRIM(canonical_entity_id), ''), LOWER(TRIM(name)) || '|' || LOWER(TRIM(COALESCE(NULLIF(website, ''), source_url))))) AS cnt
+       FROM products
+       WHERE verification_status != 'Rejected' AND TRIM(name) != '';`
+    );
+    const papersRows = this.fetchAll(
+      `SELECT COUNT(DISTINCT COALESCE(NULLIF(LOWER(TRIM(doi)), ''), NULLIF(LOWER(TRIM(arxiv_id)), ''), LOWER(TRIM(source_url)), LOWER(TRIM(title)))) AS cnt
+       FROM research_papers
+       WHERE verification_status != 'Rejected' AND TRIM(title) != '';`
+    );
+    return {
+      startups: Number(startupsRows[0]?.cnt ?? 0),
+      products: Number(productsRows[0]?.cnt ?? 0),
+      research_papers: Number(papersRows[0]?.cnt ?? 0),
     };
   }
 
@@ -1445,6 +1521,7 @@ export class AtlasDatabase {
     status: "Connected" | "Not Connected" | "Sync Failed";
     spreadsheetId: string | null;
     spreadsheetUrl: string | null;
+    clearSpreadsheetTarget?: boolean;
     lastSyncMode: string | null;
     lastAttemptAt: string | null;
     lastSuccessAt: string | null;
@@ -1457,6 +1534,12 @@ export class AtlasDatabase {
   }): void {
     this.initializeSchema();
     const conn = this.getConnection();
+    const spreadsheetIdSql = state.clearSpreadsheetTarget
+      ? "excluded.spreadsheet_id"
+      : "COALESCE(excluded.spreadsheet_id, sheets_sync_state.spreadsheet_id)";
+    const spreadsheetUrlSql = state.clearSpreadsheetTarget
+      ? "excluded.spreadsheet_url"
+      : "COALESCE(excluded.spreadsheet_url, sheets_sync_state.spreadsheet_url)";
     conn
       .prepare(
         `INSERT INTO sheets_sync_state (
@@ -1466,8 +1549,8 @@ export class AtlasDatabase {
         ) VALUES ('default', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           status = excluded.status,
-          spreadsheet_id = COALESCE(excluded.spreadsheet_id, sheets_sync_state.spreadsheet_id),
-          spreadsheet_url = COALESCE(excluded.spreadsheet_url, sheets_sync_state.spreadsheet_url),
+          spreadsheet_id = ${spreadsheetIdSql},
+          spreadsheet_url = ${spreadsheetUrlSql},
           last_sync_mode = excluded.last_sync_mode,
           last_attempt_at = excluded.last_attempt_at,
           last_success_at = COALESCE(excluded.last_success_at, sheets_sync_state.last_success_at),
@@ -1504,6 +1587,7 @@ export class AtlasDatabase {
     categories: string[];
     startedAt: string;
     historicalCounts: Record<string, number>;
+    newRecordsCounts?: Record<string, number>;
     fresh24hCounts: Record<string, number>;
   }): void {
     this.initializeSchema();
@@ -1512,8 +1596,8 @@ export class AtlasDatabase {
       .prepare(
         `INSERT INTO pipeline_runs (
           run_id, trigger_type, mode, categories_json, started_at, completed_at,
-          status, historical_counts_json, fresh_24h_counts_json, errors_json, source_outcomes_json, summary
-        ) VALUES (?, ?, ?, ?, ?, NULL, 'running', ?, ?, '[]', '[]', NULL);`
+          status, historical_counts_json, new_records_counts_json, fresh_24h_counts_json, errors_json, source_outcomes_json, summary
+        ) VALUES (?, ?, ?, ?, ?, NULL, 'running', ?, ?, ?, '[]', '[]', NULL);`
       )
       .run(
         run.runId,
@@ -1522,6 +1606,7 @@ export class AtlasDatabase {
         JSON.stringify(run.categories),
         run.startedAt,
         JSON.stringify(run.historicalCounts),
+        JSON.stringify(run.newRecordsCounts ?? {}),
         JSON.stringify(run.fresh24hCounts)
       );
   }
@@ -1531,6 +1616,7 @@ export class AtlasDatabase {
     completedAt: string;
     status: "completed" | "partial" | "failed";
     historicalCounts: Record<string, number>;
+    newRecordsCounts?: Record<string, number>;
     fresh24hCounts: Record<string, number>;
     errors: Array<Record<string, unknown>>;
     sourceOutcomes: SourceOutcomeRecord[];
@@ -1544,6 +1630,7 @@ export class AtlasDatabase {
           completed_at = ?,
           status = ?,
           historical_counts_json = ?,
+          new_records_counts_json = ?,
           fresh_24h_counts_json = ?,
           errors_json = ?,
           source_outcomes_json = ?,
@@ -1554,6 +1641,7 @@ export class AtlasDatabase {
         update.completedAt,
         update.status,
         JSON.stringify(update.historicalCounts),
+        JSON.stringify(update.newRecordsCounts ?? {}),
         JSON.stringify(update.fresh24hCounts),
         JSON.stringify(update.errors),
         JSON.stringify(update.sourceOutcomes),
@@ -1601,6 +1689,7 @@ export class AtlasDatabase {
       completed_at: (r.completed_at as string | null) ?? null,
       status: (String(r.status) as PipelineRunRecord["status"]) || "completed",
       historical_counts: parseJson<Record<string, number>>(r.historical_counts_json, {}),
+      new_records_counts: parseJson<Record<string, number>>(r.new_records_counts_json, {}),
       fresh_24h_counts: parseJson<Record<string, number>>(r.fresh_24h_counts_json, {}),
       errors: parseJson<Array<Record<string, unknown>>>(r.errors_json, []),
       source_outcomes: parseJson<SourceOutcomeRecord[]>(r.source_outcomes_json, []),

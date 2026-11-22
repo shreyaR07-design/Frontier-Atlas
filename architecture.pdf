@@ -1,0 +1,193 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [5 0 R 7 0 R 9 0 R] /Count 3 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents 6 0 R >>
+endobj
+6 0 obj
+<< /Length 1817 >>
+stream
+BT
+/F2 18 Tf
+1 0 0 1 48 740 Tm
+(FrontierAtlas - System Architecture & Engineering Blueprint) Tj
+/F1 10 Tf
+1 0 0 1 48 715 Tm
+(AI-Powered Data Intelligence, Structured Extraction, Verification & Entity Resolution) Tj
+/F2 13 Tf
+1 0 0 1 48 688 Tm
+(1. High-Level Architecture & Data Flow \(500k+ Scale Design\)) Tj
+/F1 10 Tf
+1 0 0 1 48 668 Tm
+([1] Public APIs & Feeds: OpenAlex | arXiv | Crossref | HF Spaces/Papers | GitHub | Job Boards | RSS) Tj
+/F1 10 Tf
+1 0 0 1 48 651 Tm
+(        |) Tj
+/F1 10 Tf
+1 0 0 1 48 634 Tm
+(        v) Tj
+/F1 10 Tf
+1 0 0 1 48 617 Tm
+([2] PoliteHttpClient & Async Collectors: Bounded concurrency, per-domain rate limit, robots.txt,) Tj
+/F1 10 Tf
+1 0 0 1 48 600 Tm
+(    HTTP 429 Retry-After backoff, 401/403/CAPTCHA non-bypass logging, checkpointed pagination.) Tj
+/F1 10 Tf
+1 0 0 1 48 583 Tm
+(        |) Tj
+/F1 10 Tf
+1 0 0 1 48 566 Tm
+(        +---> [3a] 4-Tier LLMRouter: 1. Gemini Flash -> 2. Groq -> 3. Llama 3 -> 4. DeepSeek) Tj
+/F1 10 Tf
+1 0 0 1 48 549 Tm
+(        |          Token-aware overlap chunking, recursive 413 half-split, heuristic demo fallback) Tj
+/F1 10 Tf
+1 0 0 1 48 532 Tm
+(        +---> [3b] Freshness & Deduplication: 24h UTC window, relative date parsing, SHA-256 IDs) Tj
+/F1 10 Tf
+1 0 0 1 48 515 Tm
+(        |) Tj
+/F1 10 Tf
+1 0 0 1 48 498 Tm
+(        v) Tj
+/F1 10 Tf
+1 0 0 1 48 481 Tm
+([4] Deterministic Entity Resolution: NFKC normalize, legal suffix strip, domain conflict guards,) Tj
+/F1 10 Tf
+1 0 0 1 48 464 Tm
+(    'OpenAI'/'OpenAI Inc.'/'Open AI' -> canonical ID + confidence + Entity Mapping Log.) Tj
+/F1 10 Tf
+1 0 0 1 48 447 Tm
+(        |) Tj
+/F1 10 Tf
+1 0 0 1 48 430 Tm
+(        v) Tj
+/F1 10 Tf
+1 0 0 1 48 413 Tm
+([5] Storage & Sync: SQLite WAL \(or PostgreSQL pool\) + 6 CSV files + 6-Tab Google Sheets API v4.) Tj
+/F1 9 Tf 1 0 0 1 48 36 Tm (Page 1 of 3) Tj
+ET
+endstream
+endobj
+7 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents 8 0 R >>
+endobj
+8 0 obj
+<< /Length 1751 >>
+stream
+BT
+/F2 13 Tf
+1 0 0 1 48 740 Tm
+(2. Multi-Tier LLM Fallback Chain & Context-Limit Recovery) Tj
+/F1 10 Tf
+1 0 0 1 48 720 Tm
+(- Tier 1: Google Gemini Flash \(@google/genai\) | Tier 2: Groq | Tier 3: Llama 3 | Tier 4: DeepSeek.) Tj
+/F1 10 Tf
+1 0 0 1 48 703 Tm
+(- Rate Limits \(HTTP 429 / 5xx\): Exponential backoff + random jitter before tier failover.) Tj
+/F1 10 Tf
+1 0 0 1 48 686 Tm
+(- Context / Payload Limits \(HTTP 413\): Recursive half-size sub-chunking \(down to 600 tokens\).) Tj
+/F1 10 Tf
+1 0 0 1 48 669 Tm
+(- Unconfigured Keys: Explicit heuristic_demo_fallback extracts grounded fields marked Unverified.) Tj
+/F2 13 Tf
+1 0 0 1 48 642 Tm
+(3. Freshness, Research Enrichment & Anti-Bot Resilience) Tj
+/F1 10 Tf
+1 0 0 1 48 622 Tm
+(- Jobs & News: Parses ISO-8601, RFC-2822, epoch, and explicit relative dates \('2 hours ago'\).) Tj
+/F1 10 Tf
+1 0 0 1 48 605 Tm
+(- Precision Tracking: Distinguishes verified_exact vs relative_estimated; rejects undated/old items.) Tj
+/F1 10 Tf
+1 0 0 1 48 588 Tm
+(- Research Enrichment: Extracts GitHub repos + live star counts and tracks metrics_updated_at.) Tj
+/F1 10 Tf
+1 0 0 1 48 571 Tm
+(- Anti-Bot Compliance: Enforces robots.txt, crawl-delay budgets, and logs 401/403/CAPTCHA safely.) Tj
+/F2 13 Tf
+1 0 0 1 48 544 Tm
+(4. Database Tables & Exact 6-Tab Google Sheets Schema) Tj
+/F1 10 Tf
+1 0 0 1 48 524 Tm
+(- Startups \(startup_id\), Products \(product_id\), Research Papers \(paper_id, github_stars\),) Tj
+/F1 10 Tf
+1 0 0 1 48 507 Tm
+(  Jobs \(job_id, posted_at\), News \(news_id, published_at\), Entity Mapping Log \(mapping_id\).) Tj
+/F1 10 Tf
+1 0 0 1 48 490 Tm
+(- Full Export & Incremental Sync: Payload-bounded values:batchUpdate + Column A ID read-back verify.) Tj
+/F1 9 Tf 1 0 0 1 48 36 Tm (Page 2 of 3) Tj
+ET
+endstream
+endobj
+9 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents 10 0 R >>
+endobj
+10 0 obj
+<< /Length 1233 >>
+stream
+BT
+/F2 13 Tf
+1 0 0 1 48 740 Tm
+(5. Scaling Architecture to 500,000+ Records) Tj
+/F1 10 Tf
+1 0 0 1 48 720 Tm
+(- Stateless Collector Workers: Partition source cursors \(OpenAlex, YC, GitHub, RSS\) over Redis) Tj
+/F1 10 Tf
+1 0 0 1 48 703 Tm
+(  Streams / PubSub queues so I/O-bound crawls scale horizontally without blocking.) Tj
+/F1 10 Tf
+1 0 0 1 48 686 Tm
+(- PostgreSQL Production Backend: Swap DATABASE_URL to PostgreSQL with connection pooling,) Tj
+/F1 10 Tf
+1 0 0 1 48 669 Tm
+(  500-2,000 row transactional upserts, and pg_trgm trigram blocking for fast entity matching.) Tj
+/F1 10 Tf
+1 0 0 1 48 652 Tm
+(- Checkpointing & Recovery: collection_checkpoints persists page/cursor progress per category.) Tj
+/F1 10 Tf
+1 0 0 1 48 635 Tm
+(- Cost & Token Optimization: Structured APIs precede LLM calls; boilerplate HTML stripping and) Tj
+/F1 10 Tf
+1 0 0 1 48 618 Tm
+(  canonical URL deduplication eliminate redundant chunk inference.) Tj
+/F1 10 Tf
+1 0 0 1 48 601 Tm
+(- Dead-Letter & Partial Failure Resilience: failure_logs captures 401/403/429/schema/freshness) Tj
+/F1 10 Tf
+1 0 0 1 48 584 Tm
+(  errors; Sheets sync gates 'Connected' strictly on 6/6 per-tab write + Column A verification.) Tj
+/F1 9 Tf 1 0 0 1 48 36 Tm (Page 3 of 3) Tj
+ET
+endstream
+endobj
+xref
+0 11
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000127 00000 n 
+0000000197 00000 n 
+0000000272 00000 n 
+0000000408 00000 n 
+0000002277 00000 n 
+0000002413 00000 n 
+0000004216 00000 n 
+0000004353 00000 n 
+trailer
+<< /Size 11 /Root 1 0 R >>
+startxref
+5639
+%%EOF

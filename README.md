@@ -38,23 +38,25 @@ Live Public APIs, Feeds & Permitted Pages
                  │
                  ▼
    ┌─────────────────────────────┐
-   │  SQLite (WAL) & CSV Writer  │  frontier-atlas/data/frontier_atlas.db
+   │  SQLite (WAL) & CSV Writer  │  frontier-atlas/data/frontier_atlas_recovered.db
    │                             │  frontier-atlas/data/exports/*.csv
    └─────────────┬───────────────┘
                  │
                  ▼
    ┌─────────────────────────────┐
-   │  GoogleSheetsService (v4)   │  RS256 Service Account JWT, 6 exact tabs,
-   │  Full Export & Inc. Sync    │  stable-ID dedup, 500-row batching, Col A verify
+   │  GoogleSheetsService (v4)   │  OAuth Bearer / Service Account JWT, 6 tabs,
+   │  Full Export & Inc. Sync    │  stable-ID dedup, batched writes, Col A verify
    └─────────────────────────────┘
 ```
 
-Key server modules in `src/server/`:
-- `atlasDb.ts` — SQLite schema, transactional batch upserts, verification status aggregation, audit trail, failure logs, checkpoints, and `sheets_sync_state`.
+Key server modules in `src/server/` (mirrored by Python modules in `frontier-atlas/src/` — `crawler/`, `llm/`, `resolver/`, `collectors/`, `exporters/`, `pipeline/`, `storage/`):
+- `atlasDb.ts` — SQLite WAL-mode schema, transactional batch upserts, unique record queries, verification status aggregation, audit trail, failure logs, checkpoints, scheduler config, and `sheets_sync_state`.
 - `httpClient.ts` — `RobotsPolicyManager`, `DomainRateLimiter`, and `PoliteHttpClient` with bounded retries, exponential backoff, `Retry-After` compliance, bounded crawl-delay budgets, and non-bypass enforcement for HTTP `401`/`403`/`451` and CAPTCHA challenges.
 - `llmRouter.ts` — `LLMRouter` orchestrating **1. Gemini Flash** (`@google/genai`) -> **2. Groq** -> **3. Llama 3** -> **4. DeepSeek**, token-aware overlap chunking, recursive half-size sub-chunking on `413` / context-limit errors, 429 exponential backoff, evidence verification, and explicit `heuristic_demo_fallback` (`Unverified`) when zero LLM API keys are configured.
 - `googleSheets.ts` — Google Sheets API v4 integration with dual auth (Workspace OAuth Bearer token or Service Account JWT), quota retries (`429`/`5xx`), 6-tab creation & header formatting, payload-bounded `values:batchUpdate` batches, duplicate-free incremental sync via Column A stable IDs, Column A read-back verification, per-tab status tracking, and persistent connection status (`Connected`, `Not Connected`, `Sync Failed`).
-- `atlasBackend.ts` — Concurrent collectors, UTC & relative timestamp normalization (`parseUtcDatetimeWithMeta`), deterministic entity resolution (`EntityResolver`), `LiveSourceVerifier`, CSV export, and pipeline orchestration.
+- `atlasBackend.ts` — Concurrent collectors, UTC & relative timestamp normalization (`parseUtcDatetimeWithMeta`), deterministic entity resolution (`EntityResolver`), `LiveSourceVerifier`, CSV export, daily scheduler, and pipeline orchestration.
+
+For the full 3-page system diagram and architectural write-up (data flow, 4-tier LLM fallback, entity resolution, error handling, and scaling to 500,000+ records), see `architecture.pdf` (and `frontier-atlas/docs/architecture.pdf`).
 
 ---
 
@@ -102,7 +104,7 @@ Set variables in `.env` (or `frontier-atlas/.env`; never commit credentials to g
 | `DEEPSEEK_API_KEY` | Tier-4 LLM fallback key (OpenAI-compatible) | *(empty)* |
 | `DEEPSEEK_MODEL` | DeepSeek model ID | `deepseek-chat` |
 | `GITHUB_TOKEN` | GitHub PAT raising REST rate limit from 60 to 5,000 req/hr | *(empty)* |
-| `DATABASE_URL` | SQLite path (`sqlite:///data/frontier_atlas.db`) | `sqlite:///data/frontier_atlas.db` |
+| `DATABASE_URL` | SQLite path (`sqlite:///data/frontier_atlas_recovered.db`) | `sqlite:///data/frontier_atlas_recovered.db` |
 | `FRESHNESS_WINDOW_HOURS` | Strict UTC lookback window for Jobs and News | `24` |
 | `MAX_CONCURRENCY` | Max concurrent requests (1–12) | `8` |
 | `RATE_LIMIT_PER_SECOND` | Per-domain request rate cap | `4` |
@@ -140,15 +142,21 @@ FrontierAtlas supports **two** authentication methods for writing to Google Shee
 
 ## API Endpoints
 
-- `GET /api/atlas/status` — Record counts, verification summary, credentials state, `sheetsStatus`, checkpoints, CSV export list, and active run status.
-- `GET /api/atlas/datasets/:category?limit=500` — Paginated table rows (`startups`, `products`, `research_papers`, `jobs`, `news`, `entity_mapping_log`, `failure_logs`, `verification_audit_log`).
-- `POST /api/atlas/run` — Starts async pipeline collection (`{ categories, limit, page }`), persists to SQLite + CSV, generates `data/quality_report.json`, and runs incremental Google Sheets sync when configured.
-- `GET /api/atlas/run-status` — Live run logs and completion status.
-- `POST /api/atlas/audit` — Re-verifies persisted records against live sources and removes duplicates.
-- `POST /api/atlas/export/sheets` — Full 6-tab Google Sheets export.
-- `POST /api/atlas/sync/sheets` — Duplicate-free incremental Google Sheets sync.
-- `POST /api/atlas/sheets/verify` — Verifies live connectivity against Google Sheets.
-- `POST /api/atlas/export/csv` & `GET /api/atlas/download/csv/:filename` — Deterministic 6-file CSV export and download.
+- `GET /api/atlas/status` — Total & unique qualified record counts, 1,000-record target checks, 24h freshness counts, verification summary, live integration health, `sheetsStatus`, scheduler state, CSV export list, and active run status.
+- `GET /api/atlas/integrations/health?refresh=true|false` — Live startup & on-demand health probes for SQLite, LLM fallback tiers (`gemini`, `groq`, `llama3`, `deepseek`), GitHub REST API, and Google Sheets.
+- `POST /api/atlas/integrations/test` — Runs live verification probes across configured integrations (accepts optional `Authorization: Bearer <oauthToken>` and `spreadsheetId`).
+- `GET /api/atlas/datasets/:category?limit=500&offset=0&window=all|24h` — Paginated rows (`limit` up to `10000`) and metadata (`totalCount`, `truncated`, `window`) for `startups`, `products`, `research_papers`, `jobs`, `news`, `entity_mapping_log`, `failure_logs`, and `verification_audit_log`.
+- `POST /api/atlas/run` — Starts async pipeline collection (`{ categories, limit, page, includeAllFresh24h }`), persists to SQLite + CSV, generates `data/quality_report.json`, and runs incremental Google Sheets sync when authorized.
+- `POST /api/atlas/refresh-24h` — Launches a focused UTC 24-hour freshness refresh across `jobs`, `news`, and `research_papers` without overwriting historical records.
+- `GET /api/atlas/run-status` — Live active run logs, progress, and completion status.
+- `GET /api/atlas/runs` — Historical `pipeline_runs` log and active run status.
+- `GET /api/atlas/scheduler` & `PUT /api/atlas/scheduler` — Reads or updates persisted daily UTC auto-refresh schedule (`{ enabled, utcTime }`).
+- `GET /api/atlas/audit-trail?category=&recordId=&limit=100` — Queries `verification_audit_log` provenance entries.
+- `POST /api/atlas/audit` — Re-verifies persisted records against live sources (supports `{ categories, offline, keepDuplicates }`).
+- `POST /api/atlas/export/sheets` — Full 6-tab Google Sheets export (`401` when unauthenticated).
+- `POST /api/atlas/sync/sheets` — Duplicate-free incremental Google Sheets sync (`401` when unauthenticated).
+- `POST /api/atlas/sheets/verify` — Verifies live connectivity against Google Sheets (`401` when unauthenticated).
+- `POST /api/atlas/export/csv` & `GET /api/atlas/download/csv/:filename` — Deterministic 6-file CSV export and allowlisted download.
 
 ---
 
@@ -177,6 +185,6 @@ python -m src.pipeline.orchestrator --categories all --limit 25 --export-csv
 
 - **Live Google Sheets Write**: Interactive browser Google Sign-In or a backend Service Account (`GOOGLE_SHEETS_CREDENTIALS_PATH` / `GOOGLE_SHEETS_CREDENTIALS_JSON`) is required to authorize real writes against `sheets.googleapis.com`; without credentials, Sheets status accurately reports `Not Connected`.
 - **LLM API Keys**: Without `GEMINI_API_KEY`, `GROQ_API_KEY`, `LLAMA3_API_KEY`, or `DEEPSEEK_API_KEY`, unstructured text extraction runs in explicit `heuristic_demo_fallback` mode and marks extracted rows `Unverified` (never fabricating live LLM responses).
-- **External Rate Limits & Anti-Bot Rules**: Unauthenticated GitHub REST API lookups are capped at 60 req/hr without `GITHUB_TOKEN`, and sources returning `401`/`403`/`429`/CAPTCHA or disallowing paths in `robots.txt` (e.g., Remotive, Ashby, MarkTechPost, The Decoder) are skipped and logged in `failure_logs` without bypassing access controls.
+- **External Rate Limits & Anti-Bot Rules**: Unauthenticated GitHub REST API lookups are capped at 60 req/hr without `GITHUB_TOKEN`; crawled HTML homepages returning `401`/`403`/`429`/CAPTCHA or disallowing paths in `robots.txt` are skipped and logged in `failure_logs` without bypassing access controls, while public JSON/RSS API feeds remain accessible directly.
 - **Python Environment in Node Container**: The Node.js runtime container ships Python 3.11 stdlib without `pip` packages (`pytest`, `pydantic`, `reportlab`, `playwright`); install `frontier-atlas/requirements.txt` in a Python virtualenv to execute `pytest` and Playwright-rendered crawls.
 

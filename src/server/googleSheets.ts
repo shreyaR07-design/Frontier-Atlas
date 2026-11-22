@@ -1,5 +1,5 @@
 /**
- * Google Sheets API v4 integration with Service Account authentication,
+ * Google Sheets API v4 integration with Google Workspace OAuth & Service Account auth,
  * paginated batch writes, quota retry/backoff, 6-tab formatting & creation,
  * duplicate-free incremental sync via stable record IDs, and read-back verification.
  */
@@ -251,6 +251,15 @@ interface ServiceAccountCreds {
   source: "path" | "json_env";
 }
 
+export class GoogleApiHttpError extends Error {
+  public readonly httpStatus: number;
+  constructor(httpStatus: number, message: string) {
+    super(message);
+    this.name = "GoogleApiHttpError";
+    this.httpStatus = httpStatus;
+  }
+}
+
 export interface GoogleSheetsConfig {
   atlasDir: string;
   rootDir: string;
@@ -261,12 +270,14 @@ export interface GoogleSheetsConfig {
   apiBaseUrl?: string; // Overrideable for local integration tests
   driveApiBaseUrl?: string; // Overrideable for local integration tests
   oauthTokenUrl?: string;
+  tokenInfoUrl?: string;
 }
 
 export interface SheetsSyncResult {
   success: boolean;
   mode: "full" | "incremental";
   status: "Connected" | "Not Connected" | "Sync Failed";
+  authRequired?: boolean;
   spreadsheetId: string | null;
   spreadsheetUrl: string | null;
   tabRowCounts: Record<string, number>;
@@ -282,7 +293,11 @@ export interface SheetsSyncResult {
 export interface SheetsConnectionStatus {
   status: "Connected" | "Not Connected" | "Sync Failed";
   configured: boolean;
-  credentialSource: "path" | "json_env" | null;
+  authRequired?: boolean;
+  credentialSource: "oauth" | "path" | "json_env" | null;
+  verifiedAccountEmail?: string | null;
+  grantedScopes?: string[];
+  tokenExpiresInSeconds?: number | null;
   spreadsheetId: string | null;
   spreadsheetUrl: string | null;
   lastSyncAt: string | null;
@@ -298,8 +313,14 @@ export interface SheetsConnectionStatus {
 
 export class GoogleSheetsService {
   private cachedToken: { token: string; expiresAtMs: number } | null = null;
+  private liveSessionVerified = false;
+  private liveCredentialSource: "oauth" | "path" | "json_env" | null = null;
+  private verifiedAccountEmail: string | null = null;
+  private grantedScopes: string[] = [];
+  private tokenExpiresInSeconds: number | null = null;
   private readonly apiBase: string;
   private readonly driveApiBase: string;
+  private readonly tokenInfoUrl: string | null;
   private readonly config: GoogleSheetsConfig;
   private readonly db: AtlasDatabase;
 
@@ -308,6 +329,11 @@ export class GoogleSheetsService {
     this.db = db;
     this.apiBase = (config.apiBaseUrl || "https://sheets.googleapis.com/v4").replace(/\/+$/, "");
     this.driveApiBase = (config.driveApiBaseUrl || "https://www.googleapis.com/drive/v3").replace(/\/+$/, "");
+    this.tokenInfoUrl = config.tokenInfoUrl
+      ? config.tokenInfoUrl.replace(/\/+$/, "")
+      : config.apiBaseUrl
+      ? null
+      : "https://oauth2.googleapis.com/tokeninfo";
   }
 
   private resolveCredentialsPath(): string | null {
@@ -488,22 +514,27 @@ export class GoogleSheetsService {
     if (!resp.ok) {
       const apiMsg = redactSecrets((parsed as { error?: { message?: string } })?.error?.message || "");
       if (resp.status === 401) {
-        throw new Error(
-          `Google Workspace authentication expired or unauthorized (HTTP 401${apiMsg ? `: ${apiMsg}` : ""}). Re-authenticate with Google or check your Service Account credentials.`
+        this.liveSessionVerified = false;
+        this.liveCredentialSource = null;
+        throw new GoogleApiHttpError(
+          401,
+          `Google Workspace authentication expired or unauthorized (HTTP 401${apiMsg ? `: ${apiMsg}` : ""}). Click 'Sign in with Google' to re-authorize.`
         );
       }
       if (resp.status === 403) {
-        throw new Error(
+        throw new GoogleApiHttpError(
+          403,
           `Google Workspace permission denied (HTTP 403${apiMsg ? `: ${apiMsg}` : ""}). Ensure the Google Sheets & Drive APIs are enabled and permissions (drive.file, spreadsheets) were granted.`
         );
       }
       if (resp.status === 404) {
-        throw new Error(
-          `Google Spreadsheet not found (HTTP 404${apiMsg ? `: ${apiMsg}` : ""}). Verify GOOGLE_SHEETS_SPREADSHEET_ID or leave it blank to create a new spreadsheet.`
+        throw new GoogleApiHttpError(
+          404,
+          `Google Spreadsheet not found (HTTP 404${apiMsg ? `: ${apiMsg}` : ""}). Verify Target Spreadsheet ID (or clear it to create a new spreadsheet in your Google Drive).`
         );
       }
       const errMsg = apiMsg || `Google Workspace API HTTP ${resp.status}`;
-      throw new Error(errMsg);
+      throw new GoogleApiHttpError(resp.status, errMsg);
     }
     return parsed as T;
   }
@@ -524,7 +555,7 @@ export class GoogleSheetsService {
     return this.apiJson<T>(this.driveApiBase, accessToken, pathSuffix, opts);
   }
 
-  private resolveTargetSpreadsheetId(overrideId?: string | null): string | null {
+  private resolveTargetSpreadsheetId(overrideId?: string | null, createNew = false): string | null {
     const cleanOverride = overrideId?.trim();
     if (cleanOverride) {
       if (!/^[a-zA-Z0-9-_]{10,120}$/.test(cleanOverride)) {
@@ -532,28 +563,122 @@ export class GoogleSheetsService {
       }
       return cleanOverride;
     }
+    if (createNew) {
+      return null;
+    }
     if (this.config.spreadsheetId?.trim()) {
       return this.config.spreadsheetId.trim();
     }
     return this.db.getSheetsSyncState()?.spreadsheetId ?? null;
   }
 
-  private async resolveAuthToken(oauthAccessToken?: string | null): Promise<string> {
-    const clean = oauthAccessToken?.trim();
-    if (clean) return clean;
+  private sanitizeOAuthToken(raw?: string | null): string | null {
+    const clean = raw?.trim() ?? "";
+    if (!clean || clean === "null" || clean === "undefined" || clean.length < 10 || /\s/.test(clean)) {
+      return null;
+    }
+    return clean;
+  }
+
+  private async verifyOAuthTokenScopes(accessToken: string): Promise<{
+    email: string | null;
+    scopes: string[];
+    expiresInSeconds: number | null;
+  }> {
+    if (!this.tokenInfoUrl) {
+      return { email: null, scopes: [], expiresInSeconds: null };
+    }
+    const resp = await this.fetchWithQuotaRetry(this.tokenInfoUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ access_token: accessToken }).toString(),
+    });
+    const info = (await resp.json().catch(() => ({}))) as {
+      scope?: string;
+      email?: string;
+      expires_in?: string | number;
+      error?: string;
+      error_description?: string;
+    };
+    if (!resp.ok) {
+      this.liveSessionVerified = false;
+      this.liveCredentialSource = null;
+      const errDesc = redactSecrets(info.error_description || info.error || "Invalid or expired OAuth token");
+      throw new GoogleApiHttpError(
+        401,
+        `Google OAuth token expired or invalid (HTTP 401: ${errDesc}). Click 'Sign in with Google' to re-authorize.`
+      );
+    }
+    const scopes = String(info.scope ?? "")
+      .split(/\s+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const hasSheetsScope = scopes.includes("https://www.googleapis.com/auth/spreadsheets");
+    const hasDriveScope =
+      scopes.includes("https://www.googleapis.com/auth/drive.file") ||
+      scopes.includes("https://www.googleapis.com/auth/drive");
+    if (!hasSheetsScope || !hasDriveScope) {
+      throw new GoogleApiHttpError(
+        403,
+        "Google Workspace authorization is missing required permissions (Google Sheets & Google Drive drive.file). Re-authorize and approve all requested permissions."
+      );
+    }
+    const expSec = Number(info.expires_in);
+    return {
+      email: typeof info.email === "string" && info.email ? info.email : null,
+      scopes,
+      expiresInSeconds: Number.isFinite(expSec) && expSec > 0 ? Math.floor(expSec) : null,
+    };
+  }
+
+  private async resolveAuthToken(oauthAccessToken?: string | null): Promise<{
+    accessToken: string;
+    credentialSource: "oauth" | "path" | "json_env";
+    email: string | null;
+    scopes: string[];
+    expiresInSeconds: number | null;
+  }> {
+    const clean = this.sanitizeOAuthToken(oauthAccessToken);
+    if (clean) {
+      const meta = await this.verifyOAuthTokenScopes(clean);
+      return {
+        accessToken: clean,
+        credentialSource: "oauth",
+        email: meta.email,
+        scopes: meta.scopes,
+        expiresInSeconds: meta.expiresInSeconds,
+      };
+    }
+    if (oauthAccessToken !== undefined && oauthAccessToken !== null && oauthAccessToken.trim() !== "") {
+      throw new GoogleApiHttpError(
+        401,
+        "Google OAuth access token is malformed (HTTP 401). Click 'Sign in with Google' to obtain a fresh OAuth token."
+      );
+    }
     const creds = this.loadServiceAccountCredentials();
-    return this.getAccessToken(creds);
+    const accessToken = await this.getAccessToken(creds);
+    return {
+      accessToken,
+      credentialSource: creds.source,
+      email: creds.client_email,
+      scopes: [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.file",
+      ],
+      expiresInSeconds: null,
+    };
   }
 
   private async ensureSpreadsheetAndTabs(
     accessToken: string,
-    overrideSpreadsheetId?: string | null
+    overrideSpreadsheetId?: string | null,
+    createNew = false
   ): Promise<{
     spreadsheetId: string;
     spreadsheetUrl: string;
     sheetPropsByTitle: Map<string, { sheetId: number; rowCount: number; columnCount: number }>;
   }> {
-    let spreadsheetId = this.resolveTargetSpreadsheetId(overrideSpreadsheetId);
+    let spreadsheetId = this.resolveTargetSpreadsheetId(overrideSpreadsheetId, createNew);
     let spreadsheetUrl: string;
     let sheetsList: Array<{ properties: { sheetId: number; title: string; gridProperties?: { rowCount?: number; columnCount?: number } } }> = [];
 
@@ -711,7 +836,7 @@ export class GoogleSheetsService {
     accessToken: string,
     spreadsheetId: string,
     spec: ExportSpec
-  ): Promise<{ headerValid: boolean; verifiedRows: number }> {
+  ): Promise<{ headerValid: boolean; verifiedRows: number; duplicateCount: number }> {
     const range = encodeURIComponent(`'${spec.tabName}'!A:A`);
     const data = await this.sheetsJson<{ values?: unknown[][] }>(
       accessToken,
@@ -719,20 +844,28 @@ export class GoogleSheetsService {
     );
     const rows = data.values ?? [];
     if (rows.length === 0) {
-      return { headerValid: false, verifiedRows: 0 };
+      return { headerValid: false, verifiedRows: 0, duplicateCount: 0 };
     }
     const headerValid = String(rows[0]?.[0] ?? "").trim() === spec.columns[0];
     const uniqueIds = new Set<string>();
+    let nonEmptyRowCount = 0;
     for (let i = 1; i < rows.length; i++) {
       const idVal = String(rows[i]?.[0] ?? "").trim();
-      if (idVal) uniqueIds.add(idVal);
+      if (idVal) {
+        nonEmptyRowCount += 1;
+        uniqueIds.add(idVal);
+      }
     }
-    return { headerValid, verifiedRows: uniqueIds.size };
+    return {
+      headerValid,
+      verifiedRows: uniqueIds.size,
+      duplicateCount: Math.max(0, nonEmptyRowCount - uniqueIds.size),
+    };
   }
 
   public getStatus(): SheetsConnectionStatus {
-    const configured = this.isConfigured();
-    const credentialSource = this.getCredentialSource();
+    const saConfigured = this.isConfigured();
+    const credentialSource = this.liveCredentialSource ?? this.getCredentialSource();
     const saved = this.db.getSheetsSyncState();
     const envSpreadsheetId = this.config.spreadsheetId?.trim() || null;
     const spreadsheetId = envSpreadsheetId ?? saved?.spreadsheetId ?? null;
@@ -741,29 +874,25 @@ export class GoogleSheetsService {
       saved?.spreadsheetUrl ??
       (spreadsheetId ? `https://docs.google.com/spreadsheets/d/${spreadsheetId}` : null);
 
-    if (!configured && (!saved || saved.status === "Not Connected")) {
-      return {
-        status: "Not Connected",
-        configured: false,
-        credentialSource: null,
-        spreadsheetId,
-        spreadsheetUrl,
-        lastSyncAt: saved?.lastSuccessAt ?? null,
-        lastAttemptAt: saved?.lastAttemptAt ?? null,
-        lastMode: saved?.lastSyncMode ?? null,
-        tabRowCounts: saved?.tabRowCounts ?? {},
-        tabStatuses: saved?.tabStatuses ?? {},
-        rowsAdded: saved?.rowsAdded ?? 0,
-        rowsUpdated: saved?.rowsUpdated ?? 0,
-        rowsUnchanged: saved?.rowsUnchanged ?? 0,
-        lastError: saved?.lastError ?? null,
-      };
-    }
+    // Do not report Connected unless a real Google API request succeeded in this active session
+    const effectiveStatus: "Connected" | "Not Connected" | "Sync Failed" = this.liveSessionVerified
+      ? saved?.status === "Sync Failed"
+        ? "Sync Failed"
+        : "Connected"
+      : saved?.status === "Sync Failed"
+      ? "Sync Failed"
+      : "Not Connected";
+
+    const authRequired = !this.liveSessionVerified && !saConfigured;
 
     return {
-      status: saved?.status ?? "Not Connected",
-      configured: configured || saved?.status === "Connected",
+      status: effectiveStatus,
+      configured: this.liveSessionVerified || saConfigured,
+      authRequired,
       credentialSource,
+      verifiedAccountEmail: this.liveSessionVerified ? this.verifiedAccountEmail : null,
+      grantedScopes: this.liveSessionVerified ? this.grantedScopes : [],
+      tokenExpiresInSeconds: this.liveSessionVerified ? this.tokenExpiresInSeconds : null,
       spreadsheetId,
       spreadsheetUrl,
       lastSyncAt: saved?.lastSuccessAt ?? null,
@@ -778,11 +907,11 @@ export class GoogleSheetsService {
     };
   }
 
-  private safeResolveTargetSpreadsheetId(overrideId?: string | null): string | null {
+  private safeResolveTargetSpreadsheetId(overrideId?: string | null, createNew = false): string | null {
     try {
-      return this.resolveTargetSpreadsheetId(overrideId);
+      return this.resolveTargetSpreadsheetId(overrideId, createNew);
     } catch {
-      return this.db.getSheetsSyncState()?.spreadsheetId ?? null;
+      return createNew ? null : this.db.getSheetsSyncState()?.spreadsheetId ?? null;
     }
   }
 
@@ -834,15 +963,24 @@ export class GoogleSheetsService {
   public async verifyConnection(opts?: {
     oauthAccessToken?: string | null;
     spreadsheetId?: string | null;
+    createNew?: boolean;
   }): Promise<SheetsConnectionStatus> {
     const attemptAt = new Date().toISOString();
     const prev = this.db.getSheetsSyncState();
-    const hasOauth = Boolean(opts?.oauthAccessToken?.trim());
+    const cleanOauth = this.sanitizeOAuthToken(opts?.oauthAccessToken);
+    const hasOauth = Boolean(cleanOauth);
+    const createNew = Boolean(opts?.createNew);
     if (!hasOauth && !this.isConfigured()) {
+      this.liveSessionVerified = false;
+      this.liveCredentialSource = null;
+      this.verifiedAccountEmail = null;
+      this.grantedScopes = [];
+      this.tokenExpiresInSeconds = null;
       this.db.saveSheetsSyncState({
         status: "Not Connected",
-        spreadsheetId: this.safeResolveTargetSpreadsheetId(opts?.spreadsheetId),
-        spreadsheetUrl: prev?.spreadsheetUrl ?? null,
+        spreadsheetId: this.safeResolveTargetSpreadsheetId(opts?.spreadsheetId, createNew),
+        spreadsheetUrl: createNew ? null : prev?.spreadsheetUrl ?? null,
+        clearSpreadsheetTarget: createNew,
         lastSyncMode: prev?.lastSyncMode ?? null,
         lastAttemptAt: attemptAt,
         lastSuccessAt: prev?.lastSuccessAt ?? null,
@@ -850,32 +988,60 @@ export class GoogleSheetsService {
         rowsAdded: prev?.rowsAdded ?? 0,
         rowsUpdated: prev?.rowsUpdated ?? 0,
         rowsUnchanged: prev?.rowsUnchanged ?? 0,
-        lastError: "Google Sheets authorization required. Click 'Sign in with Google' to connect your Google Drive & Sheets account.",
+        lastError:
+          "Google Sheets authorization required. Click 'Sign in with Google' to connect your Google Drive & Sheets account.",
       });
-      return this.getStatus();
+      return { ...this.getStatus(), authRequired: true };
     }
 
     try {
-      const token = await this.resolveAuthToken(opts?.oauthAccessToken);
-      const targetId = this.resolveTargetSpreadsheetId(opts?.spreadsheetId);
-      let spreadsheetUrl = prev?.spreadsheetUrl ?? null;
-      if (targetId) {
-        const meta = await this.sheetsJson<{ spreadsheetId: string; spreadsheetUrl?: string }>(
-          token,
-          `/spreadsheets/${targetId}?fields=spreadsheetId,spreadsheetUrl`
-        );
-        spreadsheetUrl = meta.spreadsheetUrl || `https://docs.google.com/spreadsheets/d/${targetId}`;
-      } else {
-        // Real live API check against Google Drive drive.file scope when no spreadsheet ID exists yet
+      const auth = await this.resolveAuthToken(opts?.oauthAccessToken);
+      const explicitTargetId =
+        Boolean(opts?.spreadsheetId?.trim()) || (!createNew && Boolean(this.config.spreadsheetId?.trim()));
+      let resolvedTargetId = this.resolveTargetSpreadsheetId(opts?.spreadsheetId, createNew);
+      let spreadsheetUrl = createNew && !resolvedTargetId ? null : prev?.spreadsheetUrl ?? null;
+      let clearedStaleTarget = createNew && !resolvedTargetId;
+
+      if (!this.config.apiBaseUrl || Boolean(this.config.driveApiBaseUrl)) {
         await this.driveJson<{ files?: Array<{ id?: string; name?: string }> }>(
-          token,
+          auth.accessToken,
           "/files?pageSize=1&fields=files(id,name)"
         );
       }
+
+      if (resolvedTargetId) {
+        try {
+          const meta = await this.sheetsJson<{ spreadsheetId: string; spreadsheetUrl?: string }>(
+            auth.accessToken,
+            `/spreadsheets/${resolvedTargetId}?fields=spreadsheetId,spreadsheetUrl`
+          );
+          spreadsheetUrl = meta.spreadsheetUrl || `https://docs.google.com/spreadsheets/d/${resolvedTargetId}`;
+        } catch (sheetErr) {
+          if (
+            !explicitTargetId &&
+            sheetErr instanceof GoogleApiHttpError &&
+            (sheetErr.httpStatus === 403 || sheetErr.httpStatus === 404)
+          ) {
+            resolvedTargetId = null;
+            spreadsheetUrl = null;
+            clearedStaleTarget = true;
+          } else {
+            throw sheetErr;
+          }
+        }
+      }
+
+      this.liveSessionVerified = true;
+      this.liveCredentialSource = auth.credentialSource;
+      this.verifiedAccountEmail = auth.email;
+      this.grantedScopes = auth.scopes;
+      this.tokenExpiresInSeconds = auth.expiresInSeconds;
+
       this.db.saveSheetsSyncState({
         status: "Connected",
-        spreadsheetId: targetId,
+        spreadsheetId: resolvedTargetId,
         spreadsheetUrl,
+        clearSpreadsheetTarget: clearedStaleTarget,
         lastSyncMode: prev?.lastSyncMode ?? "verify",
         lastAttemptAt: attemptAt,
         lastSuccessAt: prev?.lastSuccessAt ?? null,
@@ -885,7 +1051,14 @@ export class GoogleSheetsService {
         rowsUnchanged: prev?.rowsUnchanged ?? 0,
         lastError: null,
       });
+      return { ...this.getStatus(), authRequired: false };
     } catch (err) {
+      this.liveSessionVerified = false;
+      this.liveCredentialSource = null;
+      this.verifiedAccountEmail = null;
+      this.grantedScopes = [];
+      this.tokenExpiresInSeconds = null;
+      const isAuthErr = err instanceof GoogleApiHttpError && err.httpStatus === 401;
       const safeErr = redactSecrets(err instanceof Error ? err.message : String(err));
       this.db.saveSheetsSyncState({
         status: "Sync Failed",
@@ -900,8 +1073,8 @@ export class GoogleSheetsService {
         rowsUnchanged: prev?.rowsUnchanged ?? 0,
         lastError: safeErr,
       });
+      return { ...this.getStatus(), authRequired: isAuthErr };
     }
-    return this.getStatus();
   }
 
   public async probeHealth(opts?: {
@@ -917,11 +1090,14 @@ export class GoogleSheetsService {
     checkedAt: string;
   }> {
     const checkedAt = new Date().toISOString();
-    const hasOauth = Boolean(opts?.oauthAccessToken?.trim());
+    const hasOauth = Boolean(this.sanitizeOAuthToken(opts?.oauthAccessToken));
     const saSource = this.getCredentialSource();
     const credentialSource: "oauth" | "path" | "json_env" | null = hasOauth ? "oauth" : saSource;
 
     if (!hasOauth && !saSource) {
+      this.liveSessionVerified = false;
+      this.liveCredentialSource = null;
+      this.verifiedAccountEmail = null;
       const saved = this.db.getSheetsSyncState();
       return {
         status: "Not Configured",
@@ -962,19 +1138,23 @@ export class GoogleSheetsService {
 
   public async exportOrSync(
     mode: "full" | "incremental",
-    opts?: { oauthAccessToken?: string | null; spreadsheetId?: string | null }
+    opts?: { oauthAccessToken?: string | null; spreadsheetId?: string | null; createNew?: boolean }
   ): Promise<SheetsSyncResult> {
     const attemptAt = new Date().toISOString();
     const prev = this.db.getSheetsSyncState();
-    const hasOauth = Boolean(opts?.oauthAccessToken?.trim());
+    const hasOauth = Boolean(this.sanitizeOAuthToken(opts?.oauthAccessToken));
+    const createNew = Boolean(opts?.createNew);
 
     if (!hasOauth && !this.isConfigured()) {
+      this.liveSessionVerified = false;
+      this.liveCredentialSource = null;
       const errMsg =
         "Google Sheets authorization required. Click 'Sign in with Google' to authorize Google Drive & Sheets access before exporting.";
       this.db.saveSheetsSyncState({
         status: "Not Connected",
-        spreadsheetId: this.safeResolveTargetSpreadsheetId(opts?.spreadsheetId),
-        spreadsheetUrl: prev?.spreadsheetUrl ?? null,
+        spreadsheetId: this.safeResolveTargetSpreadsheetId(opts?.spreadsheetId, createNew),
+        spreadsheetUrl: createNew ? null : prev?.spreadsheetUrl ?? null,
+        clearSpreadsheetTarget: createNew,
         lastSyncMode: mode,
         lastAttemptAt: attemptAt,
         lastSuccessAt: prev?.lastSuccessAt ?? null,
@@ -982,12 +1162,13 @@ export class GoogleSheetsService {
         rowsAdded: 0,
         rowsUpdated: 0,
         rowsUnchanged: 0,
-        lastError: null,
+        lastError: errMsg,
       });
       return {
         success: false,
         mode,
         status: "Not Connected",
+        authRequired: true,
         spreadsheetId: null,
         spreadsheetUrl: null,
         tabRowCounts: {},
@@ -1002,9 +1183,10 @@ export class GoogleSheetsService {
     }
 
     try {
-      const accessToken = await this.resolveAuthToken(opts?.oauthAccessToken);
+      const auth = await this.resolveAuthToken(opts?.oauthAccessToken);
+      const accessToken = auth.accessToken;
       const { spreadsheetId, spreadsheetUrl, sheetPropsByTitle } =
-        await this.ensureSpreadsheetAndTabs(accessToken, opts?.spreadsheetId);
+        await this.ensureSpreadsheetAndTabs(accessToken, opts?.spreadsheetId, createNew);
 
       const batchSize = 250;
       const tabRowCounts: Record<string, number> = {};
@@ -1252,7 +1434,7 @@ export class GoogleSheetsService {
             }
           }
 
-          const { headerValid, verifiedRows } = await this.verifyWrittenTab(
+          const { headerValid, verifiedRows, duplicateCount } = await this.verifyWrittenTab(
             accessToken,
             spreadsheetId,
             spec
@@ -1268,6 +1450,16 @@ export class GoogleSheetsService {
               verifiedRows,
               error: `Header column mismatch on '${spec.tabName}'`,
               message: `Verification failed: expected header '${spec.columns[0]}' in A1`,
+            };
+          } else if (duplicateCount > 0) {
+            tabStatuses[spec.tabName] = {
+              tabName: spec.tabName,
+              status: "failed",
+              expectedRows,
+              writtenRows: expectedRows,
+              verifiedRows,
+              error: `Duplicate rows detected on '${spec.tabName}' (${duplicateCount} duplicate IDs)`,
+              message: `Verification failed: ${duplicateCount} duplicate IDs found`,
             };
           } else if (verifiedRows !== expectedRows) {
             tabStatuses[spec.tabName] = {
@@ -1291,7 +1483,7 @@ export class GoogleSheetsService {
             };
           }
         } catch (tabErr) {
-          const tabMsg = tabErr instanceof Error ? tabErr.message : String(tabErr);
+          const tabMsg = redactSecrets(tabErr instanceof Error ? tabErr.message : String(tabErr));
           verifiedTabRowCounts[spec.tabName] = 0;
           tabStatuses[spec.tabName] = {
             tabName: spec.tabName,
@@ -1302,8 +1494,13 @@ export class GoogleSheetsService {
             error: tabMsg,
             message: `Failed: ${tabMsg}`,
           };
+          if (tabErr instanceof GoogleApiHttpError && tabErr.httpStatus === 401) {
+            this.liveSessionVerified = false;
+            this.liveCredentialSource = null;
+          }
           if (/HTTP (401|403|404)/.test(tabMsg)) {
             fatalAuthOrTargetError = tabMsg;
+            break;
           }
         }
       }
@@ -1317,10 +1514,15 @@ export class GoogleSheetsService {
           .map((s) => `${s.tabName} (${tabStatuses[s.tabName]?.error || "verification failed"})`)
           .join("; ");
         const errMsg = `${6 - failedTabs.length}/6 tabs verified. Failed tabs: ${failedSummary}`;
+        const authRequired = /HTTP 401/i.test(errMsg);
+        if (authRequired) {
+          this.liveSessionVerified = false;
+          this.liveCredentialSource = null;
+        }
         this.db.saveSheetsSyncState({
           status: "Sync Failed",
           spreadsheetId,
-          spreadsheetUrl,
+          spreadsheetUrl: null,
           lastSyncMode: mode,
           lastAttemptAt: attemptAt,
           lastSuccessAt: prev?.lastSuccessAt ?? null,
@@ -1335,8 +1537,9 @@ export class GoogleSheetsService {
           success: false,
           mode,
           status: "Sync Failed",
+          authRequired,
           spreadsheetId,
-          spreadsheetUrl,
+          spreadsheetUrl: null,
           tabRowCounts,
           verifiedTabRowCounts,
           tabStatuses,
@@ -1347,6 +1550,12 @@ export class GoogleSheetsService {
           error: errMsg,
         };
       }
+
+      this.liveSessionVerified = true;
+      this.liveCredentialSource = auth.credentialSource;
+      this.verifiedAccountEmail = auth.email;
+      this.grantedScopes = auth.scopes;
+      this.tokenExpiresInSeconds = auth.expiresInSeconds;
 
       this.db.saveSheetsSyncState({
         status: "Connected",
@@ -1367,6 +1576,7 @@ export class GoogleSheetsService {
         success: true,
         mode,
         status: "Connected",
+        authRequired: false,
         spreadsheetId,
         spreadsheetUrl,
         tabRowCounts,
@@ -1379,8 +1589,15 @@ export class GoogleSheetsService {
         error: null,
       };
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      const targetId = this.safeResolveTargetSpreadsheetId(opts?.spreadsheetId);
+      const msg = redactSecrets(err instanceof Error ? err.message : String(err));
+      const authRequired =
+        (err instanceof GoogleApiHttpError && err.httpStatus === 401) || /HTTP 401/i.test(msg);
+      if (authRequired) {
+        this.liveSessionVerified = false;
+        this.liveCredentialSource = null;
+        this.verifiedAccountEmail = null;
+      }
+      const targetId = this.safeResolveTargetSpreadsheetId(opts?.spreadsheetId, createNew);
       const tabStatuses: Record<string, TabExportStatus> = {};
       for (const spec of EXPORT_SPECS) {
         tabStatuses[spec.tabName] = {
@@ -1396,7 +1613,7 @@ export class GoogleSheetsService {
       this.db.saveSheetsSyncState({
         status: "Sync Failed",
         spreadsheetId: targetId,
-        spreadsheetUrl: prev?.spreadsheetUrl ?? null,
+        spreadsheetUrl: null,
         lastSyncMode: mode,
         lastAttemptAt: attemptAt,
         lastSuccessAt: prev?.lastSuccessAt ?? null,
@@ -1411,8 +1628,9 @@ export class GoogleSheetsService {
         success: false,
         mode,
         status: "Sync Failed",
+        authRequired,
         spreadsheetId: targetId,
-        spreadsheetUrl: prev?.spreadsheetUrl ?? null,
+        spreadsheetUrl: null,
         tabRowCounts: {},
         verifiedTabRowCounts: {},
         tabStatuses,

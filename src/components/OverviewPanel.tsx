@@ -31,23 +31,29 @@ interface OverviewPanelProps {
   failures: FailureLogRow[];
   runState: RunJobState;
   auditing: boolean;
+  csvExporting?: boolean;
   schedulerUpdating: boolean;
   sheetsExporting: boolean;
   sheetsSyncing: boolean;
   testingIntegrations: boolean;
+  testingGoogleConnection: boolean;
   sheetsFeedback: {
     success: boolean;
     message: string;
     url?: string | null;
+    needsReauth?: boolean;
   } | null;
   googleUserEmail: string | null;
   googleHasToken: boolean;
   googleSigningIn: boolean;
   targetSpreadsheetId: string;
   onTargetSpreadsheetIdChange: (value: string) => void;
+  onClearTargetSpreadsheetId: () => void;
   onGoogleSignIn: () => void;
+  onGoogleSwitchAccount: () => void;
   onGoogleSignOut: () => void;
   onTestIntegrations: () => void;
+  onTestGoogleConnection: () => void;
   onSelectSection: (section: SectionId) => void;
   onOpenRunModal: () => void;
   onRefresh24h: () => void;
@@ -143,19 +149,24 @@ export function OverviewPanel({
   failures,
   runState,
   auditing,
+  csvExporting = false,
   schedulerUpdating,
   sheetsExporting,
   sheetsSyncing,
   testingIntegrations,
+  testingGoogleConnection,
   sheetsFeedback,
   googleUserEmail,
   googleHasToken,
   googleSigningIn,
   targetSpreadsheetId,
   onTargetSpreadsheetIdChange,
+  onClearTargetSpreadsheetId,
   onGoogleSignIn,
+  onGoogleSwitchAccount,
   onGoogleSignOut,
   onTestIntegrations,
+  onTestGoogleConnection,
   onSelectSection,
   onOpenRunModal,
   onRefresh24h,
@@ -227,7 +238,7 @@ export function OverviewPanel({
   const verificationByCategory = status?.verificationCounts?.byCategory ?? {};
   const unavailableSources = report?.unavailable_sources ?? [];
   const sheetsStatus = status?.sheetsStatus ?? {
-    status: status?.credentials.googleSheetsConfigured ? "Not Connected" : "Not Connected",
+    status: "Not Connected",
     configured: status?.credentials.googleSheetsConfigured ?? false,
     credentialSource: null,
     spreadsheetId: null,
@@ -266,6 +277,9 @@ export function OverviewPanel({
   const jobsFresh = report?.categories?.jobs?.freshness ?? null;
   const newsFresh = report?.categories?.news?.freshness ?? null;
   const freshCounts24h = status?.freshCounts24h ?? { jobs: 0, news: 0, research_papers: 0 };
+  const latestNewCounts = status?.latestRunNewCounts ?? {};
+  const totalNewLatestRun = Object.values(latestNewCounts).reduce((sum, n) => sum + n, 0);
+  const githubNotConfigured = status?.integrationHealth?.byId?.github?.status === "Not Configured";
   const pipelineRuns = status?.pipelineRuns ?? [];
   const lastSourceOutcomes = status?.lastSourceOutcomes ?? [];
   const failedSources = lastSourceOutcomes.filter((s) => s.status === "failed");
@@ -299,7 +313,10 @@ export function OverviewPanel({
             <p className="text-sm text-slate-400">
               {totalRecords === 0
                 ? "Database initialized with 0 records. Run a live collection to populate source-verified datasets."
-                : `${totalRecords.toLocaleString()} historical rows across 6 datasets in ${status?.storage.backend ?? "sqlite"}${status?.storage.integrityCheck === "ok" ? " (integrity verified)" : ""}.`}
+                : `${totalRecords.toLocaleString()} total historical rows across 6 datasets in ${status?.storage.backend ?? "sqlite"}${status?.storage.integrityCheck === "ok" ? " (integrity verified)" : ""}.`}
+              {pipelineRuns.length > 0
+                ? ` · Latest run added +${totalNewLatestRun.toLocaleString()} new rows`
+                : ""}
               {status?.lastSuccessfulRunAt
                 ? ` · Last successful collection ${new Date(status.lastSuccessfulRunAt).toLocaleString()}`
                 : report?.generated_at_utc
@@ -322,10 +339,11 @@ export function OverviewPanel({
             <button
               type="button"
               onClick={onExportCsv}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm font-medium transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
+              disabled={csvExporting}
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-60 text-slate-200 text-sm font-medium transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
             >
               <Download className="w-4 h-4" />
-              <span>Export CSV</span>
+              <span>{csvExporting ? "Exporting CSV..." : "Export CSV"}</span>
             </button>
 
             <button
@@ -470,21 +488,44 @@ export function OverviewPanel({
             className={`mt-4 rounded-lg border p-3 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2 ${
               sheetsFeedback.success
                 ? "bg-emerald-950/30 border-emerald-800/60 text-emerald-300"
-                : "bg-amber-950/30 border-amber-800/60 text-amber-300"
+                : "bg-rose-950/30 border-rose-800/60 text-rose-200"
             }`}
           >
             <span>{sheetsFeedback.message}</span>
-            {sheetsFeedback.url && (
-              <a
-                href={sheetsFeedback.url}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-1 font-medium underline shrink-0"
-              >
-                <span>Open Spreadsheet</span>
-                <ExternalLink className="w-3.5 h-3.5" />
-              </a>
-            )}
+            <div className="flex items-center gap-2.5 shrink-0">
+              {!sheetsFeedback.success &&
+                Boolean(targetSpreadsheetId.trim()) &&
+                /403|404|not found|Target Spreadsheet/i.test(sheetsFeedback.message) && (
+                  <button
+                    type="button"
+                    onClick={onClearTargetSpreadsheetId}
+                    className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium transition-colors"
+                  >
+                    Clear Target ID (Create New)
+                  </button>
+                )}
+              {sheetsFeedback.needsReauth && (
+                <button
+                  type="button"
+                  onClick={onGoogleSignIn}
+                  disabled={googleSigningIn}
+                  className="px-2.5 py-1 rounded bg-white hover:bg-slate-100 disabled:opacity-60 text-slate-900 font-medium transition-colors"
+                >
+                  {googleSigningIn ? "Signing in..." : "Sign in with Google"}
+                </button>
+              )}
+              {sheetsFeedback.success && sheetsFeedback.url && (
+                <a
+                  href={sheetsFeedback.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1 font-medium underline shrink-0"
+                >
+                  <span>Open Spreadsheet</span>
+                  <ExternalLink className="w-3.5 h-3.5" />
+                </a>
+              )}
+            </div>
           </div>
         )}
         {(unavailableSources.length > 0 || missingCredsList.length > 0 || failedIntegrations.length > 0) && (
@@ -518,8 +559,10 @@ export function OverviewPanel({
                 <div>
                   <span className="font-medium text-amber-300">Unconfigured API Credentials: </span>
                   <span>
-                    <code className="text-amber-100">{missingCredsList.join(", ")}</code> not set in server environment
-                    (public unauthenticated endpoints continue normally; optional AI extraction fallback and higher GitHub rate limits require keys).
+                    <code className="text-amber-100">{missingCredsList.join(", ")}</code> not set in server environment.
+                    {githubNotConfigured
+                      ? " GitHub public API continues unauthenticated with a 60 requests/hour rate limit (set GITHUB_TOKEN for 5,000 req/hr)."
+                      : " Public unauthenticated endpoints continue normally; optional provider keys enable extra fallbacks."}
                   </span>
                 </div>
               </div>
@@ -533,10 +576,18 @@ export function OverviewPanel({
         <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
           {DATASET_META.map((meta) => {
             const count = status?.counts[meta.key] ?? 0;
+            const uniqueTargetCount =
+              meta.key === "startups"
+                ? status?.uniqueQualifiedCounts?.startups ?? count
+                : meta.key === "products"
+                ? status?.uniqueQualifiedCounts?.products ?? count
+                : meta.key === "research_papers"
+                ? status?.uniqueQualifiedCounts?.research_papers ?? count
+                : count;
             const catReport = report?.categories[meta.key];
             const catVer = verificationByCategory[meta.key];
             const target = meta.target;
-            const pct = target ? Math.min(100, Math.round((count / target) * 100)) : null;
+            const pct = target ? Math.min(100, Math.round((uniqueTargetCount / target) * 100)) : null;
 
             return (
               <button
@@ -556,27 +607,32 @@ export function OverviewPanel({
                 </div>
 
                 <div className="mt-4 flex items-baseline justify-between gap-2">
-                  <span className="font-mono text-2xl font-semibold text-slate-100 tabular-nums">
-                    {count.toLocaleString()}
-                  </span>
+                  <div>
+                    <span className="font-mono text-2xl font-semibold text-slate-100 tabular-nums">
+                      {count.toLocaleString()}
+                    </span>
+                    <span className="ml-1.5 text-[11px] font-mono text-sky-400/90 tabular-nums">
+                      (+{(latestNewCounts[meta.key] ?? 0).toLocaleString()} new)
+                    </span>
+                  </div>
                   {meta.key === "research_papers" ? (
-                    <span className="font-mono text-xs text-emerald-300 tabular-nums">
-                      24h Fresh: {freshCounts24h.research_papers.toLocaleString()} · Target {target?.toLocaleString()} ({pct}%)
+                    <span className="font-mono text-xs text-emerald-300 tabular-nums text-right">
+                      24h Fresh: {freshCounts24h.research_papers.toLocaleString()} · {uniqueTargetCount.toLocaleString()} unique / {target?.toLocaleString()} ({pct}%)
                     </span>
                   ) : meta.key === "jobs" ? (
-                    <span className="font-mono text-xs text-emerald-300 tabular-nums">
+                    <span className="font-mono text-xs text-emerald-300 tabular-nums text-right">
                       24h Fresh: {freshCounts24h.jobs.toLocaleString()} · Archive {count.toLocaleString()}
                     </span>
                   ) : meta.key === "news" ? (
-                    <span className="font-mono text-xs text-emerald-300 tabular-nums">
+                    <span className="font-mono text-xs text-emerald-300 tabular-nums text-right">
                       24h Fresh: {freshCounts24h.news.toLocaleString()} · Archive {count.toLocaleString()}
                     </span>
                   ) : target !== null ? (
-                    <span className="font-mono text-xs text-slate-400 tabular-nums">
-                      Target {target.toLocaleString()} ({pct}%)
+                    <span className="font-mono text-xs text-slate-400 tabular-nums text-right">
+                      {uniqueTargetCount.toLocaleString()} unique / {target.toLocaleString()} ({pct}%)
                     </span>
                   ) : (
-                    <span className="font-mono text-xs text-slate-400">
+                    <span className="font-mono text-xs text-slate-400 text-right">
                       Audit entries
                     </span>
                   )}
@@ -770,7 +826,16 @@ export function OverviewPanel({
                 <FileSpreadsheet className="w-4 h-4 text-sky-400 shrink-0" />
                 <span className="text-sm font-medium text-slate-100">Google Sheets Sync Status</span>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={onTestGoogleConnection}
+                  disabled={testingGoogleConnection || googleSigningIn}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-800 hover:bg-slate-700 disabled:opacity-60 text-slate-200 text-xs font-medium transition-colors"
+                >
+                  <RefreshCw className={`w-3 h-3 ${testingGoogleConnection ? "animate-spin" : ""}`} />
+                  <span>{testingGoogleConnection ? "Testing Google..." : "Test Google Connection"}</span>
+                </button>
                 <span
                   className={`inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-0.5 rounded-md border ${
                     sheetsStatus.status === "Connected"
@@ -795,17 +860,19 @@ export function OverviewPanel({
                       : "Not Connected"}
                   </span>
                 </span>
-                {sheetsStatus.spreadsheetUrl && (
-                  <a
-                    href={sheetsStatus.spreadsheetUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline-flex items-center gap-1 text-xs text-sky-400 hover:underline"
-                  >
-                    <span>Open Sheet</span>
-                    <ExternalLink className="w-3 h-3" />
-                  </a>
-                )}
+                {sheetsStatus.status === "Connected" &&
+                  Boolean(sheetsStatus.lastSyncAt) &&
+                  Boolean(sheetsStatus.spreadsheetUrl) && (
+                    <a
+                      href={sheetsStatus.spreadsheetUrl!}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 text-xs text-sky-400 hover:underline"
+                    >
+                      <span>Open Sheet</span>
+                      <ExternalLink className="w-3 h-3" />
+                    </a>
+                  )}
               </div>
             </div>
 
@@ -815,13 +882,23 @@ export function OverviewPanel({
                   <div className="text-xs text-slate-300">
                     Signed in as <span className="font-mono text-emerald-300">{googleUserEmail}</span>
                   </div>
-                  <button
-                    type="button"
-                    onClick={onGoogleSignOut}
-                    className="px-3 py-1.5 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium transition-colors shrink-0"
-                  >
-                    Sign out
-                  </button>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={onGoogleSwitchAccount}
+                      disabled={googleSigningIn}
+                      className="px-3 py-1.5 rounded-md bg-slate-800 hover:bg-slate-700 disabled:opacity-60 text-slate-200 text-xs font-medium transition-colors"
+                    >
+                      {googleSigningIn ? "Authorizing..." : "Re-authorize"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={onGoogleSignOut}
+                      className="px-3 py-1.5 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium transition-colors"
+                    >
+                      Sign out
+                    </button>
+                  </div>
                 </>
               ) : (
                 <>
@@ -866,9 +943,20 @@ export function OverviewPanel({
             </div>
 
             <div className="space-y-1">
-              <label htmlFor="target-spreadsheet-id" className="text-xs text-slate-400 block">
-                Target Spreadsheet ID (optional — leave blank to auto-create)
-              </label>
+              <div className="flex items-center justify-between gap-2">
+                <label htmlFor="target-spreadsheet-id" className="text-xs text-slate-400 block">
+                  Target Spreadsheet ID (optional — leave blank to auto-create)
+                </label>
+                {targetSpreadsheetId.trim() !== "" && (
+                  <button
+                    type="button"
+                    onClick={onClearTargetSpreadsheetId}
+                    className="text-[11px] text-sky-400 hover:text-sky-300 underline"
+                  >
+                    Clear (auto-create new)
+                  </button>
+                )}
+              </div>
               <input
                 id="target-spreadsheet-id"
                 type="text"
@@ -1116,6 +1204,7 @@ export function OverviewPanel({
                   <tr className="border-b border-slate-800 text-slate-400">
                     <th className="py-2 pr-2 font-medium">Trigger</th>
                     <th className="py-2 px-2 font-medium">Status</th>
+                    <th className="py-2 px-2 font-medium">New Rows</th>
                     <th className="py-2 px-2 font-medium">24h Fresh</th>
                     <th className="py-2 px-2 font-medium">Summary</th>
                     <th className="py-2 pl-2 font-medium text-right">Started (UTC)</th>
@@ -1131,6 +1220,11 @@ export function OverviewPanel({
                         : run.status === "running"
                         ? "text-sky-400"
                         : "text-rose-400";
+                    const newCounts = run.new_records_counts ?? {};
+                    const totalRunNew = Object.values(newCounts).reduce((s, v) => s + Number(v || 0), 0);
+                    const newTooltip = Object.entries(newCounts)
+                      .map(([k, v]) => `${k}: +${v}`)
+                      .join(", ");
                     return (
                       <tr key={run.run_id} className="hover:bg-slate-800/30">
                         <td className="py-2 pr-2 font-mono text-slate-300 whitespace-nowrap">
@@ -1139,10 +1233,16 @@ export function OverviewPanel({
                         <td className={`py-2 px-2 font-medium whitespace-nowrap ${statusCls}`}>
                           {run.status}
                         </td>
+                        <td
+                          className="py-2 px-2 font-mono text-sky-300 tabular-nums whitespace-nowrap"
+                          title={newTooltip || "Per-dataset net new rows inserted"}
+                        >
+                          +{totalRunNew.toLocaleString()}
+                        </td>
                         <td className="py-2 px-2 font-mono text-slate-300 tabular-nums whitespace-nowrap">
                           {run.fresh_24h_counts?.jobs ?? 0}J / {run.fresh_24h_counts?.news ?? 0}N / {run.fresh_24h_counts?.research_papers ?? 0}P
                         </td>
-                        <td className="py-2 px-2 text-slate-400 max-w-[240px] truncate" title={run.summary ?? ""}>
+                        <td className="py-2 px-2 text-slate-400 max-w-[220px] truncate" title={run.summary ?? ""}>
                           {run.summary ?? "—"}
                         </td>
                         <td className="py-2 pl-2 text-right font-mono text-slate-400 tabular-nums whitespace-nowrap">

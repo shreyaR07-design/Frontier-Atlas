@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { AlertTriangle, FileSpreadsheet, X } from "lucide-react";
 
 interface SheetsConfirmModalProps {
@@ -26,14 +27,29 @@ export function SheetsConfirmModal({
   onCancel,
   onConfirm,
 }: SheetsConfirmModalProps) {
+  useEffect(() => {
+    if (!mode) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onCancel();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [mode, onCancel]);
+
   if (!mode) return null;
 
   const isFull = mode === "full";
   const totalRows = TAB_MAPPING.reduce((acc, item) => acc + (counts?.[item.key] ?? 0), 0);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-xs">
-      <div className="w-full max-w-lg rounded-xl bg-[#0E172B] border border-slate-800 p-6 space-y-4">
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-xs"
+      onClick={onCancel}
+    >
+      <div
+        className="w-full max-w-lg rounded-xl bg-[#0E172B] border border-slate-800 p-6 space-y-4"
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center gap-2">
             <FileSpreadsheet className="w-5 h-5 text-sky-400" />

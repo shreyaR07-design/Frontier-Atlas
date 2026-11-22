@@ -41,6 +41,15 @@ const ALLOWED_AUDIT_CATEGORIES = new Set([
   "entity_mapping_log",
 ]);
 
+const ALLOWED_CSV_FILES = new Set([
+  "startups.csv",
+  "products.csv",
+  "research_papers.csv",
+  "jobs.csv",
+  "news.csv",
+  "entity_mapping_log.csv",
+]);
+
 async function startServer(): Promise<void> {
   const atlas = new AtlasBackendService(ATLAS_DIR);
   const app = express();
@@ -115,12 +124,14 @@ async function startServer(): Promise<void> {
       return;
     }
     const rawLimit = Number(req.query.limit ?? 500);
-    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(1, Math.floor(rawLimit)), 2000) : 500;
+    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(1, Math.floor(rawLimit)), 10000) : 500;
+    const rawOffset = Number(req.query.offset ?? 0);
+    const offset = Number.isFinite(rawOffset) ? Math.max(0, Math.floor(rawOffset)) : 0;
     const rawWindow = String(req.query.window ?? "all").trim().toLowerCase();
     const windowMode: "all" | "24h" = rawWindow === "24h" ? "24h" : "all";
 
     try {
-      res.json(atlas.getDataset(category, limit, windowMode));
+      res.json(atlas.getDataset(category, limit, windowMode, offset));
     } catch (err) {
       res.status(500).json({
         error: `Failed to query dataset '${category}'.`,
@@ -286,35 +297,43 @@ async function startServer(): Promise<void> {
     return {
       oauthAccessToken,
       spreadsheetId: rawSheetId || null,
+      createNew: req.body?.createNew === true,
     };
   };
 
   app.post("/api/atlas/export/sheets", async (req, res) => {
     try {
       const result = await atlas.exportGoogleSheets(extractSheetsOpts(req));
-      res.json(result);
+      res.status(result.authRequired ? 401 : 200).json(result);
     } catch (err) {
-      res.status(500).json({ success: false, error: err instanceof Error ? err.message : String(err) });
+      res.status(500).json({
+        success: false,
+        error: redactSecrets(err instanceof Error ? err.message : String(err)),
+      });
     }
   });
 
   app.post("/api/atlas/sync/sheets", async (req, res) => {
     try {
       const result = await atlas.syncGoogleSheets(extractSheetsOpts(req));
-      res.json(result);
+      res.status(result.authRequired ? 401 : 200).json(result);
     } catch (err) {
-      res.status(500).json({ success: false, error: err instanceof Error ? err.message : String(err) });
+      res.status(500).json({
+        success: false,
+        error: redactSecrets(err instanceof Error ? err.message : String(err)),
+      });
     }
   });
 
   app.post("/api/atlas/sheets/verify", async (req, res) => {
     try {
       const result = await atlas.verifyGoogleSheetsConnection(extractSheetsOpts(req));
-      res.json(result);
+      res.status(result.authRequired ? 401 : 200).json(result);
     } catch (err) {
       res.status(500).json({
         status: "Sync Failed",
-        lastError: err instanceof Error ? err.message : String(err),
+        authRequired: false,
+        lastError: redactSecrets(err instanceof Error ? err.message : String(err)),
       });
     }
   });
@@ -328,12 +347,18 @@ async function startServer(): Promise<void> {
   });
 
   app.get("/api/atlas/download/csv/:filename", (req, res) => {
-    const safeName = path.basename(req.params.filename);
-    if (!safeName.endsWith(".csv")) {
+    const rawName = String(req.params.filename ?? "");
+    const safeName = path.basename(rawName);
+    if (safeName !== rawName || !ALLOWED_CSV_FILES.has(safeName)) {
       res.status(400).json({ error: "Invalid CSV filename." });
       return;
     }
-    const target = path.resolve(ATLAS_DIR, "data/exports", safeName);
+    const exportsDir = path.resolve(ATLAS_DIR, "data/exports");
+    const target = path.resolve(exportsDir, safeName);
+    if (!target.startsWith(exportsDir + path.sep)) {
+      res.status(400).json({ error: "Invalid CSV export path." });
+      return;
+    }
     if (!fs.existsSync(target)) {
       res.status(404).json({ error: `CSV export '${safeName}' has not been generated yet.` });
       return;

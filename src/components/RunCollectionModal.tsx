@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { AlertTriangle, Play, X } from "lucide-react";
 import type { AtlasStatusResponse } from "../types/atlas";
 
@@ -36,6 +36,15 @@ export function RunCollectionModal({
   ]);
   const [limit, setLimit] = useState<number>(20);
   const [page, setPage] = useState<number>(1);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [open, onClose]);
 
   if (!open) return null;
 
@@ -77,8 +86,14 @@ export function RunCollectionModal({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-xs">
-      <div className="w-full max-w-md rounded-xl bg-[#0E172B] border border-slate-800 p-6 space-y-5">
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-xs"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-md rounded-xl bg-[#0E172B] border border-slate-800 p-6 space-y-5"
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="flex items-center justify-between">
           <h2 className="font-display text-lg font-semibold text-slate-100">
             Run Live Data Collection

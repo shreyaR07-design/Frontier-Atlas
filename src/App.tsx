@@ -16,6 +16,8 @@ import {
   googleSignIn,
   googleSignOut,
   initGoogleAuth,
+  isGoogleTokenValid,
+  updateGoogleTokenExpiry,
 } from "./lib/googleWorkspaceAuth";
 import type {
   AnyDatasetRow,
@@ -45,6 +47,20 @@ const DATASET_CSV_NAMES: Record<DatasetCategory, string> = {
   entity_mapping_log: "entity_mapping_log.csv",
 };
 
+async function readJsonSafe<T extends object>(resp: Response): Promise<T & { error?: string }> {
+  const raw = await resp.text();
+  if (!raw.trim()) {
+    return {} as T & { error?: string };
+  }
+  try {
+    return JSON.parse(raw) as T & { error?: string };
+  } catch {
+    return {
+      error: `Unexpected non-JSON response (HTTP ${resp.status}): ${raw.slice(0, 140)}`,
+    } as T & { error?: string };
+  }
+}
+
 export default function App() {
   const [activeSection, setActiveSection] = useState<SectionId>("overview");
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
@@ -54,6 +70,7 @@ export default function App() {
   const [statusError, setStatusError] = useState<string | null>(null);
 
   const [datasetRows, setDatasetRows] = useState<AnyDatasetRow[]>([]);
+  const [datasetTotalCount, setDatasetTotalCount] = useState<number>(0);
   const [datasetWindow, setDatasetWindow] = useState<"all" | "24h">("all");
   const [datasetLoading, setDatasetLoading] = useState(false);
   const [datasetError, setDatasetError] = useState<string | null>(null);
@@ -72,19 +89,23 @@ export default function App() {
 
   const [runModalOpen, setRunModalOpen] = useState(false);
   const [auditing, setAuditing] = useState(false);
+  const [csvExporting, setCsvExporting] = useState(false);
   const [schedulerUpdating, setSchedulerUpdating] = useState(false);
   const [sheetsExporting, setSheetsExporting] = useState(false);
   const [sheetsSyncing, setSheetsSyncing] = useState(false);
   const [sheetsConfirmMode, setSheetsConfirmMode] = useState<"full" | "incremental" | null>(null);
   const [targetSpreadsheetId, setTargetSpreadsheetId] = useState("");
+  const hasInitializedSheetIdRef = useRef(false);
   const [googleSigningIn, setGoogleSigningIn] = useState(false);
   const [testingIntegrations, setTestingIntegrations] = useState(false);
+  const [testingGoogleConnection, setTestingGoogleConnection] = useState(false);
   const [googleUserEmail, setGoogleUserEmail] = useState<string | null>(null);
   const [googleHasToken, setGoogleHasToken] = useState(false);
   const [sheetsFeedback, setSheetsFeedback] = useState<{
     success: boolean;
     message: string;
     url?: string | null;
+    needsReauth?: boolean;
   } | null>(null);
 
   const loadStatus = useCallback(async () => {
@@ -92,7 +113,7 @@ export default function App() {
     setStatusError(null);
     try {
       const resp = await fetch("/api/atlas/status");
-      const data = await resp.json();
+      const data = await readJsonSafe<AtlasStatusResponse & { error?: string }>(resp);
       if (!resp.ok) {
         throw new Error(data.error || `HTTP ${resp.status}`);
       }
@@ -126,18 +147,24 @@ export default function App() {
     setDatasetError(null);
     try {
       const supportsWin = category === "jobs" || category === "news" || category === "research_papers";
-      const query = supportsWin ? `?limit=1500&window=${win}` : `?limit=1500`;
+      const fetchLimit = 10000;
+      const query = supportsWin ? `?limit=${fetchLimit}&window=${win}` : `?limit=${fetchLimit}`;
       const resp = await fetch(`/api/atlas/datasets/${category}${query}`);
-      const data = await resp.json();
+      const data = await readJsonSafe<{ rows?: AnyDatasetRow[]; totalCount?: number; error?: string }>(resp);
       if (seq !== datasetRequestSeqRef.current) return;
       if (!resp.ok) {
         throw new Error(data.error || `HTTP ${resp.status}`);
       }
-      setDatasetRows(Array.isArray(data.rows) ? data.rows : []);
+      const nextRows = Array.isArray(data.rows) ? data.rows : [];
+      setDatasetRows(nextRows);
+      setDatasetTotalCount(
+        typeof data.totalCount === "number" ? data.totalCount : nextRows.length
+      );
     } catch (err) {
       if (seq !== datasetRequestSeqRef.current) return;
       setDatasetError(err instanceof Error ? err.message : String(err));
       setDatasetRows([]);
+      setDatasetTotalCount(0);
     } finally {
       if (seq === datasetRequestSeqRef.current) {
         setDatasetLoading(false);
@@ -149,10 +176,12 @@ export default function App() {
     if (nextSection !== activeSection) {
       datasetRequestSeqRef.current += 1;
       setDatasetRows([]);
+      setDatasetTotalCount(0);
       setDatasetError(null);
       setDatasetWindow("all");
       setDatasetLoading(nextSection !== "overview");
       setActiveSection(nextSection);
+      window.scrollTo({ top: 0, behavior: "smooth" });
     }
   }, [activeSection]);
 
@@ -176,10 +205,11 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (status?.sheetsStatus?.spreadsheetId && !targetSpreadsheetId) {
+    if (!hasInitializedSheetIdRef.current && status?.sheetsStatus?.spreadsheetId) {
+      hasInitializedSheetIdRef.current = true;
       setTargetSpreadsheetId(status.sheetsStatus.spreadsheetId);
     }
-  }, [status?.sheetsStatus?.spreadsheetId, targetSpreadsheetId]);
+  }, [status?.sheetsStatus?.spreadsheetId]);
 
   useEffect(() => {
     if (activeSection !== "overview") {
@@ -219,7 +249,7 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ categories, limit, page }),
       });
-      const data = await resp.json();
+      const data = await readJsonSafe<{ run?: RunJobState; error?: string }>(resp);
       if (!resp.ok) {
         setRunState((prev) => ({
           ...prev,
@@ -244,7 +274,7 @@ export default function App() {
     setSheetsFeedback(null);
     try {
       const resp = await fetch("/api/atlas/refresh-24h", { method: "POST" });
-      const data = await resp.json();
+      const data = await readJsonSafe<{ run?: RunJobState; error?: string }>(resp);
       if (!resp.ok) {
         setSheetsFeedback({
           success: false,
@@ -272,7 +302,10 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(opts),
       });
-      const data = await resp.json();
+      const data = await readJsonSafe<{
+        scheduler?: { enabled?: boolean; utc_time?: string };
+        error?: string;
+      }>(resp);
       if (!resp.ok) {
         throw new Error(data.error || `HTTP ${resp.status}`);
       }
@@ -300,7 +333,12 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({}),
       });
-      const data = await resp.json();
+      const data = await readJsonSafe<{
+        verificationCounts?: { totals?: Record<string, number> };
+        auditEntriesLogged?: number;
+        duplicatesRemoved?: number;
+        error?: string;
+      }>(resp);
       if (!resp.ok) {
         throw new Error(data.error || `HTTP ${resp.status}`);
       }
@@ -333,6 +371,9 @@ export default function App() {
     setTestingIntegrations(true);
     try {
       const token = overrideToken !== undefined ? overrideToken : getGoogleAccessToken();
+      if (overrideToken === undefined && !token) {
+        setGoogleHasToken(false);
+      }
       const headers: Record<string, string> = { "Content-Type": "application/json" };
       if (token) {
         headers.Authorization = `Bearer ${token}`;
@@ -352,22 +393,93 @@ export default function App() {
     }
   }, [loadStatus, targetSpreadsheetId]);
 
-  const handleGoogleSignIn = async () => {
+  const handleTestGoogleConnection = useCallback(
+    async (overrideToken?: string | null): Promise<boolean> => {
+      setTestingGoogleConnection(true);
+      setSheetsFeedback(null);
+      try {
+        const token = overrideToken !== undefined ? overrideToken : getGoogleAccessToken();
+        if (overrideToken === undefined && !token) {
+          setGoogleHasToken(false);
+        }
+        const headers: Record<string, string> = { "Content-Type": "application/json" };
+        if (token) {
+          headers.Authorization = `Bearer ${token}`;
+        }
+        const resp = await fetch("/api/atlas/sheets/verify", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            spreadsheetId: targetSpreadsheetId.trim() || undefined,
+            createNew: targetSpreadsheetId.trim() === "",
+          }),
+        });
+        const data = await readJsonSafe<Record<string, unknown>>(resp);
+        await loadStatus();
+
+        if (data.status === "Connected") {
+          if (typeof data.tokenExpiresInSeconds === "number") {
+            updateGoogleTokenExpiry(data.tokenExpiresInSeconds);
+          }
+          if (data.verifiedAccountEmail) {
+            setGoogleUserEmail(String(data.verifiedAccountEmail));
+          }
+          setSheetsFeedback({
+            success: true,
+            message: data.spreadsheetId
+              ? `Google Workspace connection verified (${String(data.verifiedAccountEmail || googleUserEmail || "OAuth")} — Drive & Spreadsheet ${String(data.spreadsheetId)} accessible).`
+              : `Google Workspace connection verified (${String(data.verifiedAccountEmail || googleUserEmail || "OAuth")} — Drive & Sheets permissions confirmed).`,
+            url: null,
+          });
+          return true;
+        }
+
+        const needsReauth = Boolean(data.authRequired) || resp.status === 401;
+        if (needsReauth) {
+          clearGoogleAccessToken();
+          setGoogleHasToken(false);
+        }
+        setSheetsFeedback({
+          success: false,
+          message:
+            String(
+              data.lastError ||
+                data.error ||
+                "Google Sheets is not connected. Click 'Sign in with Google' to authorize Drive & Sheets."
+            ),
+          url: null,
+          needsReauth,
+        });
+        return false;
+      } catch (err) {
+        setSheetsFeedback({
+          success: false,
+          message: err instanceof Error ? err.message : String(err),
+          url: null,
+        });
+        return false;
+      } finally {
+        setTestingGoogleConnection(false);
+      }
+    },
+    [googleUserEmail, loadStatus, targetSpreadsheetId]
+  );
+
+  const handleGoogleSignIn = async (selectAccount = false) => {
     setGoogleSigningIn(true);
     setSheetsFeedback(null);
     try {
-      const { user, accessToken } = await googleSignIn();
+      const { user, accessToken } = await googleSignIn({ selectAccount });
       setGoogleUserEmail(user.email || user.displayName || "Google Account");
       setGoogleHasToken(true);
-      await handleTestIntegrations(accessToken);
-      setSheetsFeedback({
-        success: true,
-        message: `Verified Google Workspace OAuth access for ${user.email || "your account"}. You can now export or sync to Google Sheets.`,
-      });
+      await handleTestGoogleConnection(accessToken);
     } catch (err) {
+      setGoogleHasToken(isGoogleTokenValid());
       setSheetsFeedback({
         success: false,
         message: err instanceof Error ? err.message : String(err),
+        url: null,
+        needsReauth: true,
       });
     } finally {
       setGoogleSigningIn(false);
@@ -382,6 +494,7 @@ export default function App() {
     setSheetsFeedback({
       success: true,
       message: "Signed out of Google Workspace session.",
+      url: null,
     });
   };
 
@@ -394,6 +507,17 @@ export default function App() {
 
     try {
       const token = getGoogleAccessToken();
+      if (!token && !status?.credentials.googleSheetsConfigured) {
+        setGoogleHasToken(false);
+        setSheetsFeedback({
+          success: false,
+          message:
+            "Google OAuth session expired or missing. Click 'Sign in with Google' to authorize before exporting.",
+          url: null,
+          needsReauth: true,
+        });
+        return;
+      }
       const headers: Record<string, string> = { "Content-Type": "application/json" };
       if (token) {
         headers.Authorization = `Bearer ${token}`;
@@ -403,23 +527,32 @@ export default function App() {
         headers,
         body: JSON.stringify({
           spreadsheetId: targetSpreadsheetId.trim() || undefined,
+          createNew: targetSpreadsheetId.trim() === "",
         }),
       });
-      const data = await resp.json();
+      const data = await readJsonSafe<Record<string, unknown>>(resp);
       await loadStatus();
-      if (data.success) {
+
+      const requiredTabs = [
+        "Startups",
+        "Products",
+        "Research Papers",
+        "Jobs",
+        "News",
+        "Entity Mapping Log",
+      ];
+      const tabStatuses = (data.tabStatuses ?? {}) as Record<string, { status?: string }>;
+      const allTabsVerified = requiredTabs.every(
+        (tab) => tabStatuses?.[tab]?.status === "success"
+      );
+
+      if (data.success && allTabsVerified && typeof data.spreadsheetUrl === "string" && data.spreadsheetUrl) {
         if (data.spreadsheetId) {
+          hasInitializedSheetIdRef.current = true;
           setTargetSpreadsheetId(String(data.spreadsheetId));
         }
         const verifiedMap = (data.verifiedTabRowCounts || data.tabRowCounts || {}) as Record<string, number>;
-        const perTabText = [
-          "Startups",
-          "Products",
-          "Research Papers",
-          "Jobs",
-          "News",
-          "Entity Mapping Log",
-        ]
+        const perTabText = requiredTabs
           .map((t) => `${t}: ${Number(verifiedMap[t] ?? 0).toLocaleString()}`)
           .join(" · ");
         if (isFull) {
@@ -429,35 +562,44 @@ export default function App() {
           );
           setSheetsFeedback({
             success: true,
-            message: `Google Sheets full export verified across all 6 tabs (${verifiedTotal.toLocaleString()} total rows — ${perTabText}).`,
+            message: `Export Successful — verified across all 6 worksheets (${verifiedTotal.toLocaleString()} total rows — ${perTabText}).`,
             url: data.spreadsheetUrl,
           });
         } else {
           setSheetsFeedback({
             success: true,
-            message: `Google Sheets incremental sync verified across all 6 tabs (+${Number(data.rowsAdded ?? 0).toLocaleString()} added, ${Number(data.rowsUpdated ?? 0).toLocaleString()} updated, ${Number(data.rowsUnchanged ?? 0).toLocaleString()} unchanged — ${perTabText}).`,
+            message: `Google Sheets incremental sync verified across all 6 worksheets (+${Number(data.rowsAdded ?? 0).toLocaleString()} added, ${Number(data.rowsUpdated ?? 0).toLocaleString()} updated, ${Number(data.rowsUnchanged ?? 0).toLocaleString()} unchanged — ${perTabText}).`,
             url: data.spreadsheetUrl,
           });
         }
       } else {
         if (data.spreadsheetId) {
+          hasInitializedSheetIdRef.current = true;
           setTargetSpreadsheetId(String(data.spreadsheetId));
         }
-        const errMsg = String(data.error || "Google Sheets operation failed.");
-        if (errMsg.includes("401")) {
+        const errMsg = String(
+          data.error ||
+            (!allTabsVerified
+              ? "Export failed: not all 6 required worksheets could be verified."
+              : "Google Sheets operation failed.")
+        );
+        const needsReauth = Boolean(data.authRequired) || resp.status === 401 || errMsg.includes("401");
+        if (needsReauth) {
           clearGoogleAccessToken();
           setGoogleHasToken(false);
         }
         setSheetsFeedback({
           success: false,
           message: errMsg,
-          url: data.spreadsheetUrl || null,
+          url: null,
+          needsReauth,
         });
       }
     } catch (err) {
       setSheetsFeedback({
         success: false,
         message: err instanceof Error ? err.message : String(err),
+        url: null,
       });
     } finally {
       if (isFull) setSheetsExporting(false);
@@ -470,12 +612,16 @@ export default function App() {
     const token = getGoogleAccessToken();
     const serviceAccountReady = Boolean(status?.credentials.googleSheetsConfigured);
     if (!token && !serviceAccountReady) {
+      setGoogleHasToken(false);
       setGoogleSigningIn(true);
       try {
-        const { user } = await googleSignIn();
+        const { user, accessToken } = await googleSignIn();
         setGoogleUserEmail(user.email || user.displayName || "Google Account");
         setGoogleHasToken(true);
-        setSheetsConfirmMode(mode);
+        const verified = await handleTestGoogleConnection(accessToken);
+        if (verified) {
+          setSheetsConfirmMode(mode);
+        }
       } catch (err) {
         setSheetsFeedback({
           success: false,
@@ -483,6 +629,8 @@ export default function App() {
             err instanceof Error
               ? `Google sign-in is required to create or write spreadsheets: ${err.message}`
               : "Google sign-in is required to create or write spreadsheets.",
+          url: null,
+          needsReauth: true,
         });
       } finally {
         setGoogleSigningIn(false);
@@ -501,10 +649,11 @@ export default function App() {
   };
 
   const handleExportCsv = async () => {
+    setCsvExporting(true);
     setSheetsFeedback(null);
     try {
       const resp = await fetch("/api/atlas/export/csv", { method: "POST" });
-      const data = await resp.json();
+      const data = await readJsonSafe<{ rowCounts?: Record<string, number>; error?: string }>(resp);
       if (!resp.ok) {
         throw new Error(data.error || `HTTP ${resp.status}`);
       }
@@ -514,13 +663,15 @@ export default function App() {
         message: `CSV exports refreshed (${Object.values(data.rowCounts || {}).reduce(
           (a: number, b: unknown) => a + Number(b || 0),
           0
-        )} total rows written to frontier-atlas/data/exports).`,
+        ).toLocaleString()} total rows written to frontier-atlas/data/exports).`,
       });
     } catch (err) {
       setSheetsFeedback({
         success: false,
         message: err instanceof Error ? err.message : String(err),
       });
+    } finally {
+      setCsvExporting(false);
     }
   };
 
@@ -598,6 +749,7 @@ export default function App() {
               failures={failures}
               runState={runState}
               auditing={auditing}
+              csvExporting={csvExporting}
               schedulerUpdating={schedulerUpdating}
               sheetsExporting={sheetsExporting}
               sheetsSyncing={sheetsSyncing}
@@ -606,12 +758,29 @@ export default function App() {
               googleHasToken={googleHasToken}
               googleSigningIn={googleSigningIn}
               targetSpreadsheetId={targetSpreadsheetId}
-              onTargetSpreadsheetIdChange={setTargetSpreadsheetId}
-              onGoogleSignIn={handleGoogleSignIn}
+              onTargetSpreadsheetIdChange={(val) => {
+                hasInitializedSheetIdRef.current = true;
+                setTargetSpreadsheetId(val);
+              }}
+              onClearTargetSpreadsheetId={() => {
+                hasInitializedSheetIdRef.current = true;
+                setTargetSpreadsheetId("");
+                setSheetsFeedback(null);
+              }}
+              onGoogleSignIn={() => {
+                void handleGoogleSignIn(false);
+              }}
+              onGoogleSwitchAccount={() => {
+                void handleGoogleSignIn(true);
+              }}
               onGoogleSignOut={handleGoogleSignOut}
               testingIntegrations={testingIntegrations}
+              testingGoogleConnection={testingGoogleConnection}
               onTestIntegrations={() => {
                 void handleTestIntegrations();
+              }}
+              onTestGoogleConnection={() => {
+                void handleTestGoogleConnection();
               }}
               onSelectSection={handleSelectSection}
               onOpenRunModal={() => setRunModalOpen(true)}
@@ -628,6 +797,7 @@ export default function App() {
               key={activeSection}
               category={activeSection}
               rows={datasetRows}
+              totalCount={datasetTotalCount}
               categoryFailures={failures.filter((f) => f.category === activeSection)}
               loading={datasetLoading}
               error={datasetError}

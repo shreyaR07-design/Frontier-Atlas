@@ -35,6 +35,7 @@ export interface CategoryQualityStats {
   rejected: number;
   duplicates: number;
   persisted_total: number;
+  unique_qualified_total?: number;
   target_minimum: number | null;
   target_met: boolean | null;
   verification_breakdown?: Record<string, number>;
@@ -103,6 +104,7 @@ export interface PipelineRunRow {
   completed_at: string | null;
   status: "running" | "completed" | "partial" | "failed";
   historical_counts: Record<string, number>;
+  new_records_counts?: Record<string, number>;
   fresh_24h_counts: Record<string, number>;
   errors: Array<Record<string, unknown>>;
   source_outcomes: SourceOutcomeItem[];
@@ -188,7 +190,11 @@ export interface TabExportStatus {
 export interface SheetsStatusPayload {
   status: "Connected" | "Not Connected" | "Sync Failed";
   configured: boolean;
-  credentialSource: "path" | "json_env" | null;
+  authRequired?: boolean;
+  credentialSource: "oauth" | "path" | "json_env" | null;
+  verifiedAccountEmail?: string | null;
+  grantedScopes?: string[];
+  tokenExpiresInSeconds?: number | null;
   spreadsheetId: string | null;
   spreadsheetUrl: string | null;
   lastSyncAt: string | null;
@@ -224,6 +230,12 @@ export interface IntegrationHealthSummary {
 
 export interface AtlasStatusResponse {
   counts: Record<DatasetCategory, number>;
+  uniqueQualifiedCounts?: {
+    startups: number;
+    products: number;
+    research_papers: number;
+  };
+  latestRunNewCounts?: Record<string, number>;
   freshCounts24h?: {
     jobs: number;
     news: number;
@@ -242,6 +254,11 @@ export interface AtlasStatusResponse {
     startups: number;
     products: number;
     research_papers: number;
+  };
+  targetChecks?: {
+    startups: { uniqueCount: number; target: number; met: boolean };
+    products: { uniqueCount: number; target: number; met: boolean };
+    research_papers: { uniqueCount: number; target: number; met: boolean };
   };
   freshnessWindowHours: number;
   credentials: {

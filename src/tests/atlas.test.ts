@@ -27,10 +27,12 @@ import { EXPORT_SPECS, GoogleSheetsService } from "../server/googleSheets.ts";
 import { PoliteHttpClient } from "../server/httpClient.ts";
 import {
   FatalProviderError,
+  GeminiLLMProvider,
   LLMRouter,
   OpenAICompatibleLLMProvider,
   PayloadTooLargeError,
   redactSecrets,
+  TransientProviderError,
   type LLMProvider,
 } from "../server/llmRouter.ts";
 import { GOOGLE_WORKSPACE_SCOPES } from "../lib/googleWorkspaceAuth.ts";
@@ -1741,3 +1743,1128 @@ test("Priority 3-5: Empty vs Failed source distinction, partial run status, hist
     fs.rmSync(tmpAtlasDir, { recursive: true, force: true });
   }
 });
+
+test("Google Workspace OAuth 401/scope validation, honest Not Connected status, batched 6-tab export, and duplicate-free re-export", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "atlas-oauth-sheets-test-"));
+  const dbPath = path.join(tmpDir, "oauth_sheets.db");
+  const nowIso = "2026-11-22T06:00:00.000Z";
+
+  const sheetValues = new Map<string, string[][]>();
+  const sheetProps = EXPORT_SPECS.map((s, idx) => ({
+    properties: {
+      sheetId: idx + 1,
+      title: s.tabName,
+      gridProperties: { rowCount: 1000, columnCount: s.columns.length },
+    },
+  }));
+
+  let batchUpdateCallCount = 0;
+  let forceJobsVerifyMismatch = false;
+  let lastAuthSeen = "";
+
+  const mockServer = await withHttpServer((req, res, body) => {
+    res.setHeader("Content-Type", "application/json");
+    const urlPath = (req.url ?? "").split("?")[0];
+
+    if (urlPath === "/tokeninfo" && req.method === "POST") {
+      const params = new URLSearchParams(body);
+      const token = params.get("access_token") ?? "";
+      if (token === "ya29.valid_full_scopes_token_0001") {
+        res.writeHead(200);
+        res.end(
+          JSON.stringify({
+            email: "tester@example.com",
+            expires_in: "3550",
+            scope: "https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/spreadsheets",
+          })
+        );
+        return;
+      }
+      if (token === "ya29.missing_sheets_scope_token_0002") {
+        res.writeHead(200);
+        res.end(
+          JSON.stringify({
+            email: "tester@example.com",
+            expires_in: "3550",
+            scope: "https://www.googleapis.com/auth/drive.file",
+          })
+        );
+        return;
+      }
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: "invalid_token", error_description: "Token expired or revoked" }));
+      return;
+    }
+
+    lastAuthSeen = String(req.headers.authorization || "");
+    if (lastAuthSeen !== "Bearer ya29.valid_full_scopes_token_0001") {
+      res.writeHead(401);
+      res.end(JSON.stringify({ error: { message: "Request had invalid authentication credentials." } }));
+      return;
+    }
+
+    if (urlPath === "/drive/files" && req.method === "GET") {
+      res.writeHead(200);
+      res.end(JSON.stringify({ files: [] }));
+      return;
+    }
+
+    if (urlPath === "/v4/spreadsheets" && req.method === "POST") {
+      res.writeHead(200);
+      res.end(
+        JSON.stringify({
+          spreadsheetId: "oauth-sheet-001",
+          spreadsheetUrl: "https://docs.google.com/spreadsheets/d/oauth-sheet-001",
+          sheets: sheetProps,
+        })
+      );
+      return;
+    }
+
+    if (urlPath === "/v4/spreadsheets/oauth-sheet-001" && req.method === "GET") {
+      res.writeHead(200);
+      res.end(
+        JSON.stringify({
+          spreadsheetId: "oauth-sheet-001",
+          spreadsheetUrl: "https://docs.google.com/spreadsheets/d/oauth-sheet-001",
+          sheets: sheetProps,
+        })
+      );
+      return;
+    }
+
+    if (urlPath === "/v4/spreadsheets/oauth-sheet-001:batchUpdate" && req.method === "POST") {
+      res.writeHead(200);
+      res.end(JSON.stringify({ replies: [] }));
+      return;
+    }
+
+    if (urlPath === "/v4/spreadsheets/oauth-sheet-001/values:batchClear" && req.method === "POST") {
+      sheetValues.clear();
+      res.writeHead(200);
+      res.end(JSON.stringify({ clearedRanges: [] }));
+      return;
+    }
+
+    if (urlPath === "/v4/spreadsheets/oauth-sheet-001/values:batchUpdate" && req.method === "POST") {
+      batchUpdateCallCount += 1;
+      const payload = JSON.parse(body) as { data?: Array<{ range: string; values: unknown[][] }> };
+      for (const entry of payload.data ?? []) {
+        const tabMatch = entry.range.match(/^'([^']+)'!A(\d+)/);
+        if (!tabMatch) continue;
+        const tabName = tabMatch[1];
+        const startRow = Number(tabMatch[2]);
+        const existing = sheetValues.get(tabName) ?? [];
+        for (let i = 0; i < entry.values.length; i++) {
+          existing[startRow - 1 + i] = entry.values[i].map((v) => String(v ?? ""));
+        }
+        sheetValues.set(tabName, existing);
+      }
+      res.writeHead(200);
+      res.end(JSON.stringify({ responses: [] }));
+      return;
+    }
+
+    const readMatch = urlPath.match(/^\/v4\/spreadsheets\/oauth-sheet-001\/values\/([^/]+)$/);
+    if (readMatch && req.method === "GET") {
+      const rangeDecoded = decodeURIComponent(readMatch[1]);
+      const tabMatch = rangeDecoded.match(/^'([^']+)'!/);
+      const tabName = tabMatch?.[1] ?? "";
+      const rows = sheetValues.get(tabName) ?? [];
+      if (forceJobsVerifyMismatch && tabName === "Jobs") {
+        res.writeHead(200);
+        res.end(JSON.stringify({ values: rows.slice(0, 1) }));
+        return;
+      }
+      if (rangeDecoded.endsWith("!A:A")) {
+        res.writeHead(200);
+        res.end(JSON.stringify({ values: rows.map((r) => [r[0] ?? ""]) }));
+        return;
+      }
+      res.writeHead(200);
+      res.end(JSON.stringify({ values: rows }));
+      return;
+    }
+
+    res.writeHead(404);
+    res.end(JSON.stringify({ error: { message: "Not found" } }));
+  });
+
+  try {
+    const db = new AtlasDatabase(dbPath);
+    db.initializeSchema();
+
+    // Seed 300 startups to exercise multi-batch pagination (batchSize = 250) + 1 record in each remaining tab
+    const bulkStartups = Array.from({ length: 300 }, (_, i) => ({
+      startup_id: `stp_${String(i).padStart(3, "0")}`,
+      name: `Startup ${i}`,
+      description: `AI startup ${i}`,
+      website: `https://startup${i}.example`,
+      official_website: `https://startup${i}.example`,
+      industry: "AI",
+      location: "San Francisco, CA",
+      founding_date: "2025-01-01",
+      source_name: "yc_oss",
+      source_url: `https://yc.example/startup-${i}`,
+      source_title: `Startup ${i}`,
+      collected_at: nowIso,
+      last_checked_at: nowIso,
+      supported_fields: ["name"],
+      verification_status: "Verified" as const,
+      rejection_reason: null,
+      canonical_entity_id: `ent_${i}`,
+      source_metadata: {},
+    }));
+    db.upsertStartups(bulkStartups);
+    db.upsertProducts([
+      {
+        product_id: "prd_oauth_1",
+        name: "Atlas Studio",
+        description: "Vector product",
+        website: "https://atlas.example/studio",
+        official_website: "https://atlas.example/studio",
+        category: "AI Tools",
+        company_name: "Startup 0",
+        source_name: "github",
+        source_url: "https://github.com/atlas/studio",
+        source_title: "Atlas Studio",
+        collected_at: nowIso,
+        last_checked_at: nowIso,
+        supported_fields: ["name"],
+        verification_status: "Verified",
+        rejection_reason: null,
+        canonical_entity_id: "ent_0",
+        source_metadata: {},
+      },
+    ]);
+    db.upsertResearchPapers([
+      {
+        paper_id: "pap_oauth_1",
+        title: "Reliable OAuth Pipelines",
+        abstract: "Paper abstract",
+        authors: ["Grace Hopper"],
+        publication_date: "2026-11-22",
+        doi: null,
+        arxiv_id: "2611.12345",
+        github_repository: null,
+        github_stars: null,
+        official_website: null,
+        source_name: "arxiv",
+        source_url: "https://arxiv.org/abs/2611.12345",
+        source_title: "Reliable OAuth Pipelines",
+        collected_at: nowIso,
+        last_checked_at: nowIso,
+        supported_fields: ["title"],
+        verification_status: "Verified",
+        rejection_reason: null,
+        source_metadata: {},
+      },
+    ]);
+    db.upsertJobs([
+      {
+        job_id: "job_oauth_1",
+        title: "Senior AI Platform Engineer",
+        company: "Startup 0",
+        location: "Remote",
+        employment_type: "Full-Time",
+        description: "Build pipelines",
+        posted_at: nowIso,
+        application_url: "https://startup0.example/jobs/1",
+        official_website: null,
+        source_name: "greenhouse",
+        source_url: "https://startup0.example/jobs/1",
+        source_title: "Senior AI Platform Engineer",
+        collected_at: nowIso,
+        last_checked_at: nowIso,
+        supported_fields: ["title"],
+        verification_status: "Verified",
+        rejection_reason: null,
+        canonical_company_id: "ent_0",
+        source_metadata: {},
+      },
+    ]);
+    db.upsertNews([
+      {
+        news_id: "nws_oauth_1",
+        headline: "Frontier AI Open Release",
+        summary: "Summary",
+        publisher: "AI Wire",
+        published_at: nowIso,
+        article_url: "https://wire.example/release",
+        official_website: null,
+        category: "AI",
+        source_name: "ai_wire",
+        source_url: "https://wire.example/rss",
+        source_title: "Frontier AI Open Release",
+        collected_at: nowIso,
+        last_checked_at: nowIso,
+        supported_fields: ["headline"],
+        verification_status: "Verified",
+        rejection_reason: null,
+        source_metadata: {},
+      },
+    ]);
+    db.upsertEntityMappingLogs([
+      {
+        mapping_id: "map_oauth_1",
+        raw_name: "Startup 0",
+        normalized_name: "startup 0",
+        canonical_name: "Startup 0",
+        canonical_id: "ent_0",
+        source_url: "https://yc.example/startup-0",
+        match_method: "exact",
+        confidence: 1.0,
+        decision: "exact_match",
+        timestamp: nowIso,
+        entity_type: "startup",
+        match_reason: "Exact domain match",
+      },
+    ]);
+
+    const svc = new GoogleSheetsService(
+      {
+        atlasDir: tmpDir,
+        rootDir: tmpDir,
+        credentialsPath: null,
+        credentialsJson: null,
+        spreadsheetId: null,
+        spreadsheetName: "FrontierAtlas OAuth Test",
+        apiBaseUrl: `${mockServer.baseUrl}/v4`,
+        driveApiBaseUrl: `${mockServer.baseUrl}/drive`,
+        tokenInfoUrl: `${mockServer.baseUrl}/tokeninfo`,
+      },
+      db
+    );
+
+    // 1. Missing token => Not Connected + authRequired
+    const missingVerify = await svc.verifyConnection();
+    assert.equal(missingVerify.status, "Not Connected");
+    assert.equal(missingVerify.authRequired, true);
+
+    // 2. Expired/invalid token => Sync Failed + authRequired=true + secrets redacted
+    const expiredVerify = await svc.verifyConnection({ oauthAccessToken: "ya29.expired_invalid_0000" });
+    assert.equal(expiredVerify.status, "Sync Failed");
+    assert.equal(expiredVerify.authRequired, true);
+    assert.ok(!String(expiredVerify.lastError).includes("ya29.expired_invalid"));
+
+    // 3. Missing required Sheets scope => Sync Failed with scope error
+    const missingScopeVerify = await svc.verifyConnection({ oauthAccessToken: "ya29.missing_sheets_scope_token_0002" });
+    assert.equal(missingScopeVerify.status, "Sync Failed");
+    assert.ok(String(missingScopeVerify.lastError).includes("missing required permissions"));
+
+    // 4. Valid OAuth token => Connected after live Drive API succeeds
+    const validVerify = await svc.verifyConnection({ oauthAccessToken: "ya29.valid_full_scopes_token_0001" });
+    assert.equal(validVerify.status, "Connected");
+    assert.equal(validVerify.authRequired, false);
+    assert.equal(validVerify.verifiedAccountEmail, "tester@example.com");
+
+    // 5. Partial verification failure => success=false and spreadsheetUrl is null (never shown before full verification)
+    forceJobsVerifyMismatch = true;
+    const partialFail = await svc.exportOrSync("full", { oauthAccessToken: "ya29.valid_full_scopes_token_0001" });
+    assert.equal(partialFail.success, false);
+    assert.equal(partialFail.spreadsheetUrl, null);
+    assert.equal(partialFail.tabStatuses["Jobs"].status, "failed");
+    assert.equal(svc.getStatus().status, "Sync Failed");
+    forceJobsVerifyMismatch = false;
+
+    // 6. Full export with valid OAuth token => creates spreadsheet, batches 300 rows, verifies all 6 tabs
+    const fullExport = await svc.exportOrSync("full", { oauthAccessToken: "ya29.valid_full_scopes_token_0001" });
+    assert.equal(fullExport.success, true, fullExport.error ?? undefined);
+    assert.equal(fullExport.status, "Connected");
+    assert.equal(fullExport.spreadsheetId, "oauth-sheet-001");
+    assert.equal(fullExport.spreadsheetUrl, "https://docs.google.com/spreadsheets/d/oauth-sheet-001");
+    assert.equal(fullExport.verifiedTabRowCounts["Startups"], 300);
+    assert.equal(fullExport.verifiedTabRowCounts["Products"], 1);
+    assert.equal(fullExport.verifiedTabRowCounts["Research Papers"], 1);
+    assert.equal(fullExport.verifiedTabRowCounts["Jobs"], 1);
+    assert.equal(fullExport.verifiedTabRowCounts["News"], 1);
+    assert.equal(fullExport.verifiedTabRowCounts["Entity Mapping Log"], 1);
+    assert.ok(batchUpdateCallCount >= 2, "Batched writes should split >250 rows across ranges cleanly");
+
+    // 7. Re-export & incremental sync preserve existing records with zero duplicates
+    const secondExport = await svc.exportOrSync("full", { oauthAccessToken: "ya29.valid_full_scopes_token_0001" });
+    assert.equal(secondExport.success, true);
+    assert.equal(secondExport.verifiedTabRowCounts["Startups"], 300);
+    const incSync = await svc.exportOrSync("incremental", { oauthAccessToken: "ya29.valid_full_scopes_token_0001" });
+    assert.equal(incSync.success, true);
+    assert.equal(incSync.rowsAdded, 0);
+    assert.equal(incSync.rowsUnchanged, 305);
+
+    // 8. Fresh server restart instance must NOT report stale Connected from SQLite until a real API request succeeds
+    const restartedSvc = new GoogleSheetsService(
+      {
+        atlasDir: tmpDir,
+        rootDir: tmpDir,
+        credentialsPath: null,
+        credentialsJson: null,
+        spreadsheetId: null,
+        spreadsheetName: "FrontierAtlas OAuth Test",
+        apiBaseUrl: `${mockServer.baseUrl}/v4`,
+        driveApiBaseUrl: `${mockServer.baseUrl}/drive`,
+        tokenInfoUrl: `${mockServer.baseUrl}/tokeninfo`,
+      },
+      db
+    );
+    const coldStatus = restartedSvc.getStatus();
+    assert.equal(coldStatus.status, "Not Connected");
+    assert.equal(coldStatus.authRequired, true);
+    assert.equal(coldStatus.spreadsheetId, "oauth-sheet-001");
+
+    // 9. Explicit missing spreadsheetId fails with 404, while stale implicit saved spreadsheetId clears gracefully
+    const explicitMissing = await restartedSvc.verifyConnection({
+      oauthAccessToken: "ya29.valid_full_scopes_token_0001",
+      spreadsheetId: "nonexistent-sheet-999",
+    });
+    assert.equal(explicitMissing.status, "Sync Failed");
+    assert.ok(String(explicitMissing.lastError).includes("404"));
+
+    db.saveSheetsSyncState({
+      status: "Connected",
+      spreadsheetId: "deleted-implicit-sheet-000",
+      spreadsheetUrl: "https://docs.google.com/spreadsheets/d/deleted-implicit-sheet-000",
+      lastSyncMode: "full",
+      lastAttemptAt: nowIso,
+      lastSuccessAt: nowIso,
+      tabRowCounts: {},
+      rowsAdded: 0,
+      rowsUpdated: 0,
+      rowsUnchanged: 0,
+      lastError: null,
+    });
+    const staleClearedVerify = await restartedSvc.verifyConnection({
+      oauthAccessToken: "ya29.valid_full_scopes_token_0001",
+    });
+    assert.equal(staleClearedVerify.status, "Connected");
+    assert.equal(staleClearedVerify.spreadsheetId, null);
+
+    db.close();
+  } finally {
+    await mockServer.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("PoliteHttpClient handles HTTP 413 immediately without wasted retries and retries HTTP 429 cleanly", async () => {
+  let req413Count = 0;
+  let req429Count = 0;
+
+  const server = await withHttpServer((req, res) => {
+    if (req.url === "/too-large") {
+      req413Count += 1;
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Payload too large" }));
+      return;
+    }
+    if (req.url === "/rate-limited") {
+      req429Count += 1;
+      if (req429Count === 1) {
+        res.writeHead(429, { "Retry-After": "0", "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Too many requests" }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  try {
+    const client = new PoliteHttpClient({
+      userAgent: "FrontierAtlasTest/1.0",
+      timeoutMs: 4000,
+      rateLimitPerSecond: 100,
+      respectRobotsTxt: false,
+      defaultMaxAttempts: 3,
+    });
+
+    const res413 = await client.fetch(`${server.baseUrl}/too-large`, { checkRobots: false });
+    assert.equal(res413.ok, false);
+    assert.equal(res413.status, 413);
+    assert.equal(res413.error, "payload_too_large_413");
+    assert.equal(req413Count, 1, "HTTP 413 must not waste retry attempts");
+
+    const res429 = await client.fetch(`${server.baseUrl}/rate-limited`, { checkRobots: false });
+    assert.equal(res429.ok, true);
+    assert.equal(res429.status, 200);
+    assert.equal(req429Count, 2, "HTTP 429 should retry and succeed");
+  } finally {
+    await server.close();
+  }
+});
+
+test("Gemini 503 failover to fallbackModel & LLMRouter skipping unconfigured providers", async () => {
+  const calls: string[] = [];
+  const server = await withHttpServer((req, res) => {
+    res.setHeader("Content-Type", "application/json");
+    if (req.url === "/groq") {
+      calls.push("groq");
+      res.writeHead(503);
+      res.end(JSON.stringify({ error: "503 Service Unavailable - high demand" }));
+      return;
+    }
+    if (req.url === "/deepseek") {
+      calls.push("deepseek");
+      res.writeHead(200);
+      res.end(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  records: [
+                    {
+                      name: "VectorGuard",
+                      description: "VectorGuard builds verified AI guardrails.",
+                      evidence_quote: "VectorGuard builds verified AI guardrails.",
+                    },
+                  ],
+                }),
+              },
+            },
+          ],
+        })
+      );
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  try {
+    // 1. Verify GeminiLLMProvider handles 503 UNAVAILABLE error via fallbackModel when primary throws 503
+    const gemini = new GeminiLLMProvider("fake-test-key", "gemini-4-hydrogen", 5000, "gemini-3.1-flash-lite");
+    const geminiModelsTried: string[] = [];
+    (gemini as unknown as {
+      generateWithModel: (
+        modelName: string,
+        prompt: string,
+        systemInstruction: string,
+        timeoutMs: number
+      ) => Promise<Record<string, unknown>>;
+    }).generateWithModel = async (modelName: string) => {
+      geminiModelsTried.push(modelName);
+      if (modelName === "gemini-4-hydrogen") {
+        throw new TransientProviderError(
+          "gemini service unavailable (503) on gemini-4-hydrogen: 503 UNAVAILABLE high demand"
+        );
+      }
+      return { ok: true, modelUsed: modelName };
+    };
+    const geminiRes = await gemini.generateJson('Return {"ok": true}');
+    assert.deepEqual(geminiModelsTried, ["gemini-4-hydrogen", "gemini-3.1-flash-lite"]);
+    assert.equal(geminiRes.modelUsed, "gemini-3.1-flash-lite");
+
+    // 2. Verify LLMRouter skips unconfigured Llama 3 and falls back Gemini (503) -> Groq (503) -> DeepSeek (200)
+    const failingGemini503: LLMProvider = {
+      providerName: "gemini",
+      model: "gemini-4-hydrogen",
+      isConfigured: () => true,
+      generateJson: async () => {
+        calls.push("gemini");
+        throw new TransientProviderError("gemini service unavailable (503): UNAVAILABLE");
+      },
+    };
+    const groqProvider = new OpenAICompatibleLLMProvider({
+      providerName: "groq",
+      apiKey: "gsk_test_0001",
+      model: "llama-3.3-70b-versatile",
+      endpointUrl: `${server.baseUrl}/groq`,
+    });
+    const unconfiguredLlama3 = new OpenAICompatibleLLMProvider({
+      providerName: "llama3",
+      apiKey: null,
+      model: "llama-3.1-70b-instruct",
+      endpointUrl: `${server.baseUrl}/llama3-should-not-be-called`,
+    });
+    const deepseekProvider = new OpenAICompatibleLLMProvider({
+      providerName: "deepseek",
+      apiKey: "sk-deepseek-test-0001",
+      model: "deepseek-chat",
+      endpointUrl: `${server.baseUrl}/deepseek`,
+    });
+
+    const router = new LLMRouter([failingGemini503, groqProvider, unconfiguredLlama3, deepseekProvider]);
+    assert.deepEqual(router.configuredProviderNames(), ["gemini", "groq", "deepseek"]);
+
+    const extraction = await router.extractStructured({
+      category: "startups",
+      sourceUrl: "https://example.com/startups",
+      sourceName: "example",
+      sourceText: "VectorGuard builds verified AI guardrails for production deployments.",
+    });
+
+    assert.equal(extraction.mode, "live_llm");
+    assert.equal(extraction.providerUsed, "deepseek");
+    assert.ok(calls.includes("gemini"));
+    assert.ok(calls.includes("groq"));
+    assert.ok(calls.includes("deepseek"));
+    assert.equal(extraction.records.length, 1);
+    assert.equal(extraction.records[0].name, "VectorGuard");
+  } finally {
+    await server.close();
+  }
+});
+
+test("Pipeline tracks newRecordsCounts accurately across duplicate re-runs and preserves historical counts on failure", async () => {
+  const tmpAtlasDir = fs.mkdtempSync(path.join(os.tmpdir(), "atlas-new-counts-"));
+  const dataDir = path.join(tmpAtlasDir, "data");
+  fs.mkdirSync(dataDir, { recursive: true });
+  const prevDbUrl = process.env.DATABASE_URL;
+  delete process.env.DATABASE_URL;
+
+  try {
+    const svc = new AtlasBackendService(tmpAtlasDir);
+    const nowIso = new Date().toISOString();
+
+    const makeJobCollector = () => async () => ({
+      records: [
+        {
+          job_id: "job_dedup_run_1",
+          title: "Principal AI Reliability Engineer",
+          company: "Apex Systems AI",
+          location: "Remote",
+          employment_type: "Full-Time",
+          description: "Maintain resilient AI pipelines.",
+          posted_at: nowIso,
+          application_url: "https://apex.example/jobs/1",
+          official_website: "https://apex.example",
+          source_name: "greenhouse",
+          source_url: "https://apex.example/jobs/1",
+          source_title: "Principal AI Reliability Engineer",
+          collected_at: nowIso,
+          last_checked_at: nowIso,
+          supported_fields: ["title", "company", "posted_at"],
+          verification_status: "Verified" as const,
+          rejection_reason: null,
+          source_metadata: {},
+        },
+      ],
+      errors: [],
+      sourceOutcomes: [
+        {
+          category: "jobs" as const,
+          source: "greenhouse",
+          url: "https://boards-api.greenhouse.io",
+          status: "ok" as const,
+          discoveredCount: 1,
+          freshCount: 1,
+          retried: false,
+          attempts: 1,
+          httpStatus: 200,
+          error: null,
+        },
+      ],
+      hasMore: false,
+    });
+
+    type RunShape = {
+      runStatus: string;
+      newRecordsCounts: Record<string, number>;
+      databaseCounts: Record<string, number>;
+    };
+    const r1 = (await svc.runPipeline({
+      triggerType: "manual",
+      mode: "full",
+      categories: ["jobs"],
+      limit: 10,
+      page: 1,
+      skipAutoSheetsSync: true,
+      collectorsOverride: { jobs: makeJobCollector() },
+    })) as RunShape;
+    assert.equal(r1.newRecordsCounts.jobs, 1);
+    assert.equal(r1.databaseCounts.jobs, 1);
+
+    // Run 2: same job collected again -> 0 newly inserted rows, historical count remains 1
+    const r2 = (await svc.runPipeline({
+      triggerType: "manual",
+      mode: "full",
+      categories: ["jobs"],
+      limit: 10,
+      page: 1,
+      skipAutoSheetsSync: true,
+      collectorsOverride: { jobs: makeJobCollector() },
+    })) as RunShape;
+    assert.equal(r2.newRecordsCounts.jobs, 0);
+    assert.equal(r2.databaseCounts.jobs, 1);
+
+    // Run 3: failing collector -> 0 new rows, historical count stays 1 (never overwritten with 0)
+    const r3 = (await svc.runPipeline({
+      triggerType: "daily_24h",
+      mode: "daily_24h",
+      categories: ["jobs"],
+      limit: 10,
+      page: 1,
+      skipAutoSheetsSync: true,
+      collectorsOverride: {
+        jobs: async () => ({
+          records: [],
+          errors: [{ source: "greenhouse", url: "https://boards-api.greenhouse.io", error: "HTTP 503" }],
+          sourceOutcomes: [
+            {
+              category: "jobs",
+              source: "greenhouse",
+              url: "https://boards-api.greenhouse.io",
+              status: "failed",
+              discoveredCount: 0,
+              freshCount: 0,
+              retried: true,
+              attempts: 2,
+              httpStatus: 503,
+              error: "HTTP 503",
+            },
+          ],
+          hasMore: false,
+        }),
+      },
+    })) as RunShape;
+    assert.equal(r3.runStatus, "failed");
+    assert.equal(r3.newRecordsCounts.jobs, 0);
+    assert.equal(r3.databaseCounts.jobs, 1);
+
+    const status = svc.getStatus() as {
+      counts: Record<string, number>;
+      latestRunNewCounts: Record<string, number>;
+      pipelineRuns: Array<{ new_records_counts?: Record<string, number> }>;
+    };
+    assert.equal(status.counts.jobs, 1);
+    assert.equal(status.latestRunNewCounts.jobs, 0);
+    assert.equal(status.pipelineRuns.length, 3);
+    assert.equal(status.pipelineRuns[2].new_records_counts?.jobs, 1);
+    assert.equal(status.pipelineRuns[1].new_records_counts?.jobs, 0);
+
+    svc.close();
+  } finally {
+    if (prevDbUrl !== undefined) process.env.DATABASE_URL = prevDbUrl;
+    fs.rmSync(tmpAtlasDir, { recursive: true, force: true });
+  }
+});
+
+test("Unique qualified record counting excludes Rejected rows and deduplicates canonical entities and papers", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "atlas-unique-cnt-"));
+  const db = new AtlasDatabase(path.join(tmpDir, "unique.db"));
+  const nowIso = "2026-11-22T06:00:00.000Z";
+  try {
+    db.initializeSchema();
+    db.upsertStartups([
+      {
+        startup_id: "stp_u1",
+        name: "Orbital AI",
+        description: "Desc",
+        website: "https://orbital.ai",
+        official_website: "https://orbital.ai",
+        industry: "AI",
+        location: "SF",
+        founding_date: "2025-01-01",
+        source_name: "yc",
+        source_url: "https://yc.example/orbital-1",
+        source_title: "Orbital AI",
+        collected_at: nowIso,
+        last_checked_at: nowIso,
+        supported_fields: ["name"],
+        verification_status: "Verified",
+        rejection_reason: null,
+        canonical_entity_id: "ent_orbital",
+        source_metadata: {},
+      },
+      {
+        // Same canonical_entity_id via another directory URL -> counts as 1 unique startup
+        startup_id: "stp_u2",
+        name: "Orbital AI Inc.",
+        description: "Desc",
+        website: "https://orbital.ai",
+        official_website: "https://orbital.ai",
+        industry: "AI",
+        location: "SF",
+        founding_date: "2025-01-01",
+        source_name: "hn",
+        source_url: "https://hn.example/orbital-2",
+        source_title: "Orbital AI",
+        collected_at: nowIso,
+        last_checked_at: nowIso,
+        supported_fields: ["name"],
+        verification_status: "Verified",
+        rejection_reason: null,
+        canonical_entity_id: "ent_orbital",
+        source_metadata: {},
+      },
+      {
+        // Rejected row must be excluded from qualified unique count
+        startup_id: "stp_u3",
+        name: "Fake Co",
+        description: null,
+        website: null,
+        official_website: null,
+        industry: "Unknown",
+        location: "Unknown",
+        founding_date: null,
+        source_name: "bad",
+        source_url: "https://bad.example/fake",
+        source_title: null,
+        collected_at: nowIso,
+        last_checked_at: nowIso,
+        supported_fields: [],
+        verification_status: "Rejected",
+        rejection_reason: "fabricated",
+        canonical_entity_id: "ent_fake",
+        source_metadata: {},
+      },
+    ]);
+
+    db.upsertProducts([
+      {
+        product_id: "prd_u1",
+        name: "TensorBench",
+        description: "Benchmarks",
+        website: "https://tensorbench.dev",
+        official_website: "https://tensorbench.dev",
+        category: "Benchmarks",
+        company_name: "Orbital AI",
+        source_name: "github",
+        source_url: "https://github.com/orbital/tensorbench",
+        source_title: "TensorBench",
+        collected_at: nowIso,
+        last_checked_at: nowIso,
+        supported_fields: ["name"],
+        verification_status: "Verified",
+        rejection_reason: null,
+        canonical_entity_id: "ent_tb",
+        source_metadata: {},
+      },
+      {
+        product_id: "prd_u2",
+        name: "Rejected Tool",
+        description: null,
+        website: null,
+        official_website: null,
+        category: "Unknown",
+        company_name: "Unknown",
+        source_name: "bad",
+        source_url: "https://bad.example/prd",
+        source_title: null,
+        collected_at: nowIso,
+        last_checked_at: nowIso,
+        supported_fields: [],
+        verification_status: "Rejected",
+        rejection_reason: "spam",
+        canonical_entity_id: "ent_bad_prd",
+        source_metadata: {},
+      },
+    ]);
+
+    db.upsertResearchPapers([
+      {
+        paper_id: "pap_u1",
+        title: "Sparse Kernels",
+        abstract: "Fast GPU kernels.",
+        authors: ["Alice"],
+        publication_date: "2026-11-21",
+        published_at: nowIso,
+        doi: "10.1000/sparse",
+        arxiv_id: "2611.99999",
+        github_repository: null,
+        github_stars: null,
+        official_website: null,
+        source_name: "arxiv",
+        source_url: "https://arxiv.org/abs/2611.99999",
+        source_title: "Sparse Kernels",
+        collected_at: nowIso,
+        last_checked_at: nowIso,
+        supported_fields: ["title"],
+        verification_status: "Verified",
+        rejection_reason: null,
+        source_metadata: {},
+      },
+      {
+        // Same DOI from Crossref -> counts as 1 unique paper
+        paper_id: "pap_u2",
+        title: "Sparse Kernels",
+        abstract: "Fast GPU kernels.",
+        authors: ["Alice"],
+        publication_date: "2026-11-21",
+        published_at: nowIso,
+        doi: "10.1000/sparse",
+        arxiv_id: null,
+        github_repository: null,
+        github_stars: null,
+        official_website: null,
+        source_name: "crossref",
+        source_url: "https://doi.org/10.1000/sparse",
+        source_title: "Sparse Kernels",
+        collected_at: nowIso,
+        last_checked_at: nowIso,
+        supported_fields: ["title"],
+        verification_status: "Verified",
+        rejection_reason: null,
+        source_metadata: {},
+      },
+    ]);
+
+    const rawCounts = db.countRecords();
+    assert.equal(rawCounts.startups, 3);
+    assert.equal(rawCounts.products, 2);
+    assert.equal(rawCounts.research_papers, 2);
+
+    const unique = db.countUniqueQualifiedRecords();
+    assert.equal(unique.startups, 1);
+    assert.equal(unique.products, 1);
+    assert.equal(unique.research_papers, 1);
+
+    db.close();
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("AtlasBackendService exposes targetChecks, accurate dataset totalCount/offset, and fast isolated SQLite health latency", async () => {
+  const tmpAtlasDir = fs.mkdtempSync(path.join(os.tmpdir(), "atlas-service-check-"));
+  const dataDir = path.join(tmpAtlasDir, "data");
+  fs.mkdirSync(dataDir, { recursive: true });
+  const prevDbUrl = process.env.DATABASE_URL;
+  delete process.env.DATABASE_URL;
+
+  try {
+    const svc = new AtlasBackendService(tmpAtlasDir);
+    const db = (svc as unknown as { db: AtlasDatabase }).db;
+    const nowIso = new Date().toISOString();
+    db.upsertJobs([
+      {
+        job_id: "job_p1",
+        title: "AI Engineer 1",
+        company: "Corp A",
+        location: "Remote",
+        employment_type: "Full-Time",
+        description: "ML",
+        posted_at: nowIso,
+        application_url: "https://example.com/jobs/1",
+        official_website: null,
+        source_name: "ashby:openai",
+        source_url: "https://example.com/jobs/1",
+        source_title: "AI Engineer 1",
+        collected_at: nowIso,
+        last_checked_at: nowIso,
+        supported_fields: ["title"],
+        verification_status: "Verified",
+        rejection_reason: null,
+        canonical_company_id: null,
+        source_metadata: {},
+      },
+      {
+        job_id: "job_p2",
+        title: "AI Engineer 2",
+        company: "Corp B",
+        location: "Remote",
+        employment_type: "Full-Time",
+        description: "ML",
+        posted_at: nowIso,
+        application_url: "https://example.com/jobs/2",
+        official_website: null,
+        source_name: "ashby:openai",
+        source_url: "https://example.com/jobs/2",
+        source_title: "AI Engineer 2",
+        collected_at: nowIso,
+        last_checked_at: nowIso,
+        supported_fields: ["title"],
+        verification_status: "Verified",
+        rejection_reason: null,
+        canonical_company_id: null,
+        source_metadata: {},
+      },
+    ]);
+
+    const page1 = svc.getDataset("jobs", 1, "all", 0) as {
+      rows: unknown[];
+      count: number;
+      totalCount: number;
+      truncated: boolean;
+    };
+    assert.equal(page1.count, 1);
+    assert.equal(page1.totalCount, 2);
+    assert.equal(page1.truncated, true);
+
+    const page2 = svc.getDataset("jobs", 1, "all", 1) as {
+      rows: Array<{ job_id: string }>;
+      count: number;
+      totalCount: number;
+      truncated: boolean;
+    };
+    assert.equal(page2.count, 1);
+    assert.equal(page2.totalCount, 2);
+    assert.equal(page2.truncated, false);
+    assert.equal(page2.rows[0].job_id, "job_p2");
+
+    const health = await svc.runIntegrationHealthChecks();
+    assert.equal(health.byId.sqlite.status, "Configured");
+    assert.ok(
+      typeof health.byId.sqlite.latencyMs === "number" && health.byId.sqlite.latencyMs < 500,
+      `Expected SQLite latency < 500ms, got ${health.byId.sqlite.latencyMs}`
+    );
+
+    const st = svc.getStatus() as {
+      targetChecks: { startups: { uniqueCount: number; target: number; met: boolean } };
+    };
+    assert.equal(st.targetChecks.startups.uniqueCount, 0);
+    assert.equal(st.targetChecks.startups.met, false);
+
+    svc.close();
+  } finally {
+    if (prevDbUrl !== undefined) process.env.DATABASE_URL = prevDbUrl;
+    fs.rmSync(tmpAtlasDir, { recursive: true, force: true });
+  }
+});
+
+test("GoogleSheetsService honors createNew=true by ignoring persisted spreadsheet_id and creating a fresh workbook", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "atlas-createnew-test-"));
+  const db = new AtlasDatabase(path.join(tmpDir, "createnew.db"));
+  const { privateKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const pem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+
+  const sheetValues = new Map<string, string[][]>();
+  const sheetProps = EXPORT_SPECS.map((s, idx) => ({
+    properties: {
+      sheetId: idx + 1,
+      title: s.tabName,
+      gridProperties: { rowCount: 1000, columnCount: s.columns.length },
+    },
+  }));
+  let createCalls = 0;
+
+  const mockServer = await withHttpServer((req, res, body) => {
+    res.setHeader("Content-Type", "application/json");
+    const urlPath = (req.url ?? "").split("?")[0];
+
+    if (urlPath === "/oauth/token" && req.method === "POST") {
+      res.writeHead(200);
+      res.end(JSON.stringify({ access_token: "mock-token-cn", expires_in: 3600 }));
+      return;
+    }
+
+    if (urlPath === "/v4/spreadsheets" && req.method === "POST") {
+      createCalls += 1;
+      const newId = `fresh-sheet-00${createCalls}`;
+      res.writeHead(200);
+      res.end(
+        JSON.stringify({
+          spreadsheetId: newId,
+          spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${newId}`,
+          sheets: sheetProps,
+        })
+      );
+      return;
+    }
+
+    if (urlPath === "/v4/spreadsheets/stale-deleted-sheet-999") {
+      res.writeHead(404);
+      res.end(JSON.stringify({ error: { message: "Requested entity was not found." } }));
+      return;
+    }
+
+    const match = urlPath.match(/^\/v4\/spreadsheets\/(fresh-sheet-00\d+)(.*)$/);
+    if (match) {
+      const subPath = match[2];
+      if (!subPath && req.method === "GET") {
+        res.writeHead(200);
+        res.end(
+          JSON.stringify({
+            spreadsheetId: match[1],
+            spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${match[1]}`,
+            sheets: sheetProps,
+          })
+        );
+        return;
+      }
+      if (subPath === ":batchUpdate" && req.method === "POST") {
+        res.writeHead(200);
+        res.end(JSON.stringify({ replies: [] }));
+        return;
+      }
+      if (subPath === "/values:batchClear" && req.method === "POST") {
+        sheetValues.clear();
+        res.writeHead(200);
+        res.end(JSON.stringify({ clearedRanges: [] }));
+        return;
+      }
+      if (subPath === "/values:batchUpdate" && req.method === "POST") {
+        const payload = JSON.parse(body) as { data?: Array<{ range: string; values: unknown[][] }> };
+        for (const entry of payload.data ?? []) {
+          const tabMatch = entry.range.match(/^'([^']+)'!A(\d+)/);
+          if (!tabMatch) continue;
+          const tabName = tabMatch[1];
+          const startRow = Number(tabMatch[2]);
+          const existing = sheetValues.get(tabName) ?? [];
+          for (let i = 0; i < entry.values.length; i++) {
+            existing[startRow - 1 + i] = entry.values[i].map((v) => String(v ?? ""));
+          }
+          sheetValues.set(tabName, existing);
+        }
+        res.writeHead(200);
+        res.end(JSON.stringify({ responses: [] }));
+        return;
+      }
+      const readMatch = subPath.match(/^\/values\/([^/]+)$/);
+      if (readMatch && req.method === "GET") {
+        const rangeDecoded = decodeURIComponent(readMatch[1]);
+        const tabMatch = rangeDecoded.match(/^'([^']+)'!/);
+        const tabName = tabMatch?.[1] ?? "";
+        const rows = sheetValues.get(tabName) ?? [];
+        res.writeHead(200);
+        res.end(JSON.stringify({ values: rows.map((r) => [r[0] ?? ""]) }));
+        return;
+      }
+    }
+
+    res.writeHead(404);
+    res.end(JSON.stringify({ error: { message: `Unhandled mock route: ${req.method} ${req.url}` } }));
+  });
+
+  try {
+    db.initializeSchema();
+    db.saveSheetsSyncState({
+      status: "Sync Failed",
+      spreadsheetId: "stale-deleted-sheet-999",
+      spreadsheetUrl: "https://docs.google.com/spreadsheets/d/stale-deleted-sheet-999",
+      lastSyncMode: "full",
+      lastAttemptAt: "2026-11-22T06:00:00.000Z",
+      lastSuccessAt: null,
+      tabRowCounts: {},
+      rowsAdded: 0,
+      rowsUpdated: 0,
+      rowsUnchanged: 0,
+      lastError: "404 Not Found",
+    });
+
+    const sheets = new GoogleSheetsService(
+      {
+        atlasDir: tmpDir,
+        rootDir: tmpDir,
+        credentialsPath: null,
+        credentialsJson: JSON.stringify({
+          client_email: "atlas-test@example.iam.gserviceaccount.com",
+          private_key: pem,
+        }),
+        spreadsheetId: null,
+        spreadsheetName: "FrontierAtlas CreateNew Test",
+        apiBaseUrl: `${mockServer.baseUrl}/v4`,
+        oauthTokenUrl: `${mockServer.baseUrl}/oauth/token`,
+      },
+      db
+    );
+
+    const verified = await sheets.verifyConnection({ createNew: true });
+    assert.equal(verified.status, "Connected");
+    assert.equal(verified.spreadsheetId, null);
+
+    const exported = await sheets.exportOrSync("full", { createNew: true });
+    assert.equal(exported.success, true, exported.error ?? undefined);
+    assert.equal(createCalls, 1);
+    assert.equal(exported.spreadsheetId, "fresh-sheet-001");
+    assert.equal(sheets.getStatus().spreadsheetId, "fresh-sheet-001");
+
+    db.close();
+  } finally {
+    await mockServer.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
