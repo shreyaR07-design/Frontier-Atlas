@@ -11,6 +11,7 @@ export interface FetchOptions {
   userAgent?: string;
   checkRobots?: boolean;
   maxAttempts?: number;
+  retryBaseDelayMs?: number;
   deduplicate?: boolean;
 }
 
@@ -434,10 +435,11 @@ export class PoliteHttpClient {
           };
         }
 
-        if (RETRYABLE_STATUSES.has(status)) {
+        if (RETRYABLE_STATUSES.has(status) || (status >= 500 && status <= 599)) {
           const retryAfter = parseRetryAfterMs(respHeaders["retry-after"]);
-          const baseBackoff = Math.min(12_000, 800 * Math.pow(2, attempt - 1));
-          const jitter = Math.floor(Math.random() * 400);
+          const baseUnit = options.retryBaseDelayMs ?? 800;
+          const baseBackoff = Math.min(12_000, baseUnit * Math.pow(2, attempt - 1));
+          const jitter = options.retryBaseDelayMs !== undefined ? 0 : Math.floor(Math.random() * 400);
           const waitMs = retryAfter !== null ? Math.max(retryAfter, baseBackoff) : baseBackoff + jitter;
           if (status === 429) {
             this.rateLimiter.penalize(domain, waitMs);
@@ -521,7 +523,8 @@ export class PoliteHttpClient {
           attempts: attempt,
         };
         if (attempt < maxAttempts) {
-          await sleep(Math.min(8000, 600 * Math.pow(2, attempt - 1)));
+          const baseUnit = options.retryBaseDelayMs ?? 600;
+          await sleep(Math.min(8000, baseUnit * Math.pow(2, attempt - 1)));
           continue;
         }
         return lastResult;

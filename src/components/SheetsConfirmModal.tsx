@@ -105,11 +105,22 @@ export function SheetsConfirmModal({
             <p className="text-amber-200/80">
               Target:{" "}
               <span className="font-mono text-amber-100">
-                {spreadsheetId.trim() ? spreadsheetId.trim() : "Create new spreadsheet in Google Drive"}
+                {status?.sheetsStatus?.credentialSource === "apps_script_webhook" ||
+                status?.sheetsStatus?.webhookUrl
+                  ? status?.sheetsStatus?.spreadsheetUrl ||
+                    (spreadsheetId.trim()
+                      ? spreadsheetId.trim()
+                      : "Google Sheet bound to Apps Script Web App")
+                  : spreadsheetId.trim()
+                  ? spreadsheetId.trim()
+                  : "Create new spreadsheet in Google Drive"}
               </span>
-              {serviceAccountEmail
+              {status?.sheetsStatus?.credentialSource === "apps_script_webhook" ||
+              status?.sheetsStatus?.webhookUrl
+                ? " (via Google Apps Script Web App)"
+                : serviceAccountEmail
                 ? ` (Service Account: ${serviceAccountEmail})`
-                : " (using backend Service Account)"}
+                : " (using optional backend Service Account)"}
             </p>
           </div>
         </div>
@@ -117,8 +128,22 @@ export function SheetsConfirmModal({
         <div className="rounded-lg bg-[#070D1A] border border-slate-800 p-3 text-xs text-slate-300 flex items-start gap-2">
           <Globe className="w-4 h-4 text-sky-400 shrink-0 mt-0.5" />
           <span>
-            After tab row verification, FrontierAtlas requests{" "}
-            <strong className="text-slate-100">Anyone with the link — Viewer</strong> permission via the Google Drive API and confirms it via read-back. If sharing is policy-blocked, it reports that honestly.
+            {status?.sheetsStatus?.credentialSource === "apps_script_webhook" ||
+            status?.sheetsStatus?.webhookUrl ? (
+              <>
+                All 6 datasets are sent via HTTP POST to your Google Apps Script Web App, which
+                updates the tabs and sets{" "}
+                <strong className="text-slate-100">Anyone with the link — Viewer</strong> sharing
+                automatically.
+              </>
+            ) : (
+              <>
+                After tab row verification, FrontierAtlas requests{" "}
+                <strong className="text-slate-100">Anyone with the link — Viewer</strong> permission
+                via the Google Drive API and confirms it via read-back. If sharing is policy-blocked,
+                it reports that honestly.
+              </>
+            )}
           </span>
         </div>
 

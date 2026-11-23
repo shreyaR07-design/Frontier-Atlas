@@ -6,7 +6,7 @@ export type DatasetCategory =
   | "news"
   | "entity_mapping_log";
 
-export type SectionId = "overview" | DatasetCategory;
+export type SectionId = "overview" | "gmail" | DatasetCategory;
 
 export type VerificationStatus =
   | "Verified"
@@ -243,7 +243,8 @@ export interface SheetsStatusPayload {
   status: "Connected" | "Not Connected" | "Sync Failed";
   configured: boolean;
   authRequired?: boolean;
-  credentialSource: "oauth" | "path" | "json_env" | "saved_config" | null;
+  credentialSource: "apps_script_webhook" | "oauth" | "path" | "json_env" | "saved_config" | null;
+  webhookUrl?: string | null;
   verifiedAccountEmail?: string | null;
   grantedScopes?: string[];
   tokenExpiresInSeconds?: number | null;

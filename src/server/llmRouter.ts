@@ -306,17 +306,16 @@ export class GeminiLLMProvider implements LLMProvider {
   private readonly timeoutMs: number;
 
   constructor(
-    apiKey: string | null,
-    model: string,
+    apiKey: string | null | undefined = process.env.GEMINI_API_KEY,
+    model: string | undefined = process.env.GEMINI_MODEL || "gemini-4-hydrogen",
     timeoutMs = 45_000,
-    fallbackModel?: string | null
+    fallbackModel: string | null | undefined = process.env.GEMINI_FALLBACK_MODEL ?? "gemini-3.1-flash-lite"
   ) {
-    this.apiKey = apiKey;
-    this.model = model;
+    this.apiKey = apiKey === null ? null : (apiKey ?? process.env.GEMINI_API_KEY ?? "").trim() || null;
+    this.model = (model ?? process.env.GEMINI_MODEL ?? "").trim() || "gemini-4-hydrogen";
     this.timeoutMs = Math.max(15_000, timeoutMs);
-    this.fallbackModel = fallbackModel && fallbackModel.trim() && fallbackModel.trim() !== model
-      ? fallbackModel.trim()
-      : null;
+    const cleanedFallback = fallbackModel?.trim() || null;
+    this.fallbackModel = cleanedFallback && cleanedFallback !== this.model ? cleanedFallback : null;
   }
 
   public isConfigured(): boolean {
@@ -395,8 +394,28 @@ export class GeminiLLMProvider implements LLMProvider {
       if (lower.includes("413") || lower.includes("token") || lower.includes("context") || lower.includes("too large")) {
         throw new PayloadTooLargeError(`gemini context/payload limit: ${msg}`);
       }
+      if (
+        lower.includes("403") ||
+        lower.includes("permission_denied") ||
+        lower.includes("billing") ||
+        lower.includes("generative language api") ||
+        lower.includes("generativelanguage.googleapis.com") ||
+        lower.includes("has not been used in project") ||
+        lower.includes("service_disabled") ||
+        lower.includes("consumer_suspended") ||
+        lower.includes("api_key_service_blocked")
+      ) {
+        const diagnostic =
+          `Gemini API 403 PERMISSION_DENIED / billing or API enablement error (${modelName}): ` +
+          `Enable Cloud Billing and the Generative Language API (generativelanguage.googleapis.com) ` +
+          `in Google Cloud Console for this project, and verify GEMINI_API_KEY permissions. (${msg})`;
+        console.warn(`[GeminiLLMProvider] ${diagnostic}`);
+        throw new FatalProviderError(diagnostic);
+      }
       if (lower.includes("429") || lower.includes("quota") || lower.includes("resource_exhausted")) {
-        throw new RateLimitError(`gemini rate limit (429): ${msg}`);
+        throw new RateLimitError(
+          `gemini quota/rate limit (429 RESOURCE_EXHAUSTED): Check Gemini API quota or Cloud Billing tier. (${msg})`
+        );
       }
       if (
         lower.includes("500") ||
@@ -413,18 +432,86 @@ export class GeminiLLMProvider implements LLMProvider {
       }
       if (
         lower.includes("401") ||
-        lower.includes("403") ||
         lower.includes("404") ||
         lower.includes("api key") ||
         lower.includes("not found") ||
-        lower.includes("permission_denied") ||
         lower.includes("unauthenticated")
       ) {
-        throw new FatalProviderError(`gemini auth/model error: ${msg}`);
+        throw new FatalProviderError(`gemini auth/model error (${modelName}): ${msg}`);
       }
       throw new TransientProviderError(`gemini (${modelName}) request error: ${msg}`);
     } finally {
       if (timer) clearTimeout(timer);
+    }
+  }
+
+  public async listAvailableModels(timeoutMs = 8000): Promise<{
+    reachable: boolean;
+    modelNames: string[];
+    error: string | null;
+  }> {
+    if (!this.isConfigured()) {
+      return { reachable: false, modelNames: [], error: "GEMINI_API_KEY is not configured." };
+    }
+    try {
+      const ai = new GoogleGenAI({
+        apiKey: this.apiKey!,
+        httpOptions: {
+          timeout: timeoutMs,
+          headers: {
+            "User-Agent": "aistudio-build",
+          },
+        },
+      });
+      const pager = await ai.models.list({ config: { pageSize: 15 } });
+      const modelNames: string[] = [];
+      for await (const m of pager) {
+        if (m?.name) modelNames.push(m.name.replace(/^models\//, ""));
+        if (modelNames.length >= 12) break;
+      }
+      return { reachable: true, modelNames, error: null };
+    } catch (err) {
+      return {
+        reachable: false,
+        modelNames: [],
+        error: redactSecrets(err instanceof Error ? err.message : String(err)),
+      };
+    }
+  }
+
+  public async probeHealth(): Promise<{ modelUsed: string; latencyMs: number }> {
+    if (!this.isConfigured()) {
+      throw new FatalProviderError("GEMINI_API_KEY is not configured");
+    }
+    const startedAt = Date.now();
+    const probePrompt = 'Return JSON {"ok": true} only.';
+    const probeSystem = 'Return valid JSON object {"ok": true} only.';
+    try {
+      await this.generateWithModel(this.model, probePrompt, probeSystem, 15_000);
+      return { modelUsed: this.model, latencyMs: Date.now() - startedAt };
+    } catch (primaryErr) {
+      if (this.fallbackModel) {
+        try {
+          await this.generateWithModel(this.fallbackModel, probePrompt, probeSystem, 15_000);
+          return { modelUsed: this.fallbackModel, latencyMs: Date.now() - startedAt };
+        } catch (fallbackErr) {
+          const primaryMsg = redactSecrets(primaryErr instanceof Error ? primaryErr.message : String(primaryErr));
+          const fallbackMsg = redactSecrets(fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr));
+          if (/403|permission_denied|billing|service_disabled/i.test(primaryMsg + fallbackMsg)) {
+            const listDiag = await this.listAvailableModels(6000);
+            const extra = listDiag.reachable
+              ? ` Generative Language API is enabled (${listDiag.modelNames.length} models listed, e.g. ${listDiag.modelNames.slice(0, 4).join(", ")}), confirming this is a Google Cloud project billing/free-tier restriction on generateContent.`
+              : listDiag.error
+              ? ` Model catalog check also failed (${listDiag.error}).`
+              : "";
+            throw new FatalProviderError(
+              `${primaryMsg}${extra} Fallback (${this.fallbackModel}) also failed: ${fallbackMsg}`
+            );
+          }
+          throw fallbackErr instanceof FatalProviderError ? primaryErr : fallbackErr;
+        }
+      }
+      throw primaryErr;
     }
   }
 
@@ -440,11 +527,12 @@ export class GeminiLLMProvider implements LLMProvider {
     try {
       return await this.generateWithModel(this.model, prompt, systemInstruction, effectiveTimeoutMs);
     } catch (primaryErr) {
-      if (
-        !opts?.skipFallback &&
-        this.fallbackModel &&
-        (primaryErr instanceof TransientProviderError || primaryErr instanceof RateLimitError)
-      ) {
+      const msg = primaryErr instanceof Error ? primaryErr.message : String(primaryErr);
+      const isModelOrTransient =
+        primaryErr instanceof TransientProviderError ||
+        primaryErr instanceof RateLimitError ||
+        /404|not found|403|permission_denied/i.test(msg);
+      if (!opts?.skipFallback && this.fallbackModel && isModelOrTransient) {
         try {
           return await this.generateWithModel(
             this.fallbackModel,
@@ -734,6 +822,7 @@ export class LLMRouter {
   private readonly maxInputTokens: number;
   private readonly overlapTokens: number;
   private readonly providers: LLMProvider[];
+  private readonly unavailableProviders = new Map<string, { untilMs: number; reason: string }>();
 
   constructor(
     providers: LLMProvider[],
@@ -742,6 +831,20 @@ export class LLMRouter {
     this.providers = providers;
     this.maxInputTokens = opts.maxInputTokens ?? 3200;
     this.overlapTokens = opts.overlapTokens ?? 180;
+  }
+
+  public isProviderTemporarilyDisabled(providerName: string, nowMs = Date.now()): boolean {
+    const entry = this.unavailableProviders.get(providerName);
+    if (!entry) return false;
+    if (entry.untilMs <= nowMs) {
+      this.unavailableProviders.delete(providerName);
+      return false;
+    }
+    return true;
+  }
+
+  public clearProviderCooldowns(): void {
+    this.unavailableProviders.clear();
   }
 
   public configuredProviderNames(): string[] {
@@ -781,6 +884,18 @@ export class LLMRouter {
 
         const startedAt = Date.now();
         try {
+          if (provider instanceof GeminiLLMProvider) {
+            const gemRes = await provider.probeHealth();
+            return {
+              provider: provider.providerName,
+              model: gemRes.modelUsed || model,
+              via,
+              status: "Configured",
+              latencyMs: gemRes.latencyMs,
+              error: null,
+              checkedAt,
+            };
+          }
           await runWithRetry(
             () => provider.generateJson(probePrompt, probeSystem, { timeoutMs }),
             2
@@ -826,12 +941,20 @@ export class LLMRouter {
       );
     }
 
+    const active = configured.filter((p) => !this.isProviderTemporarilyDisabled(p.providerName));
+    if (active.length === 0) {
+      const reasons = configured
+        .map((p) => `${p.providerName}: ${this.unavailableProviders.get(p.providerName)?.reason ?? "unavailable"}`)
+        .join("; ");
+      throw new FatalProviderError(`All configured LLM providers are temporarily disabled/skipped: ${reasons}`);
+    }
+
     const errors: string[] = [];
     const attemptedProviders: string[] = [];
     const fallbackLog: string[] = [];
     let sawTimeoutOrTransient = false;
-    for (let idx = 0; idx < configured.length; idx++) {
-      const provider = configured[idx];
+    for (let idx = 0; idx < active.length; idx++) {
+      const provider = active[idx];
       attemptedProviders.push(provider.providerName);
       try {
         const payload = await runWithRetry(() => provider.generateJson(prompt), 3);
@@ -853,8 +976,17 @@ export class LLMRouter {
           sawTimeoutOrTransient = true;
         }
         const safeReason = redactSecrets(err instanceof Error ? err.message : String(err));
+        if (err instanceof FatalProviderError) {
+          this.unavailableProviders.set(provider.providerName, {
+            untilMs: Date.now() + 5 * 60_000,
+            reason: safeReason,
+          });
+          console.warn(
+            `[LLMRouter] Disabling '${provider.providerName}' for 5m after fatal/permission error: ${safeReason}`
+          );
+        }
         errors.push(`${provider.providerName}: ${safeReason}`);
-        const nextProvider = configured[idx + 1]?.providerName;
+        const nextProvider = active[idx + 1]?.providerName;
         const failMsg = nextProvider
           ? `[LLMRouter] Provider '${provider.providerName}' failed (${safeReason}); falling back to '${nextProvider}'.`
           : `[LLMRouter] Provider '${provider.providerName}' failed (${safeReason}); no remaining fallback providers.`;
@@ -1051,6 +1183,20 @@ export class LLMRouter {
       }
     }
     result.attemptedProviders = Array.from(attemptedSet);
+
+    if (!result.llmConnected && result.records.length === 0 && opts.allowHeuristicFallback) {
+      const degradeMsg = `[LLMRouter] Live LLM providers unavailable (${result.errors[0] || "unknown error"}); degrading gracefully to deterministic heuristic fallback (records marked Unverified).`;
+      result.mode = "heuristic_demo_fallback";
+      result.llmConnected = false;
+      result.fallbackLog.push(degradeMsg);
+      opts.onLog?.(degradeMsg);
+      result.records = extractWithHeuristicDemo(
+        opts.category,
+        opts.sourceUrl,
+        opts.sourceName,
+        opts.sourceText
+      );
+    }
 
     return result;
   }

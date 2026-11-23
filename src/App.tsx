@@ -5,7 +5,9 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Menu, Play, RefreshCw } from "lucide-react";
+import { AppsScriptSetupModal } from "./components/AppsScriptSetupModal";
 import { DatasetView } from "./components/DatasetView";
+import { GmailPanel } from "./components/GmailPanel";
 import { OverviewPanel } from "./components/OverviewPanel";
 import { RunCollectionModal } from "./components/RunCollectionModal";
 import { SheetsConfirmModal } from "./components/SheetsConfirmModal";
@@ -26,6 +28,7 @@ import type {
 
 const SECTION_LABELS: Record<SectionId, string> = {
   overview: "Overview",
+  gmail: "Gmail",
   startups: "Startups",
   products: "Products",
   research_papers: "Research Papers",
@@ -44,15 +47,56 @@ const DATASET_CSV_NAMES: Record<DatasetCategory, string> = {
 };
 
 async function readJsonSafe<T extends object>(resp: Response): Promise<T & { error?: string }> {
+  const contentType = (resp.headers.get("content-type") || "").toLowerCase();
   const raw = await resp.text();
-  if (!raw.trim()) {
+  const trimmed = raw.trim();
+
+  const looksLikeHtml =
+    contentType.includes("text/html") ||
+    contentType.includes("application/xhtml") ||
+    /^<(?:!doctype|html|head|body)\b/i.test(trimmed);
+
+  if (looksLikeHtml) {
+    const titleMatch = trimmed.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    const htmlTitle = titleMatch?.[1]?.replace(/\s+/g, " ").trim();
+    const isGoogleAuth = /accounts\.google\.com|Sign in - Google Accounts|You need permission/i.test(
+      trimmed
+    );
+    return {
+      error: isGoogleAuth
+        ? `Received Google Sign-In/permission HTML page (HTTP ${resp.status}). Ensure your Apps Script Web App (/exec) is deployed with Execute as: 'Me' and Who has access: 'Anyone'.`
+        : !resp.ok
+          ? `Request failed (HTTP ${resp.status}, Content-Type: ${contentType || "text/html"}${htmlTitle ? ` — "${htmlTitle}"` : ""}). Check backend server logs or endpoint routing.`
+          : `Expected JSON response but received HTML (${contentType || "text/html"}${htmlTitle ? ` — "${htmlTitle}"` : ""}). Verify the endpoint URL and deployment settings.`,
+    } as T & { error?: string };
+  }
+
+  if (!trimmed) {
+    if (!resp.ok) {
+      return {
+        error: `Request failed with empty response body (HTTP ${resp.status}${resp.statusText ? ` ${resp.statusText}` : ""}).`,
+      } as T & { error?: string };
+    }
     return {} as T & { error?: string };
   }
+
+  const looksLikeJson =
+    contentType.includes("json") ||
+    contentType.includes("text/javascript") ||
+    trimmed.startsWith("{") ||
+    trimmed.startsWith("[");
+
+  if (!looksLikeJson) {
+    return {
+      error: `Expected JSON but received ${contentType || "text/plain"} (HTTP ${resp.status}): ${trimmed.slice(0, 140)}`,
+    } as T & { error?: string };
+  }
+
   try {
-    return JSON.parse(raw) as T & { error?: string };
+    return JSON.parse(trimmed) as T & { error?: string };
   } catch {
     return {
-      error: `Unexpected non-JSON response (HTTP ${resp.status}): ${raw.slice(0, 140)}`,
+      error: `Invalid JSON response (HTTP ${resp.status}, Content-Type: ${contentType || "unknown"}): ${trimmed.slice(0, 140)}`,
     } as T & { error?: string };
   }
 }
@@ -93,6 +137,11 @@ export default function App() {
   const [sheetsExportScope, setSheetsExportScope] = useState<ExportScope>("all");
   const [targetSpreadsheetId, setTargetSpreadsheetId] = useState("");
   const hasInitializedSheetIdRef = useRef(false);
+  const [webhookUrlInput, setWebhookUrlInput] = useState("");
+  const hasInitializedWebhookRef = useRef(false);
+  const [savingWebhookUrl, setSavingWebhookUrl] = useState(false);
+  const [appsScriptModalOpen, setAppsScriptModalOpen] = useState(false);
+  const [appsScriptModalError, setAppsScriptModalError] = useState<string | null>(null);
   const [savingServiceAccount, setSavingServiceAccount] = useState(false);
   const [testingIntegrations, setTestingIntegrations] = useState(false);
   const [testingGoogleConnection, setTestingGoogleConnection] = useState(false);
@@ -164,12 +213,13 @@ export default function App() {
 
   const handleSelectSection = useCallback((nextSection: SectionId) => {
     if (nextSection !== activeSection) {
+      const isDataset = nextSection !== "overview" && nextSection !== "gmail";
       datasetRequestSeqRef.current += 1;
       setDatasetRows([]);
       setDatasetTotalCount(0);
       setDatasetError(null);
       setDatasetWindow("all");
-      setDatasetLoading(nextSection !== "overview");
+      setDatasetLoading(isDataset);
       setActiveSection(nextSection);
       window.scrollTo({ top: 0, behavior: "smooth" });
     }
@@ -188,7 +238,14 @@ export default function App() {
   }, [status?.sheetsStatus?.spreadsheetId]);
 
   useEffect(() => {
-    if (activeSection !== "overview") {
+    if (!hasInitializedWebhookRef.current && status?.sheetsStatus?.webhookUrl) {
+      hasInitializedWebhookRef.current = true;
+      setWebhookUrlInput(status.sheetsStatus.webhookUrl);
+    }
+  }, [status?.sheetsStatus?.webhookUrl]);
+
+  useEffect(() => {
+    if (activeSection !== "overview" && activeSection !== "gmail") {
       void loadDataset(activeSection, datasetWindow);
     }
   }, [activeSection, datasetWindow, loadDataset]);
@@ -205,7 +262,7 @@ export default function App() {
           if (data.run.status !== "running") {
             void loadStatus();
             void loadFailures();
-            if (activeSection !== "overview") {
+            if (activeSection !== "overview" && activeSection !== "gmail") {
               void loadDataset(activeSection, datasetWindow);
             }
           }
@@ -320,7 +377,7 @@ export default function App() {
       }
       await loadStatus();
       await loadFailures();
-      if (activeSection !== "overview") {
+      if (activeSection !== "overview" && activeSection !== "gmail") {
         void loadDataset(activeSection, datasetWindow);
       }
       const totals = data.verificationCounts?.totals;
@@ -369,6 +426,7 @@ export default function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          webhookUrl: webhookUrlInput.trim() || undefined,
           spreadsheetId: targetSpreadsheetId.trim() || undefined,
           createNew: targetSpreadsheetId.trim() === "",
         }),
@@ -381,11 +439,16 @@ export default function App() {
           typeof data.spreadsheetUrl === "string" && data.spreadsheetUrl
             ? data.spreadsheetUrl
             : null;
+        const isWebhook = data.credentialSource === "apps_script_webhook";
         setSheetsFeedback({
           success: true,
-          message: data.spreadsheetId
-            ? `Google Service Account verified (${String(data.verifiedAccountEmail || "Service Account")} — Spreadsheet ${String(data.spreadsheetId)} accessible).`
-            : `Google Service Account verified (${String(data.verifiedAccountEmail || "Service Account")} — Drive & Sheets APIs ready).`,
+          message: isWebhook
+            ? verifiedUrl
+              ? `Google Apps Script Web App verified and linked to ${verifiedUrl}.`
+              : "Google Apps Script Web App URL verified and ready to export all 6 datasets."
+            : data.spreadsheetId
+            ? `Google Sheets verified (${String(data.verifiedAccountEmail || "Service Account")} — Spreadsheet ${String(data.spreadsheetId)} accessible).`
+            : `Google Sheets verified (${String(data.verifiedAccountEmail || "Service Account")} — Drive & Sheets APIs ready).`,
           url: verifiedUrl,
         });
         return true;
@@ -397,7 +460,7 @@ export default function App() {
         message: String(
           data.lastError ||
             data.error ||
-            "Google Service Account credentials are not configured. Paste a Service Account JSON key in the Setup Panel below."
+            "Google Apps Script Webhook URL is not configured yet. Paste your Web App URL in Google Sheets Setup below."
         ),
         url: null,
         needsReauth,
@@ -413,7 +476,7 @@ export default function App() {
     } finally {
       setTestingGoogleConnection(false);
     }
-  }, [loadStatus, targetSpreadsheetId]);
+  }, [loadStatus, targetSpreadsheetId, webhookUrlInput]);
 
   const prepareFallbackSummary = useCallback(
     async (reason: string, scope: ExportScope): Promise<SheetsFallbackExportSummary | null> => {
@@ -459,6 +522,130 @@ export default function App() {
     },
     []
   );
+
+  const saveWebhookUrlInternal = async (opts?: {
+    skipVerify?: boolean;
+  }): Promise<{ ok: boolean; webhookUrl: string | null; error: string | null }> => {
+    const trimmed = webhookUrlInput.trim();
+    if (!trimmed) {
+      return { ok: false, webhookUrl: null, error: "Paste your Google Apps Script Web App URL first." };
+    }
+    setSavingWebhookUrl(true);
+    setAppsScriptModalError(null);
+    setSheetsFeedback(null);
+    try {
+      const resp = await fetch("/api/atlas/sheets/webhook", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          webhookUrl: trimmed,
+          skipVerify: opts?.skipVerify === true,
+        }),
+      });
+      const data = await readJsonSafe<{
+        saved?: boolean;
+        verified?: boolean;
+        webhookUrl?: string | null;
+        sheetsStatus?: { spreadsheetId?: string | null; spreadsheetUrl?: string | null; lastError?: string | null };
+        error?: string;
+      }>(resp);
+      await loadStatus();
+
+      if (!resp.ok || !data.saved) {
+        const errText =
+          data.error || `Failed to save Google Apps Script Webhook URL (HTTP ${resp.status}).`;
+        setAppsScriptModalError(errText);
+        setSheetsFeedback({
+          success: false,
+          message: errText,
+          url: null,
+          needsReauth: true,
+        });
+        return { ok: false, webhookUrl: null, error: errText };
+      }
+
+      hasInitializedWebhookRef.current = true;
+      const savedUrl = data.webhookUrl ?? trimmed;
+      setWebhookUrlInput(savedUrl);
+      if (data.sheetsStatus?.spreadsheetId) {
+        hasInitializedSheetIdRef.current = true;
+        setTargetSpreadsheetId(data.sheetsStatus.spreadsheetId);
+      }
+
+      if (opts?.skipVerify) {
+        return { ok: true, webhookUrl: savedUrl, error: null };
+      }
+
+      if (data.verified) {
+        setSheetsFeedback({
+          success: true,
+          message:
+            "Google Apps Script Webhook URL saved and verified. Click Export Google Sheets or Sync Google Sheets to publish all 6 SQLite datasets.",
+          url: data.sheetsStatus?.spreadsheetUrl ?? null,
+        });
+        return { ok: true, webhookUrl: savedUrl, error: null };
+      }
+
+      const verifyErr =
+        data.error ||
+        data.sheetsStatus?.lastError ||
+        "Webhook URL saved, but verification failed. Ensure your Apps Script Web App is deployed with 'Who has access: Anyone'.";
+      setAppsScriptModalError(verifyErr);
+      setSheetsFeedback({
+        success: false,
+        message: verifyErr,
+        url: null,
+      });
+      return { ok: false, webhookUrl: savedUrl, error: verifyErr };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setAppsScriptModalError(msg);
+      setSheetsFeedback({
+        success: false,
+        message: msg,
+        url: null,
+      });
+      return { ok: false, webhookUrl: null, error: msg };
+    } finally {
+      setSavingWebhookUrl(false);
+    }
+  };
+
+  const handleSaveWebhookUrl = async (): Promise<boolean> => {
+    const res = await saveWebhookUrlInternal({ skipVerify: false });
+    return res.ok;
+  };
+
+  const handleRemoveWebhookUrl = async () => {
+    setSavingWebhookUrl(true);
+    setAppsScriptModalError(null);
+    setSheetsFeedback(null);
+    try {
+      const resp = await fetch("/api/atlas/sheets/webhook", { method: "DELETE" });
+      const data = await readJsonSafe<{ error?: string }>(resp);
+      await loadStatus();
+      if (!resp.ok) {
+        throw new Error(data.error || `HTTP ${resp.status}`);
+      }
+      hasInitializedWebhookRef.current = true;
+      setWebhookUrlInput("");
+      setSheetsFeedback({
+        success: true,
+        message: "Cleared Google Apps Script Webhook URL.",
+        url: null,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setAppsScriptModalError(msg);
+      setSheetsFeedback({
+        success: false,
+        message: msg,
+        url: null,
+      });
+    } finally {
+      setSavingWebhookUrl(false);
+    }
+  };
 
   const handleSaveServiceAccount = async (rawJson: string): Promise<boolean> => {
     setSavingServiceAccount(true);
@@ -544,7 +731,10 @@ export default function App() {
     }
   };
 
-  const executeSheetsAction = async (mode: "full" | "incremental") => {
+  const executeSheetsAction = async (
+    mode: "full" | "incremental",
+    opts?: { webhookUrl?: string | null }
+  ): Promise<boolean> => {
     setSheetsConfirmMode(null);
     const isFull = mode === "full";
     if (isFull) setSheetsExporting(true);
@@ -552,10 +742,13 @@ export default function App() {
     setSheetsFeedback(null);
 
     try {
+      const effectiveWebhookUrl =
+        (opts?.webhookUrl !== undefined ? opts.webhookUrl : webhookUrlInput)?.trim() || undefined;
       const resp = await fetch(isFull ? "/api/atlas/export/sheets" : "/api/atlas/sync/sheets", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          webhookUrl: effectiveWebhookUrl,
           spreadsheetId: targetSpreadsheetId.trim() || undefined,
           createNew: targetSpreadsheetId.trim() === "",
           exportScope: sheetsExportScope,
@@ -631,6 +824,8 @@ export default function App() {
             countsSummary,
           });
         }
+        setAppsScriptModalError(null);
+        return true;
       } else {
         if (data.spreadsheetId) {
           hasInitializedSheetIdRef.current = true;
@@ -645,6 +840,7 @@ export default function App() {
         const needsReauth = Boolean(data.authRequired) || resp.status === 401 || errMsg.includes("401");
         const resolvedFallback =
           fallbackExport ?? (await prepareFallbackSummary(errMsg, sheetsExportScope));
+        setAppsScriptModalError(errMsg);
         setSheetsFeedback({
           success: false,
           message: errMsg,
@@ -657,20 +853,35 @@ export default function App() {
           fallbackExport: resolvedFallback,
           countsSummary,
         });
+        return false;
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       const fallbackExport = await prepareFallbackSummary(msg, sheetsExportScope);
+      setAppsScriptModalError(msg);
       setSheetsFeedback({
         success: false,
         message: msg,
         url: null,
         fallbackExport,
       });
+      return false;
     } finally {
       if (isFull) setSheetsExporting(false);
       else setSheetsSyncing(false);
     }
+  };
+
+  const handleSaveAndSyncWebhook = async (): Promise<boolean> => {
+    const saveRes = await saveWebhookUrlInternal({ skipVerify: true });
+    if (!saveRes.ok || !saveRes.webhookUrl) {
+      return false;
+    }
+    const syncOk = await executeSheetsAction("full", { webhookUrl: saveRes.webhookUrl });
+    if (syncOk) {
+      setAppsScriptModalOpen(false);
+    }
+    return syncOk;
   };
 
   const startSheetsFlow = async (mode: "full" | "incremental") => {
@@ -679,12 +890,17 @@ export default function App() {
     // use non-destructive incremental merge whenever updating an existing spreadsheetId.
     const effectiveMode: "full" | "incremental" =
       mode === "full" && targetSpreadsheetId.trim() !== "" ? "incremental" : mode;
-    const serviceAccountReady = Boolean(
-      status?.sheetsStatus?.configured || status?.credentials.googleSheetsConfigured
+    const syncTargetReady = Boolean(
+      webhookUrlInput.trim() ||
+        status?.sheetsStatus?.webhookUrl ||
+        status?.sheetsStatus?.configured ||
+        status?.credentials.googleSheetsConfigured
     );
-    if (!serviceAccountReady) {
+    if (!syncTargetReady) {
+      setAppsScriptModalError(null);
+      setAppsScriptModalOpen(true);
       const msg =
-        "Google Service Account credentials are not configured yet. Paste your Service Account JSON key in the Setup Panel below (or set GOOGLE_SHEETS_CREDENTIALS_JSON in server config) — no browser OAuth popup needed.";
+        "Paste your Google Apps Script Webhook URL in the Setup modal to export all 6 tabs directly to a public Google Sheet.";
       const fallbackExport = await prepareFallbackSummary(msg, sheetsExportScope);
       setSheetsFeedback({
         success: false,
@@ -696,17 +912,12 @@ export default function App() {
           {
             step: 1,
             key: "auth",
-            label: "Configure Google Service Account",
+            label: "Save Google Apps Script Webhook URL",
             status: "failed",
             detail: msg,
           },
         ],
       });
-      window.setTimeout(() => {
-        document
-          .getElementById("service-account-setup-panel")
-          ?.scrollIntoView({ behavior: "smooth", block: "center" });
-      }, 60);
       return;
     }
     setSheetsConfirmMode(effectiveMode);
@@ -784,7 +995,7 @@ export default function App() {
   const handleRefresh = () => {
     void loadStatus();
     void loadFailures();
-    if (activeSection !== "overview") {
+    if (activeSection !== "overview" && activeSection !== "gmail") {
       void loadDataset(activeSection, datasetWindow);
     }
   };
@@ -863,6 +1074,21 @@ export default function App() {
               onSheetsExportScopeChange={setSheetsExportScope}
               sheetsFeedback={sheetsFeedback}
               savingServiceAccount={savingServiceAccount}
+              webhookUrlInput={webhookUrlInput}
+              onWebhookUrlInputChange={(val) => {
+                hasInitializedWebhookRef.current = true;
+                setWebhookUrlInput(val);
+              }}
+              savingWebhookUrl={savingWebhookUrl}
+              onSaveWebhookUrl={handleSaveWebhookUrl}
+              onSaveAndSyncWebhook={handleSaveAndSyncWebhook}
+              onRemoveWebhookUrl={() => {
+                void handleRemoveWebhookUrl();
+              }}
+              onOpenAppsScriptModal={() => {
+                setAppsScriptModalError(null);
+                setAppsScriptModalOpen(true);
+              }}
               targetSpreadsheetId={targetSpreadsheetId}
               onTargetSpreadsheetIdChange={(val) => {
                 hasInitializedSheetIdRef.current = true;
@@ -896,6 +1122,8 @@ export default function App() {
               onDownloadAllDatasets={() => void handleExportCsv(true)}
               onRetryStatus={loadStatus}
             />
+          ) : activeSection === "gmail" ? (
+            <GmailPanel status={status} />
           ) : (
             <DatasetView
               key={activeSection}
@@ -925,6 +1153,35 @@ export default function App() {
         integrationHealth={status?.integrationHealth ?? null}
         onClose={() => setRunModalOpen(false)}
         onStartRun={handleStartRun}
+      />
+
+      <AppsScriptSetupModal
+        open={appsScriptModalOpen}
+        webhookUrlInput={webhookUrlInput}
+        onWebhookUrlInputChange={(val) => {
+          hasInitializedWebhookRef.current = true;
+          setAppsScriptModalError(null);
+          setWebhookUrlInput(val);
+        }}
+        savedWebhookUrl={status?.sheetsStatus?.webhookUrl}
+        spreadsheetUrl={
+          (sheetsFeedback?.success && sheetsFeedback.url) ||
+          status?.sheetsStatus?.spreadsheetUrl
+        }
+        totalRowsCount={
+          status
+            ? Object.values(status.counts).reduce((sum, n) => sum + n, 0)
+            : 0
+        }
+        savingWebhookUrl={savingWebhookUrl}
+        syncingNow={sheetsExporting || sheetsSyncing}
+        errorMessage={appsScriptModalError}
+        onClose={() => setAppsScriptModalOpen(false)}
+        onSaveOnly={handleSaveWebhookUrl}
+        onSaveAndSyncNow={handleSaveAndSyncWebhook}
+        onRemoveWebhookUrl={() => {
+          void handleRemoveWebhookUrl();
+        }}
       />
 
       <SheetsConfirmModal

@@ -292,11 +292,13 @@ async function startServer(): Promise<void> {
       typeof authHeader === "string" && authHeader.toLowerCase().startsWith("bearer ")
         ? authHeader.slice(7).trim() || null
         : null;
+    const rawWebhookUrl = typeof req.body?.webhookUrl === "string" ? req.body.webhookUrl.trim() : "";
     const rawSheetId = typeof req.body?.spreadsheetId === "string" ? req.body.spreadsheetId.trim() : "";
     const exportScope: "qualified_24h" | "all" =
       req.body?.exportScope === "qualified_24h" ? "qualified_24h" : "all";
     return {
       oauthAccessToken,
+      webhookUrl: rawWebhookUrl || null,
       spreadsheetId: rawSheetId || null,
       createNew: req.body?.createNew === true,
       exportScope,
@@ -379,6 +381,39 @@ async function startServer(): Promise<void> {
     }
   });
 
+  app.post("/api/atlas/sheets/webhook", async (req, res) => {
+    try {
+      const rawUrl = typeof req.body?.webhookUrl === "string" ? req.body.webhookUrl : null;
+      const skipVerify = req.body?.skipVerify === true;
+      const saved = await atlas.saveGoogleAppsScriptWebhook(rawUrl, { skipVerify });
+      res.status(200).json({
+        ...saved,
+        status: atlas.getStatus(),
+      });
+    } catch (err) {
+      res.status(400).json({
+        saved: false,
+        error: redactSecrets(err instanceof Error ? err.message : String(err)),
+      });
+    }
+  });
+
+  app.delete("/api/atlas/sheets/webhook", async (_req, res) => {
+    try {
+      const result = await atlas.saveGoogleAppsScriptWebhook(null);
+      res.status(200).json({
+        removed: true,
+        ...result,
+        status: atlas.getStatus(),
+      });
+    } catch (err) {
+      res.status(500).json({
+        removed: false,
+        error: redactSecrets(err instanceof Error ? err.message : String(err)),
+      });
+    }
+  });
+
   app.delete("/api/atlas/sheets/credentials", async (_req, res) => {
     try {
       const result = await atlas.removeGoogleServiceAccountCredentials();
@@ -449,6 +484,10 @@ async function startServer(): Promise<void> {
         error: err instanceof Error ? err.message : `Failed to export '${safeName}'.`,
       });
     }
+  });
+
+  app.all("/api/*", (_req, res) => {
+    res.status(404).json({ error: "API endpoint not found." });
   });
 
   if (process.env.NODE_ENV !== "production") {

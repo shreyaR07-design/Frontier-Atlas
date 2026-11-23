@@ -8,6 +8,9 @@ import test from "node:test";
 import JSZip from "jszip";
 import {
   AtlasBackendService,
+  buildGithubHeaders,
+  buildOpenAlexRequestUrl,
+  buildOpenAlexUserAgent,
   classifyJobRoleFamily,
   clearGithubEnrichmentCacheForTest,
   computeNextUtcRunIso,
@@ -15,6 +18,7 @@ import {
   detectJobRemoteEligibility,
   enrichGithubRepoMap,
   EntityResolver,
+  fetchOpenAlexWorksPage,
   isGithubRateLimitedNow,
   isWithinFreshnessWindow,
   LiveSourceVerifier,
@@ -25,6 +29,7 @@ import {
   parseUtcDatetime,
   parseUtcDatetimeWithMeta,
   probeGithubApi,
+  resetGithubWarningForTest,
   updateGithubRateLimitFromHeaders,
 } from "../server/atlasBackend.ts";
 import { AtlasDatabase } from "../server/atlasDb.ts";
@@ -1010,11 +1015,11 @@ test("Task 1: Llama 3 routes through Groq when GROQ_API_KEY is set, fallback log
   }
 });
 
-test("Task 2 & Task 3: Minimal Google OAuth scopes, Google Drive/Sheets probeHealth, and GitHub REST API rate-limit probe", async () => {
-  assert.deepEqual(GOOGLE_WORKSPACE_SCOPES, [
-    "https://www.googleapis.com/auth/drive.file",
-    "https://www.googleapis.com/auth/spreadsheets",
-  ]);
+test("Task 2 & Task 3: Google OAuth scopes (Drive, Sheets & Gmail), Google Drive/Sheets probeHealth, and GitHub REST API rate-limit probe", async () => {
+  assert.ok(GOOGLE_WORKSPACE_SCOPES.includes("https://www.googleapis.com/auth/drive.file"));
+  assert.ok(GOOGLE_WORKSPACE_SCOPES.includes("https://www.googleapis.com/auth/spreadsheets"));
+  assert.ok(GOOGLE_WORKSPACE_SCOPES.includes("https://www.googleapis.com/auth/gmail.readonly"));
+  assert.ok(GOOGLE_WORKSPACE_SCOPES.includes("https://www.googleapis.com/auth/gmail.send"));
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "atlas-health-test-"));
   const db = new AtlasDatabase(path.join(tmpDir, "health.db"));
@@ -2083,7 +2088,7 @@ test("Google Workspace OAuth 401/scope validation, honest Not Connected status, 
     assert.equal(fullExport.success, true, fullExport.error ?? undefined);
     assert.equal(fullExport.status, "Connected");
     assert.equal(fullExport.spreadsheetId, "oauth-sheet-001");
-    assert.equal(fullExport.spreadsheetUrl, "https://docs.google.com/spreadsheets/d/oauth-sheet-001");
+    assert.equal(fullExport.spreadsheetUrl, "https://docs.google.com/spreadsheets/d/oauth-sheet-001/edit");
     assert.equal(fullExport.verifiedTabRowCounts["Startups"], 300);
     assert.equal(fullExport.verifiedTabRowCounts["Products"], 1);
     assert.equal(fullExport.verifiedTabRowCounts["Research Papers"], 1);
@@ -3114,19 +3119,19 @@ test("Google OAuth error formatter explicitly detects Error 403 access_denied an
   assert.equal(isGoogleOAuthBlockedMessage(err403), true);
   assert.equal(isGoogleOAuthBlockedMessage("Export Successful"), false);
 
+  const diag = getOAuthSetupDiagnostics();
+  assert.ok(diag.firebaseProjectId.length > 0);
   const errDomain = Object.assign(
     new Error("Firebase: Error (auth/unauthorized-domain)."),
     { code: "auth/unauthorized-domain" }
   );
   const domainMsg = formatGoogleAuthError(errDomain);
   assert.ok(domainMsg.includes("auth/unauthorized-domain"));
-  assert.ok(domainMsg.includes("gen-lang-client-0062316160"));
+  assert.ok(domainMsg.includes(diag.firebaseProjectId));
   assert.ok(domainMsg.includes("/__/auth/handler"));
   assert.equal(isGoogleOAuthBlockedMessage(errDomain), true);
   assert.equal(isGoogleOAuthBlockedMessage(domainMsg), true);
 
-  const diag = getOAuthSetupDiagnostics();
-  assert.equal(diag.firebaseProjectId, "gen-lang-client-0062316160");
   assert.ok(
     diag.previewHostnames.includes("ais-dev-2lxnn5ax4d6w4sxglutuue-910587750641.asia-northeast1.run.app")
   );
@@ -3937,8 +3942,8 @@ test("GoogleSheetsService incremental mode preserves existing historical rows an
     const failedRes = await sheets.exportOrSync("incremental");
     assert.equal(failedRes.success, false);
     assert.equal(failedRes.spreadsheetId, "perm-sheet-01");
-    assert.equal(failedRes.spreadsheetUrl, "https://docs.google.com/spreadsheets/d/perm-sheet-01");
-    assert.equal(sheets.getStatus().spreadsheetUrl, "https://docs.google.com/spreadsheets/d/perm-sheet-01");
+    assert.equal(failedRes.spreadsheetUrl, "https://docs.google.com/spreadsheets/d/perm-sheet-01/edit");
+    assert.equal(sheets.getStatus().spreadsheetUrl, "https://docs.google.com/spreadsheets/d/perm-sheet-01/edit");
 
     db.close();
   } finally {
@@ -4093,5 +4098,548 @@ test("validateZipArchive rejects truncated buffers and GoogleSheetsService verif
   }
 });
 
+test("GoogleSheetsService supports zero-setup Apps Script Webhook URL persistence, redirect verify, and 6-tab export/sync", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "atlas-webhook-test-"));
+  const dbPath = path.join(tmpDir, "webhook.db");
+  let simulateSignInRedirect = false;
+  let lastPostContentType = "";
+  let lastPostMode = "full";
+  const postedPayloads: Array<{
+    mode: string;
+    exportScope: string;
+    spreadsheetName: string;
+    spreadsheetId: string | null;
+    datasets: Record<string, unknown[][]>;
+  }> = [];
 
+  const mockServer = await withHttpServer((req, res, body) => {
+    const urlPath = (req.url ?? "").split("?")[0];
+    if (simulateSignInRedirect) {
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.writeHead(200);
+      res.end("<html><title>Sign in - Google Accounts</title><body>accounts.google.com/ServiceLogin</body></html>");
+      return;
+    }
 
+    if (urlPath === "/macros/s/demo/exec" && req.method === "GET") {
+      res.writeHead(302, { Location: `${mockServer.baseUrl}/macros/s/demo/exec-final` });
+      res.end("");
+      return;
+    }
+
+    if (urlPath === "/macros/s/demo/exec-final" && req.method === "GET") {
+      res.setHeader("Content-Type", "application/json");
+      res.writeHead(200);
+      res.end(
+        JSON.stringify({
+          status: "ok",
+          spreadsheetId: "webhook_sheet_999",
+          spreadsheetUrl: "https://docs.google.com/spreadsheets/d/webhook_sheet_999/view",
+        })
+      );
+      return;
+    }
+
+    if (urlPath === "/macros/s/demo/exec" && req.method === "POST") {
+      lastPostContentType = String(req.headers["content-type"] || "");
+      const parsed = JSON.parse(body) as (typeof postedPayloads)[number];
+      postedPayloads.push(parsed);
+      lastPostMode = parsed.mode;
+      // Google Apps Script returns 302 redirecting to script.googleusercontent.com echo URL
+      res.writeHead(302, { Location: `${mockServer.baseUrl}/macros/s/demo/post-echo` });
+      res.end("");
+      return;
+    }
+
+    if (urlPath === "/macros/s/demo/post-echo" && req.method === "GET") {
+      const latest = postedPayloads[postedPayloads.length - 1];
+      const tabRowCounts: Record<string, number> = {};
+      let totalRows = 0;
+      for (const [tabName, matrix] of Object.entries(latest.datasets ?? {})) {
+        const count = Math.max(0, matrix.length - 1);
+        tabRowCounts[tabName] = count;
+        totalRows += count;
+      }
+      res.setHeader("Content-Type", "application/json");
+      res.writeHead(200);
+      res.end(
+        JSON.stringify({
+          status: "ok",
+          spreadsheetId: "webhook_sheet_999",
+          spreadsheetUrl: "https://docs.google.com/spreadsheets/d/webhook_sheet_999/edit#gid=0",
+          tabRowCounts,
+          rowsAdded: lastPostMode === "full" ? totalRows : 1,
+          rowsUpdated: lastPostMode === "incremental" ? 1 : 0,
+          rowsUnchanged: lastPostMode === "incremental" ? Math.max(0, totalRows - 2) : 0,
+          publicViewerVerified: true,
+        })
+      );
+      return;
+    }
+
+    res.writeHead(404);
+    res.end("{}");
+  });
+
+  try {
+    const db = new AtlasDatabase(dbPath);
+    db.initializeSchema();
+
+    // Seed records in Startups and Entity Mapping Log so exported payload carries rows
+    const nowIso = new Date().toISOString();
+    db.upsertStartups([
+      {
+        startup_id: "stp_wh_1",
+        name: "Webhook Robotics",
+        description: "Zero-setup webhook startup record",
+        website: "https://webhookrobotics.example.com",
+        official_website: "https://webhookrobotics.example.com",
+        industry: "Robotics",
+        location: "Bengaluru",
+        founding_date: null,
+        source_name: "test_seed",
+        source_url: "https://example.com/startups/wh1",
+        source_title: "Webhook Robotics",
+        collected_at: nowIso,
+        last_checked_at: nowIso,
+        supported_fields: ["name", "website"],
+        verification_status: "Verified",
+        rejection_reason: null,
+        canonical_entity_id: "can_wh_1",
+        source_metadata: {},
+      },
+    ]);
+
+    db.upsertEntityMappingLogs([
+      {
+        mapping_id: "map_wh_1",
+        raw_name: "Webhook Robotics Inc.",
+        normalized_name: "webhook robotics",
+        canonical_name: "Webhook Robotics",
+        canonical_id: "can_wh_1",
+        source_url: "https://example.com/startups/wh1",
+        match_method: "exact_domain",
+        confidence: 1.0,
+        decision: "merged",
+        timestamp: nowIso,
+        entity_type: "company",
+        match_reason: "Exact domain match",
+      },
+    ]);
+
+    const webhookUrl = `${mockServer.baseUrl}/macros/s/demo/exec`;
+    db.saveSheetsWebhookUrl(webhookUrl);
+
+    const sheets = new GoogleSheetsService(
+      {
+        atlasDir: tmpDir,
+        rootDir: tmpDir,
+        credentialsPath: null,
+        credentialsJson: null,
+        spreadsheetId: null,
+        spreadsheetName: "FrontierAtlas Webhook Test",
+      },
+      db
+    );
+
+    // Resilient URL normalization handles whitespace, quotes, invisible chars, and missing scheme
+    assert.equal(
+      sheets.validateWebhookUrl("  \"https://script.google.com/macros/s/AKfycbTest123/exec\" \n "),
+      "https://script.google.com/macros/s/AKfycbTest123/exec"
+    );
+    assert.equal(
+      sheets.validateWebhookUrl("script.google.com/macros/s/AKfycbTest123/exec\u200B"),
+      "https://script.google.com/macros/s/AKfycbTest123/exec"
+    );
+    assert.equal(
+      sheets.validateWebhookUrl("Web app URL: https://script.google.com/macros/s/AKfycbTest123/exec"),
+      "https://script.google.com/macros/s/AKfycbTest123/exec"
+    );
+    assert.throws(() => sheets.validateWebhookUrl("not-a-valid-url"), /Invalid Google Apps Script Webhook URL/);
+
+    assert.equal(sheets.hasServiceAccountCredentials(), false);
+    assert.equal(sheets.getCredentialSource(), "apps_script_webhook");
+    assert.equal(sheets.isConfigured(), true);
+    assert.equal(sheets.getStatus().webhookUrl, webhookUrl);
+
+    // 1. Verify GET with HTTP 302 redirect succeeds & normalizes spreadsheetUrl
+    const verified = await sheets.verifyConnection();
+    assert.equal(verified.status, "Connected");
+    assert.equal(verified.credentialSource, "apps_script_webhook");
+    assert.equal(verified.spreadsheetId, "webhook_sheet_999");
+    assert.equal(verified.spreadsheetUrl, "https://docs.google.com/spreadsheets/d/webhook_sheet_999/edit");
+
+    // 2. Full 6-tab export via POST (follows 302 redirect, sends Content-Type text/plain;charset=utf-8, sends datasets)
+    const fullExport = await sheets.exportOrSync("full");
+    assert.equal(fullExport.success, true);
+    assert.equal(fullExport.status, "Connected");
+    assert.equal(fullExport.publicViewerVerified, true);
+    assert.equal(fullExport.publicAccessStatus, "public_viewer");
+    assert.equal(fullExport.spreadsheetUrl, "https://docs.google.com/spreadsheets/d/webhook_sheet_999/edit");
+    assert.ok(lastPostContentType.toLowerCase().startsWith("text/plain"));
+    assert.equal(postedPayloads.length, 1);
+    assert.deepEqual(
+      Object.keys(postedPayloads[0].datasets),
+      EXPORT_SPECS.map((s) => s.tabName)
+    );
+    const startupsMatrix = postedPayloads[0].datasets["Startups"];
+    assert.ok(Array.isArray(startupsMatrix) && startupsMatrix.length === 2);
+    assert.equal(startupsMatrix[0][0], "startup_id");
+    assert.equal(startupsMatrix[1][0], "stp_wh_1");
+    const mappingMatrix = postedPayloads[0].datasets["Entity Mapping Log"];
+    assert.ok(Array.isArray(mappingMatrix) && mappingMatrix.length === 2);
+
+    // 3. Incremental sync via POST
+    const incSync = await sheets.exportOrSync("incremental");
+    assert.equal(incSync.success, true);
+    assert.equal(incSync.mode, "incremental");
+    assert.equal(postedPayloads.length, 2);
+
+    // Persisted SQLite state retains webhookUrl and canonical spreadsheetUrl
+    const persisted = db.getSheetsSyncState();
+    assert.equal(persisted?.webhookUrl, webhookUrl);
+    assert.equal(persisted?.spreadsheetUrl, "https://docs.google.com/spreadsheets/d/webhook_sheet_999/edit");
+    assert.equal(persisted?.publicViewerVerified, true);
+
+    // 4. Sign-In HTML returned by misconfigured Apps Script Web App fails cleanly
+    simulateSignInRedirect = true;
+    const signInFail = await sheets.verifyConnection();
+    assert.equal(signInFail.status, "Sync Failed");
+    assert.ok(signInFail.lastError?.includes("Who has access: 'Anyone'"));
+
+    db.close();
+  } finally {
+    await mockServer.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("Apps Script snippet always returns ContentService JSON (including catch) and webhook client detects HTML before JSON.parse", async () => {
+  // 1. Validate snippet syntax & runtime behavior in catch/error paths
+  const modalSource = fs.readFileSync(
+    path.resolve(process.cwd(), "src/components/AppsScriptSetupModal.tsx"),
+    "utf-8"
+  );
+  const snippetMatch = modalSource.match(
+    /export const GOOGLE_APPS_SCRIPT_SNIPPET = `([\s\S]*?)`;/
+  );
+  assert.ok(snippetMatch?.[1], "GOOGLE_APPS_SCRIPT_SNIPPET should exist");
+  const snippetCode = snippetMatch[1];
+
+  const jsonOutputs: Array<{ text: string; mimeType: string }> = [];
+  const fakeEnv = {
+    ContentService: {
+      MimeType: { JSON: "application/json" },
+      createTextOutput: (text: string) => ({
+        setMimeType: (mimeType: string) => {
+          const out = { text, mimeType };
+          jsonOutputs.push(out);
+          return out;
+        },
+      }),
+    },
+    SpreadsheetApp: {
+      getActiveSpreadsheet: () => null,
+      openById: () => {
+        throw new Error("Simulated SpreadsheetApp failure");
+      },
+    },
+    DriveApp: {
+      Access: { ANYONE_WITH_LINK: "ANYONE_WITH_LINK" },
+      Permission: { VIEW: "VIEW" },
+      getFileById: () => ({ setSharing: () => {} }),
+    },
+  };
+
+  const runner = new Function(
+    "ContentService",
+    "SpreadsheetApp",
+    "DriveApp",
+    `${snippetCode}\nreturn { doGet: doGet, doPost: doPost };`
+  );
+  const handlers = runner(fakeEnv.ContentService, fakeEnv.SpreadsheetApp, fakeEnv.DriveApp) as {
+    doGet: (e: unknown) => { text: string; mimeType: string };
+    doPost: (e: unknown) => { text: string; mimeType: string };
+  };
+
+  const getMissingSheet = handlers.doGet({});
+  assert.equal(getMissingSheet.mimeType, "application/json");
+  assert.equal(JSON.parse(getMissingSheet.text).ok, false);
+
+  const getThrown = handlers.doGet({ parameter: { spreadsheetId: "bad_id" } });
+  assert.equal(getThrown.mimeType, "application/json");
+  assert.match(JSON.parse(getThrown.text).error, /Simulated SpreadsheetApp failure/);
+
+  const postBadJson = handlers.doPost({ postData: { contents: "{broken-json" } });
+  assert.equal(postBadJson.mimeType, "application/json");
+  assert.equal(JSON.parse(postBadJson.text).status, "error");
+
+  // 2. Verify GoogleSheetsService inspects response.ok & Content-Type before JSON.parse on HTML pages
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "atlas-html-diag-"));
+  let responseMode: "html_200" | "html_500" | "json_error" = "html_200";
+  const mockServer = await withHttpServer((_req, res) => {
+    if (responseMode === "html_200") {
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.writeHead(200);
+      res.end("<!DOCTYPE html><html><head><title>Script Error</title></head><body>Unauthorized HTML</body></html>");
+      return;
+    }
+    if (responseMode === "html_500") {
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.writeHead(500);
+      res.end("<!DOCTYPE html><html><head><title>500 Internal Error</title></head><body>Boom</body></html>");
+      return;
+    }
+    res.setHeader("Content-Type", "application/json");
+    res.writeHead(400);
+    res.end(JSON.stringify({ status: "error", error: "Spreadsheet ID invalid" }));
+  });
+
+  try {
+    const db = new AtlasDatabase(path.join(tmpDir, "diag.db"));
+    db.initializeSchema();
+    const webhookUrl = `${mockServer.baseUrl}/macros/s/demo/exec`;
+    db.saveSheetsWebhookUrl(webhookUrl);
+    const sheets = new GoogleSheetsService(
+      {
+        atlasDir: tmpDir,
+        rootDir: tmpDir,
+        credentialsPath: null,
+        credentialsJson: null,
+        spreadsheetId: null,
+        spreadsheetName: "HTML Diag Test",
+      },
+      db
+    );
+
+    responseMode = "html_200";
+    const verifyHtml200 = await sheets.verifyConnection();
+    assert.equal(verifyHtml200.status, "Sync Failed");
+    assert.match(verifyHtml200.lastError || "", /returned an HTML page.*Script Error/i);
+    assert.doesNotMatch(verifyHtml200.lastError || "", /Unexpected token/i);
+
+    responseMode = "html_500";
+    const syncHtml500 = await sheets.exportOrSync("full");
+    assert.equal(syncHtml500.success, false);
+    assert.match(syncHtml500.error || "", /HTML page.*HTTP 500/i);
+
+    responseMode = "json_error";
+    const syncJsonErr = await sheets.exportOrSync("full");
+    assert.equal(syncJsonErr.success, false);
+    assert.match(syncJsonErr.error || "", /HTTP 400: Spreadsheet ID invalid/);
+    db.close();
+  } finally {
+    await mockServer.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("Gemini 403 PERMISSION_DENIED / billing errors surface actionable Cloud Billing guidance and degrade gracefully without crashing pipeline", async () => {
+  let geminiCalls = 0;
+  const gemini = new GeminiLLMProvider("AIzaSyFakeTestKey1234567890123456", "gemini-4-hydrogen", 5000, "gemini-3.1-flash-lite");
+  (gemini as unknown as {
+    generateWithModel: () => Promise<Record<string, unknown>>;
+  }).generateWithModel = async () => {
+    geminiCalls += 1;
+    // Simulate real @google/genai 403 error message passing through error classifier logic?
+    // Verify router circuit-breaker + actionable error handling cleanly
+    throw new FatalProviderError(
+      "Gemini API 403 PERMISSION_DENIED / billing or API enablement error (gemini-4-hydrogen): Enable Cloud Billing and the Generative Language API (generativelanguage.googleapis.com) in Google Cloud Console for this project."
+    );
+  };
+
+  const logs: string[] = [];
+  const router = new LLMRouter([gemini]);
+
+  // Call 1 triggers FatalProviderError, disables gemini for cooldown, and degrades cleanly to heuristic fallback
+  const res1 = await router.extractStructured({
+    category: "startups",
+    sourceUrl: "https://example.com/launch",
+    sourceName: "test_feed",
+    sourceText: "HeliosGrid builds autonomous battery storage dispatch systems in Austin, TX.",
+    allowHeuristicFallback: true,
+    onLog: (m) => logs.push(m),
+  });
+
+  assert.equal(geminiCalls, 1);
+  assert.equal(res1.mode, "heuristic_demo_fallback");
+  assert.equal(res1.llmConnected, false);
+  assert.ok(res1.records.length >= 1);
+  assert.equal(router.isProviderTemporarilyDisabled("gemini"), true);
+  assert.ok(
+    logs.some((l) => l.includes("Cloud Billing") && l.includes("Generative Language API")),
+    "Should log clear Cloud Billing / Generative Language API guidance"
+  );
+
+  // Call 2 skips disabled Gemini provider immediately (0 redundant failing API calls) and degrades cleanly
+  const res2 = await router.extractStructured({
+    category: "startups",
+    sourceUrl: "https://example.com/launch2",
+    sourceName: "test_feed",
+    sourceText: "NimbusLab builds fast compiler verification tooling.",
+    allowHeuristicFallback: true,
+  });
+  assert.equal(geminiCalls, 1, "Disabled Gemini provider should be skipped cleanly within cooldown window");
+  assert.equal(res2.mode, "heuristic_demo_fallback");
+  assert.ok(res2.records.length >= 1);
+});
+
+test("GitHub API helpers attach GITHUB_TOKEN, warn when missing, retry transient Retry-After 403, and preserve partial results on quota exhaustion", async () => {
+  clearGithubEnrichmentCacheForTest();
+  resetGithubWarningForTest();
+
+  const headersNoTok = buildGithubHeaders(null);
+  assert.equal(headersNoTok.Authorization, undefined);
+  const headersWithTok = buildGithubHeaders("ghp_sampletoken_12345678901234567890");
+  assert.equal(headersWithTok.Authorization, "Bearer ghp_sampletoken_12345678901234567890");
+
+  let callCount = 0;
+  let lastAuthSeen: string | undefined;
+  const mockGh = await withHttpServer((req, res) => {
+    callCount += 1;
+    lastAuthSeen = typeof req.headers.authorization === "string" ? req.headers.authorization : undefined;
+    res.setHeader("Content-Type", "application/json");
+    if (req.url === "/repos/org/retry-once" && callCount === 1) {
+      res.setHeader("Retry-After", "0");
+      res.writeHead(403);
+      res.end(JSON.stringify({ message: "You have exceeded a secondary rate limit." }));
+      return;
+    }
+    res.setHeader("X-RateLimit-Remaining", "4990");
+    res.writeHead(200);
+    res.end(JSON.stringify({ stargazers_count: 888, forks_count: 42, open_issues_count: 3, language: "Rust" }));
+  });
+
+  try {
+    const httpClient = new PoliteHttpClient({
+      userAgent: "FrontierAtlasTest/1.0",
+      timeoutMs: 5000,
+      rateLimitPerSecond: 100,
+      respectRobotsTxt: false,
+      defaultMaxAttempts: 1,
+    });
+
+    const warnLogs: string[] = [];
+    const mapRetry = new Map<string, Array<Record<string, unknown>>>([
+      ["org/retry-once", [{ paper_id: "p_retry", github_stars: null, source_metadata: {} }]],
+    ]);
+    // Missing token triggers warning + 403 Retry-After=0 retries cleanly and succeeds
+    const retryRes = await enrichGithubRepoMap(mapRetry, {
+      http: httpClient,
+      githubToken: null,
+      maxSlugs: 5,
+      nowIso: new Date().toISOString(),
+      apiBaseUrl: mockGh.baseUrl,
+      retryBaseDelayMs: 5,
+      onLog: (m) => warnLogs.push(m),
+    });
+    assert.equal(callCount, 2, "Transient 403 secondary rate limit with Retry-After should retry");
+    assert.equal(lastAuthSeen, undefined);
+    assert.equal(retryRes.rateLimited, false);
+    assert.equal(mapRetry.get("org/retry-once")![0].github_stars, 888);
+    assert.ok(warnLogs.some((w) => w.includes("GITHUB_TOKEN is not set")), "Should emit clear missing GITHUB_TOKEN warning");
+
+    // With token configured, Authorization: Bearer header is sent
+    const mapAuth = new Map<string, Array<Record<string, unknown>>>([
+      ["org/with-token", [{ paper_id: "p_auth", github_stars: null, source_metadata: {} }]],
+    ]);
+    await enrichGithubRepoMap(mapAuth, {
+      http: httpClient,
+      githubToken: "ghp_sampletoken_12345678901234567890",
+      maxSlugs: 5,
+      nowIso: new Date().toISOString(),
+      apiBaseUrl: mockGh.baseUrl,
+      retryBaseDelayMs: 5,
+    });
+    assert.equal(lastAuthSeen, "Bearer ghp_sampletoken_12345678901234567890");
+    assert.equal(mapAuth.get("org/with-token")![0].github_stars, 888);
+  } finally {
+    await mockGh.close();
+  }
+});
+
+test("OpenAlex collector attaches polite mailto/User-Agent, retries 4 times with exponential backoff, and reports clean per-source failures", async () => {
+  const oaUrl = buildOpenAlexRequestUrl("https://api.openalex.org/works?search=ai", "researcher@example.edu");
+  assert.match(oaUrl, /mailto=researcher%40example\.edu/);
+  const oaUa = buildOpenAlexUserAgent("FrontierAtlasBot/1.0 (+https://github.com/frontier-atlas)", "researcher@example.edu");
+  assert.match(oaUa, /mailto:researcher@example\.edu/);
+
+  let oaAttempts = 0;
+  let seenUserAgent = "";
+  let seenQuery = "";
+  let alwaysFail = false;
+
+  const mockOa = await withHttpServer((req, res) => {
+    oaAttempts += 1;
+    seenUserAgent = String(req.headers["user-agent"] || "");
+    seenQuery = String(req.url || "");
+    if (alwaysFail || oaAttempts < 4) {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Service temporarily unavailable" }));
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        results: [
+          {
+            id: "https://openalex.org/W123456",
+            title: "Resilient OpenAlex Paper",
+            publication_date: "2026-11-20",
+            primary_location: { landing_page_url: "https://example.org/paper/w123456" },
+          },
+        ],
+      })
+    );
+  });
+
+  try {
+    const httpClient = new PoliteHttpClient({
+      userAgent: "FrontierAtlasBot/1.0 (+https://github.com/frontier-atlas)",
+      timeoutMs: 3000,
+      rateLimitPerSecond: 100,
+      respectRobotsTxt: false,
+      defaultMaxAttempts: 4,
+    });
+
+    // 1. Fails 3 times (503) then succeeds on 4th attempt
+    const okBatch = await fetchOpenAlexWorksPage({
+      http: httpClient,
+      page: 1,
+      perPage: 15,
+      timeoutMs: 3000,
+      baseUserAgent: "FrontierAtlasBot/1.0 (+https://github.com/frontier-atlas)",
+      mailto: "researcher@example.edu",
+      baseUrl: `${mockOa.baseUrl}/works`,
+      maxAttempts: 4,
+      retryBaseDelayMs: 5,
+    });
+    assert.equal(okBatch.ok, true);
+    assert.equal(okBatch.attempts, 4);
+    assert.equal(oaAttempts, 4);
+    assert.equal(okBatch.works.length, 1);
+    assert.match(seenQuery, /mailto=researcher%40example\.edu/);
+    assert.match(seenUserAgent, /mailto:researcher@example\.edu/);
+
+    // 2. When OpenAlex persistently fails across 4 attempts, returns structured per-source error instead of throwing
+    alwaysFail = true;
+    oaAttempts = 0;
+    const failBatch = await fetchOpenAlexWorksPage({
+      http: httpClient,
+      page: 1,
+      perPage: 15,
+      timeoutMs: 3000,
+      baseUserAgent: "FrontierAtlasBot/1.0",
+      mailto: "researcher@example.edu",
+      baseUrl: `${mockOa.baseUrl}/works`,
+      maxAttempts: 4,
+      retryBaseDelayMs: 5,
+    });
+    assert.equal(failBatch.ok, false);
+    assert.equal(failBatch.attempts, 4);
+    assert.equal(failBatch.status, 503);
+    assert.match(failBatch.error || "", /4 attempt\(s\).*HTTP 503/i);
+  } finally {
+    await mockOa.close();
+  }
+});

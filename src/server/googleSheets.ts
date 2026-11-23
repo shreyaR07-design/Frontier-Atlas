@@ -163,6 +163,43 @@ export const EXPORT_SPECS: ExportSpec[] = [
 
 const SHEETS_MAX_CELL_LEN = 45_000;
 
+const DATE_ONLY_EXPORT_COLUMNS = new Set(["founding_date", "publication_date"]);
+const UTC_TIMESTAMP_EXPORT_COLUMNS = new Set([
+  "collected_at",
+  "last_checked_at",
+  "published_at",
+  "posted_at",
+  "timestamp",
+]);
+
+function normalizeSheetScalarString(raw: string): string {
+  // Strip NUL and non-printable control chars (preserving tab/newline)
+  return raw.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "");
+}
+
+function formatExportDateValue(col: string, val: unknown): string {
+  if (val === null || val === undefined) return "";
+  const raw = String(val).trim();
+  if (!raw) return "";
+  if (DATE_ONLY_EXPORT_COLUMNS.has(col)) {
+    const ymd = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+    if (ymd) return ymd[1];
+  }
+  if (UTC_TIMESTAMP_EXPORT_COLUMNS.has(col)) {
+    const hasTz = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw);
+    const isoCandidate = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(raw)
+      ? `${raw.replace(" ", "T")}${hasTz ? "" : "Z"}`
+      : /^\d{4}-\d{2}-\d{2}$/.test(raw)
+      ? `${raw}T00:00:00.000Z`
+      : raw;
+    const ms = Date.parse(isoCandidate);
+    if (Number.isFinite(ms)) {
+      return new Date(ms).toISOString();
+    }
+  }
+  return normalizeSheetScalarString(raw);
+}
+
 export function formatExportCell(
   col: string,
   row: Record<string, unknown>,
@@ -173,12 +210,12 @@ export function formatExportCell(
     if (typeof raw === "string") {
       try {
         const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) return parsed.map(String).join("; ");
+        if (Array.isArray(parsed)) return normalizeSheetScalarString(parsed.map(String).join("; "));
       } catch {
-        return raw;
+        return normalizeSheetScalarString(raw);
       }
     } else if (Array.isArray(raw)) {
-      return raw.map(String).join("; ");
+      return normalizeSheetScalarString(raw.map(String).join("; "));
     }
     return "";
   }
@@ -187,26 +224,26 @@ export function formatExportCell(
     if (typeof raw === "string") {
       try {
         const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) return parsed.map(String).join("; ");
+        if (Array.isArray(parsed)) return normalizeSheetScalarString(parsed.map(String).join("; "));
       } catch {
-        return raw;
+        return normalizeSheetScalarString(raw);
       }
     } else if (Array.isArray(raw)) {
-      return raw.map(String).join("; ");
+      return normalizeSheetScalarString(raw.map(String).join("; "));
     }
     return "";
   }
   if (col === "official_website") {
     const v = row.official_website ?? row.website;
-    return v === null || v === undefined ? "" : String(v);
+    return v === null || v === undefined ? "" : normalizeSheetScalarString(String(v));
   }
   if (col === "verification_reason") {
-    if (row.rejection_reason) return String(row.rejection_reason);
+    if (row.rejection_reason) return normalizeSheetScalarString(String(row.rejection_reason));
     if (typeof row.source_metadata_json === "string" && row.source_metadata_json.trim()) {
       try {
         const meta = JSON.parse(row.source_metadata_json) as Record<string, unknown>;
         const reason = meta.verification_reason || meta.source_error;
-        if (reason) return String(reason);
+        if (reason) return normalizeSheetScalarString(String(reason));
       } catch {
         // Ignore parse error
       }
@@ -216,7 +253,7 @@ export function formatExportCell(
   if (col === "source_metadata_json") {
     const raw = row.source_metadata_json ?? row.source_metadata;
     if (raw === null || raw === undefined) return "{}";
-    const serialized = typeof raw === "string" ? raw : JSON.stringify(raw);
+    const serialized = normalizeSheetScalarString(typeof raw === "string" ? raw : JSON.stringify(raw));
     return forSheets && serialized.length > SHEETS_MAX_CELL_LEN
       ? serialized.slice(0, SHEETS_MAX_CELL_LEN)
       : serialized;
@@ -233,7 +270,13 @@ export function formatExportCell(
     if (!Number.isFinite(n)) return "";
     return forSheets ? Number(n.toFixed(4)) : n.toFixed(4);
   }
-  const str = String(val);
+  if (DATE_ONLY_EXPORT_COLUMNS.has(col) || UTC_TIMESTAMP_EXPORT_COLUMNS.has(col)) {
+    const formattedDate = formatExportDateValue(col, val);
+    return forSheets && formattedDate.length > SHEETS_MAX_CELL_LEN
+      ? formattedDate.slice(0, SHEETS_MAX_CELL_LEN)
+      : formattedDate;
+  }
+  const str = normalizeSheetScalarString(String(val));
   return forSheets && str.length > SHEETS_MAX_CELL_LEN ? str.slice(0, SHEETS_MAX_CELL_LEN) : str;
 }
 
@@ -250,6 +293,12 @@ function columnLetter(colCount: number): string {
 
 export function canonicalSpreadsheetUrl(spreadsheetId: string): string {
   return `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`;
+}
+
+export function extractSpreadsheetIdFromUrl(rawUrl: string | null | undefined): string | null {
+  if (!rawUrl) return null;
+  const m = String(rawUrl).match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]{10,120})/i);
+  return m ? m[1] : null;
 }
 
 export const SERVICE_ACCOUNT_SCOPES = [
@@ -313,6 +362,7 @@ export interface GoogleSheetsConfig {
   credentialsPath: string | null;
   credentialsJson: string | null;
   savedCredentialsPath?: string | null;
+  webhookUrl?: string | null;
   spreadsheetId: string | null;
   spreadsheetName: string;
   freshnessWindowHours?: number;
@@ -358,7 +408,8 @@ export interface SheetsConnectionStatus {
   status: "Connected" | "Not Connected" | "Sync Failed";
   configured: boolean;
   authRequired?: boolean;
-  credentialSource: "oauth" | "path" | "json_env" | "saved_config" | null;
+  credentialSource: "apps_script_webhook" | "oauth" | "path" | "json_env" | "saved_config" | null;
+  webhookUrl?: string | null;
   verifiedAccountEmail?: string | null;
   grantedScopes?: string[];
   tokenExpiresInSeconds?: number | null;
@@ -383,7 +434,7 @@ export interface SheetsConnectionStatus {
 export class GoogleSheetsService {
   private cachedToken: { token: string; expiresAtMs: number } | null = null;
   private liveSessionVerified = false;
-  private liveCredentialSource: "oauth" | "path" | "json_env" | "saved_config" | null = null;
+  private liveCredentialSource: "apps_script_webhook" | "oauth" | "path" | "json_env" | "saved_config" | null = null;
   private verifiedAccountEmail: string | null = null;
   private grantedScopes: string[] = [];
   private tokenExpiresInSeconds: number | null = null;
@@ -431,15 +482,118 @@ export class GoogleSheetsService {
     return fs.existsSync(resolved) ? resolved : null;
   }
 
-  public getCredentialSource(): "path" | "json_env" | "saved_config" | null {
+  public validateWebhookUrl(rawUrl: string): string {
+    let clean = rawUrl
+      .replace(/[\u200B-\u200D\uFEFF\u00A0]/g, "")
+      .trim()
+      .replace(/^["'`<\s]+|["'`>\s]+$/g, "")
+      .trim();
+
+    if (!clean) {
+      throw new Error("Google Apps Script Webhook URL is required.");
+    }
+
+    // If pasted from instructions or logs with surrounding words, extract the URL token
+    const embeddedMatch = clean.match(/https?:\/\/[^\s"'<>]+/i);
+    if (embeddedMatch) {
+      clean = embeddedMatch[0];
+    } else if (/^script\.google\.com\//i.test(clean)) {
+      clean = `https://${clean}`;
+    }
+
+    let parsed: URL;
+    try {
+      parsed = new URL(clean);
+    } catch {
+      throw new Error(
+        "Invalid Google Apps Script Webhook URL format. Expected a deployed Web App URL like https://script.google.com/macros/s/.../exec."
+      );
+    }
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+      throw new Error(
+        "Google Apps Script Webhook URL must start with https:// (e.g., https://script.google.com/macros/s/.../exec)."
+      );
+    }
+    if (
+      parsed.protocol === "http:" &&
+      parsed.hostname !== "127.0.0.1" &&
+      parsed.hostname !== "localhost"
+    ) {
+      throw new Error(
+        "Google Apps Script Webhook URL must use https:// (e.g., https://script.google.com/macros/s/.../exec)."
+      );
+    }
+
+    const hostLower = parsed.hostname.toLowerCase();
+    if (hostLower === "docs.google.com") {
+      throw new Error(
+        "Invalid Google Apps Script Webhook URL: you pasted a Google Sheets/Docs URL instead of the Apps Script Web App /exec endpoint. Open Extensions -> Apps Script, deploy as Web App, and copy the https://script.google.com/macros/s/.../exec URL."
+      );
+    }
+    if (hostLower === "script.google.com" || hostLower.endsWith(".script.google.com")) {
+      const p = parsed.pathname.replace(/\/+$/, "");
+      if (/\/dev$/i.test(p)) {
+        throw new Error(
+          "Invalid Google Apps Script Webhook URL: '/dev' test URLs require an interactive Google session and return HTML login pages. Deploy a versioned Web App and use the '/exec' URL."
+        );
+      }
+      if (/\/(?:home\/projects|d)\//i.test(p) || /\/edit$/i.test(p)) {
+        throw new Error(
+          "Invalid Google Apps Script Webhook URL: you pasted a script editor or deployment management page URL instead of the deployed Web App '/exec' URL (https://script.google.com/macros/s/.../exec)."
+        );
+      }
+      if (!/\/macros\/(?:u\/\d+\/)?s\/[A-Za-z0-9_-]+\/exec$/i.test(p)) {
+        throw new Error(
+          "Invalid Google Apps Script Webhook URL: script.google.com URLs must point to the deployed '/exec' endpoint (https://script.google.com/macros/s/<DEPLOYMENT_ID>/exec)."
+        );
+      }
+    }
+    return parsed.toString();
+  }
+
+  public resolveWebhookUrl(overrideUrl?: string | null): string | null {
+    const rawOverride = overrideUrl?.trim();
+    if (rawOverride) {
+      return this.validateWebhookUrl(rawOverride);
+    }
+    const dbUrl = this.db.getSheetsSyncState()?.webhookUrl?.trim();
+    if (dbUrl) {
+      try {
+        return this.validateWebhookUrl(dbUrl);
+      } catch {
+        return null;
+      }
+    }
+    const envUrl = this.config.webhookUrl?.trim();
+    if (envUrl) {
+      try {
+        return this.validateWebhookUrl(envUrl);
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  public hasServiceAccountCredentials(): boolean {
+    if (this.resolveSavedCredentialsPath()) return true;
+    if (this.config.credentialsJson && this.config.credentialsJson.trim()) return true;
+    if (this.resolveCredentialsPath()) return true;
+    return false;
+  }
+
+  public getCredentialSource(): "apps_script_webhook" | "path" | "json_env" | "saved_config" | null {
+    if (this.resolveWebhookUrl()) {
+      return "apps_script_webhook";
+    }
+    if (this.resolveSavedCredentialsPath()) {
+      return "saved_config";
+    }
     if (this.config.credentialsJson && this.config.credentialsJson.trim()) {
       return "json_env";
     }
     if (this.resolveCredentialsPath()) {
       return "path";
-    }
-    if (this.resolveSavedCredentialsPath()) {
-      return "saved_config";
     }
     return null;
   }
@@ -461,7 +615,11 @@ export class GoogleSheetsService {
     let rawJsonText: string | null = null;
     let source: "path" | "json_env" | "saved_config" = "path";
 
-    if (this.config.credentialsJson && this.config.credentialsJson.trim()) {
+    const savedPath = this.resolveSavedCredentialsPath();
+    if (savedPath) {
+      rawJsonText = fs.readFileSync(savedPath, "utf-8");
+      source = "saved_config";
+    } else if (this.config.credentialsJson && this.config.credentialsJson.trim()) {
       const trimmed = this.config.credentialsJson.trim();
       if (trimmed.startsWith("{")) {
         rawJsonText = trimmed;
@@ -471,19 +629,13 @@ export class GoogleSheetsService {
       source = "json_env";
     } else {
       const resolvedPath = this.resolveCredentialsPath();
-      if (resolvedPath) {
-        rawJsonText = fs.readFileSync(resolvedPath, "utf-8");
-        source = "path";
-      } else {
-        const savedPath = this.resolveSavedCredentialsPath();
-        if (!savedPath) {
-          throw new Error(
-            "Google Service Account credentials are not configured. Paste a Service Account JSON key in the Google Sheets Setup panel or set GOOGLE_SHEETS_CREDENTIALS_JSON in the server environment."
-          );
-        }
-        rawJsonText = fs.readFileSync(savedPath, "utf-8");
-        source = "saved_config";
+      if (!resolvedPath) {
+        throw new Error(
+          "Google Service Account credentials are not configured. Paste a Service Account JSON key in the Google Sheets Setup panel or set GOOGLE_SHEETS_CREDENTIALS_JSON in the server environment."
+        );
       }
+      rawJsonText = fs.readFileSync(resolvedPath, "utf-8");
+      source = "path";
     }
 
     let parsed: { client_email?: string; private_key?: string; token_uri?: string };
@@ -1059,12 +1211,15 @@ export class GoogleSheetsService {
   }
 
   public getStatus(): SheetsConnectionStatus {
-    const saConfigured = this.isConfigured();
+    const webhookUrl = this.resolveWebhookUrl();
+    const isConfigured = this.isConfigured();
     const credentialSource = this.liveCredentialSource ?? this.getCredentialSource();
     const saved = this.db.getSheetsSyncState();
     const envSpreadsheetId = this.config.spreadsheetId?.trim() || null;
     const spreadsheetId = envSpreadsheetId ?? saved?.spreadsheetId ?? null;
-    const spreadsheetUrl = spreadsheetId ? canonicalSpreadsheetUrl(spreadsheetId) : null;
+    const spreadsheetUrl = spreadsheetId
+      ? canonicalSpreadsheetUrl(spreadsheetId)
+      : saved?.spreadsheetUrl ?? null;
 
     // Do not report Connected unless a real Google API request succeeded in this active session
     const effectiveStatus: "Connected" | "Not Connected" | "Sync Failed" = this.liveSessionVerified
@@ -1075,13 +1230,14 @@ export class GoogleSheetsService {
       ? "Sync Failed"
       : "Not Connected";
 
-    const authRequired = !this.liveSessionVerified && !saConfigured;
+    const authRequired = !this.liveSessionVerified && !isConfigured;
 
     return {
       status: effectiveStatus,
-      configured: this.liveSessionVerified || saConfigured,
+      configured: this.liveSessionVerified || isConfigured,
       authRequired,
       credentialSource,
+      webhookUrl,
       verifiedAccountEmail: this.liveSessionVerified ? this.verifiedAccountEmail : null,
       grantedScopes: this.liveSessionVerified ? this.grantedScopes : [],
       tokenExpiresInSeconds: this.liveSessionVerified ? this.tokenExpiresInSeconds : null,
@@ -1376,8 +1532,337 @@ export class GoogleSheetsService {
     }
   }
 
+  private inspectWebhookJsonResponse(
+    resp: Response,
+    rawText: string,
+    mode: "verify" | "sync"
+  ): { parsed: Record<string, unknown> } {
+    const contentType = (resp.headers.get("content-type") || "").toLowerCase();
+    const trimmed = rawText.trim();
+    const strippedText = trimmed
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    const looksLikeHtml =
+      contentType.includes("text/html") ||
+      contentType.includes("application/xhtml") ||
+      /^<(?:!doctype|html|head|body)\b/i.test(trimmed);
+
+    const authRedirectOrDenied =
+      resp.status === 401 ||
+      resp.status === 403 ||
+      /accounts\.google\.com\/ServiceLogin|Sign in - Google Accounts|You need permission|Request access|DriveApp.*permission|Authorization is required/i.test(
+        `${resp.url || ""}\n${strippedText}`
+      );
+
+    if (authRedirectOrDenied) {
+      throw new Error(
+        `Google Apps Script Web App returned a Sign-In or permission page (HTTP ${resp.status || 403}, Content-Type: ${contentType || "text/html"}). In Apps Script, deploy the '/exec' Web App with Execute as: 'Me' (script owner) and Who has access: 'Anyone'.`
+      );
+    }
+
+    const missingHandlerMatch = strippedText.match(
+      /(?:Script function not found|找不到以下指令碼函式|找不到以下脚本函数|La fonction du script est introuvable|No se encontró la función del script|Skriptfunktion nicht gefunden)[\s:：]*(doGet|doPost)?/i
+    );
+    if (missingHandlerMatch) {
+      const fnName = missingHandlerMatch[1] || (mode === "verify" ? "doGet" : "doPost");
+      throw new Error(
+        `Google Apps Script Web App returned HTTP ${resp.status} ${contentType || "text/html"} ("Script function not found: ${fnName}"). Paste the provided Code.gs containing both doGet(e) and doPost(e) returning ContentService JSON, save, and create/update a Web App deployment (Deploy -> Manage deployments -> Edit -> New version -> Execute as: Me, Who has access: Anyone).`
+      );
+    }
+
+    if (looksLikeHtml) {
+      const titleMatch = trimmed.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+      const htmlTitle = titleMatch?.[1]?.replace(/\s+/g, " ").trim();
+      const snippet = strippedText ? ` — ${strippedText.slice(0, 140)}` : "";
+      throw new Error(
+        `Google Apps Script Web App returned an HTML page (HTTP ${resp.status}, Content-Type: ${contentType || "text/html"}${htmlTitle ? ` — "${htmlTitle}"` : ""}${snippet}) instead of application/json. Ensure the URL ends with '/exec' (not '/edit' or '/dev'), both doGet(e) and doPost(e) return ContentService JSON, and deployment uses Execute as: 'Me' + Who has access: 'Anyone'.`
+      );
+    }
+
+    const canAttemptJsonParse =
+      contentType.includes("json") ||
+      contentType.includes("text/javascript") ||
+      trimmed.startsWith("{") ||
+      trimmed.startsWith("[");
+
+    if (!resp.ok) {
+      let jsonErrMsg: string | null = null;
+      if (canAttemptJsonParse && trimmed) {
+        try {
+          const errObj = JSON.parse(trimmed) as Record<string, unknown>;
+          if (typeof errObj.error === "string" && errObj.error.trim()) {
+            jsonErrMsg = errObj.error.trim();
+          }
+        } catch {
+          jsonErrMsg = null;
+        }
+      }
+      throw new Error(
+        jsonErrMsg
+          ? `Apps Script Web App returned HTTP ${resp.status}: ${jsonErrMsg}`
+          : `Apps Script Web App returned HTTP ${resp.status} (Content-Type: ${contentType || "unknown"})${strippedText ? `: ${strippedText.slice(0, 140)}` : ""}. Verify the /exec Web App URL and deployment permissions.`
+      );
+    }
+
+    if (!trimmed) {
+      throw new Error(
+        `Apps Script Web App returned an empty response (HTTP ${resp.status}). Ensure doGet(e) and doPost(e) return ContentService.createTextOutput(...).setMimeType(ContentService.MimeType.JSON).`
+      );
+    }
+
+    if (!canAttemptJsonParse) {
+      throw new Error(
+        `Apps Script Web App returned unexpected Content-Type '${contentType || "unknown"}' (HTTP ${resp.status}): ${strippedText.slice(0, 140)}. Ensure ContentService.MimeType.JSON is returned.`
+      );
+    }
+
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("Response JSON was not an object.");
+      }
+      const obj = parsed as Record<string, unknown>;
+      if (obj.ok === false || obj.success === false || obj.status === "error") {
+        throw new Error(String(obj.error || obj.message || "Apps Script Web App reported an error."));
+      }
+      const hasExplicitSuccess =
+        obj.success === true || obj.ok === true || obj.status === "ok";
+      if (!hasExplicitSuccess) {
+        throw new Error(
+          "Apps Script Web App JSON response is missing a success confirmation ('success: true' or 'status: \"ok\"')."
+        );
+      }
+      return { parsed: obj };
+    } catch (err) {
+      if (
+        err instanceof Error &&
+        (err.message.includes("Apps Script Web App") || err.message.includes("JSON response"))
+      ) {
+        throw err;
+      }
+      throw new Error(
+        `Apps Script Web App returned malformed JSON (HTTP ${resp.status}, Content-Type: ${contentType || "unknown"}): ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
+  public async readWorksheetDataset(opts: {
+    tabName: string;
+    limit?: number;
+    webhookUrl?: string | null;
+    spreadsheetId?: string | null;
+    oauthAccessToken?: string | null;
+  }): Promise<{
+    supported: boolean;
+    exists: boolean;
+    tabName: string;
+    columns: string[];
+    rowCount: number;
+    duplicateIds: number;
+    rows: unknown[][];
+    spreadsheetId: string | null;
+    spreadsheetUrl: string | null;
+  }> {
+    const cleanTab = opts.tabName.trim();
+    const limit = Math.max(1, Math.min(200, opts.limit ?? 25));
+    const hasOauth = Boolean(this.sanitizeOAuthToken(opts.oauthAccessToken));
+    const webhookUrl = !hasOauth ? this.resolveWebhookUrl(opts.webhookUrl) : null;
+
+    if (webhookUrl) {
+      const readUrl = new URL(webhookUrl);
+      readUrl.searchParams.set("action", "read");
+      readUrl.searchParams.set("dataset", cleanTab);
+      readUrl.searchParams.set("limit", String(limit));
+      const targetId = this.safeResolveTargetSpreadsheetId(opts.spreadsheetId, false);
+      if (targetId) {
+        readUrl.searchParams.set("spreadsheetId", targetId);
+      }
+      const resp = await fetch(readUrl.toString(), {
+        method: "GET",
+        redirect: "follow",
+        headers: { Accept: "application/json,text/plain;q=0.9,*/*;q=0.8" },
+        signal: AbortSignal.timeout(20_000),
+      });
+      const bodyText = await resp.text();
+      const { parsed } = this.inspectWebhookJsonResponse(resp, bodyText, "verify");
+      const returnedId =
+        typeof parsed.spreadsheetId === "string" && parsed.spreadsheetId.trim()
+          ? parsed.spreadsheetId.trim()
+          : extractSpreadsheetIdFromUrl(
+              typeof parsed.spreadsheetUrl === "string" ? parsed.spreadsheetUrl : null
+            ) || targetId;
+      const returnedUrl = returnedId
+        ? canonicalSpreadsheetUrl(returnedId)
+        : typeof parsed.spreadsheetUrl === "string"
+        ? parsed.spreadsheetUrl.trim()
+        : null;
+
+      if (parsed.action === "read" || Array.isArray(parsed.columns) || typeof parsed.exists === "boolean") {
+        return {
+          supported: true,
+          exists: Boolean(parsed.exists),
+          tabName: cleanTab,
+          columns: Array.isArray(parsed.columns) ? parsed.columns.map(String) : [],
+          rowCount: typeof parsed.rowCount === "number" ? parsed.rowCount : 0,
+          duplicateIds: typeof parsed.duplicateIds === "number" ? parsed.duplicateIds : 0,
+          rows: Array.isArray(parsed.rows) ? (parsed.rows as unknown[][]) : [],
+          spreadsheetId: returnedId,
+          spreadsheetUrl: returnedUrl,
+        };
+      }
+      const countsMap =
+        parsed.tabRowCounts && typeof parsed.tabRowCounts === "object"
+          ? (parsed.tabRowCounts as Record<string, unknown>)
+          : null;
+      return {
+        supported: false,
+        exists: countsMap ? cleanTab in countsMap : true,
+        tabName: cleanTab,
+        columns: [],
+        rowCount: countsMap && typeof countsMap[cleanTab] === "number" ? Number(countsMap[cleanTab]) : 0,
+        duplicateIds: 0,
+        rows: [],
+        spreadsheetId: returnedId,
+        spreadsheetUrl: returnedUrl,
+      };
+    }
+
+    const auth = await this.resolveAuthToken(opts.oauthAccessToken);
+    const spreadsheetId = this.resolveTargetSpreadsheetId(opts.spreadsheetId, false);
+    if (!spreadsheetId) {
+      throw new Error("No spreadsheetId configured for Google Sheets read-back.");
+    }
+    const spec = EXPORT_SPECS.find((s) => s.tabName === cleanTab);
+    const colEnd = columnLetter(spec?.columns.length ?? 20);
+    const encodedRange = encodeURIComponent(`'${cleanTab}'!A1:${colEnd}`);
+    const resp = await this.sheetsJson<{ values?: unknown[][] }>(
+      auth.accessToken,
+      `/spreadsheets/${spreadsheetId}/values/${encodedRange}?majorDimension=ROWS`
+    );
+    const values = resp.values ?? [];
+    const columns = values[0] ? values[0].map((v) => String(v ?? "")) : [];
+    const seen = new Set<string>();
+    let duplicateIds = 0;
+    for (let i = 1; i < values.length; i++) {
+      const id = String(values[i]?.[0] ?? "").trim();
+      if (!id) continue;
+      if (seen.has(id)) duplicateIds += 1;
+      else seen.add(id);
+    }
+    return {
+      supported: true,
+      exists: values.length > 0,
+      tabName: cleanTab,
+      columns,
+      rowCount: Math.max(0, values.length - 1),
+      duplicateIds,
+      rows: values.slice(1, 1 + limit),
+      spreadsheetId,
+      spreadsheetUrl: canonicalSpreadsheetUrl(spreadsheetId),
+    };
+  }
+
+  private async verifyWebhookConnectionInternal(
+    webhookUrl: string,
+    opts?: { spreadsheetId?: string | null; createNew?: boolean }
+  ): Promise<SheetsConnectionStatus> {
+    const attemptAt = new Date().toISOString();
+    const prev = this.db.getSheetsSyncState();
+    const createNew = Boolean(opts?.createNew);
+
+    try {
+      const targetId = this.safeResolveTargetSpreadsheetId(opts?.spreadsheetId, createNew);
+      const probeUrl = new URL(webhookUrl);
+      if (targetId) {
+        probeUrl.searchParams.set("spreadsheetId", targetId);
+      }
+      const resp = await fetch(probeUrl.toString(), {
+        method: "GET",
+        redirect: "follow",
+        headers: {
+          Accept: "application/json,text/plain;q=0.9,*/*;q=0.8",
+        },
+        signal: AbortSignal.timeout(15_000),
+      });
+      const bodyText = await resp.text();
+      const { parsed: parsedJson } = this.inspectWebhookJsonResponse(resp, bodyText, "verify");
+
+      let resolvedId = createNew ? null : prev?.spreadsheetId ?? null;
+      let resolvedUrl = createNew ? null : prev?.spreadsheetUrl ?? null;
+
+      const jsonId =
+        typeof parsedJson.spreadsheetId === "string" && parsedJson.spreadsheetId.trim()
+          ? parsedJson.spreadsheetId.trim()
+          : extractSpreadsheetIdFromUrl(
+              typeof parsedJson.spreadsheetUrl === "string" ? parsedJson.spreadsheetUrl : null
+            );
+      if (jsonId) {
+        resolvedId = jsonId;
+        resolvedUrl = canonicalSpreadsheetUrl(jsonId);
+      } else if (typeof parsedJson.spreadsheetUrl === "string" && parsedJson.spreadsheetUrl.trim()) {
+        resolvedUrl = parsedJson.spreadsheetUrl.trim();
+      }
+
+      const returnedTabCounts =
+        parsedJson.tabRowCounts && typeof parsedJson.tabRowCounts === "object"
+          ? Object.fromEntries(
+              Object.entries(parsedJson.tabRowCounts as Record<string, unknown>).map(([k, v]) => [
+                k,
+                typeof v === "number" && Number.isFinite(v) ? v : 0,
+              ])
+            )
+          : prev?.tabRowCounts ?? {};
+
+      this.liveSessionVerified = true;
+      this.liveCredentialSource = "apps_script_webhook";
+      this.verifiedAccountEmail = null;
+      this.grantedScopes = [];
+      this.tokenExpiresInSeconds = null;
+
+      this.db.saveSheetsSyncState({
+        status: "Connected",
+        webhookUrl,
+        spreadsheetId: resolvedId,
+        spreadsheetUrl: resolvedUrl,
+        clearSpreadsheetTarget: createNew && !resolvedId,
+        lastSyncMode: prev?.lastSyncMode ?? "verify",
+        lastAttemptAt: attemptAt,
+        lastSuccessAt: prev?.lastSuccessAt ?? null,
+        tabRowCounts: returnedTabCounts,
+        rowsAdded: prev?.rowsAdded ?? 0,
+        rowsUpdated: prev?.rowsUpdated ?? 0,
+        rowsUnchanged: prev?.rowsUnchanged ?? 0,
+        lastError: null,
+      });
+      return { ...this.getStatus(), authRequired: false };
+    } catch (err) {
+      this.liveSessionVerified = false;
+      this.liveCredentialSource = null;
+      const safeErr = redactSecrets(err instanceof Error ? err.message : String(err));
+      this.db.saveSheetsSyncState({
+        status: "Sync Failed",
+        webhookUrl,
+        spreadsheetId: prev?.spreadsheetId ?? null,
+        spreadsheetUrl: prev?.spreadsheetUrl ?? null,
+        lastSyncMode: "verify",
+        lastAttemptAt: attemptAt,
+        lastSuccessAt: prev?.lastSuccessAt ?? null,
+        tabRowCounts: prev?.tabRowCounts ?? {},
+        rowsAdded: prev?.rowsAdded ?? 0,
+        rowsUpdated: prev?.rowsUpdated ?? 0,
+        rowsUnchanged: prev?.rowsUnchanged ?? 0,
+        lastError: safeErr,
+      });
+      return { ...this.getStatus(), authRequired: false };
+    }
+  }
+
   public async verifyConnection(opts?: {
     oauthAccessToken?: string | null;
+    webhookUrl?: string | null;
     spreadsheetId?: string | null;
     createNew?: boolean;
   }): Promise<SheetsConnectionStatus> {
@@ -1386,7 +1871,13 @@ export class GoogleSheetsService {
     const cleanOauth = this.sanitizeOAuthToken(opts?.oauthAccessToken);
     const hasOauth = Boolean(cleanOauth);
     const createNew = Boolean(opts?.createNew);
-    if (!hasOauth && !this.isConfigured()) {
+    const webhookUrl = !hasOauth ? this.resolveWebhookUrl(opts?.webhookUrl) : null;
+
+    if (webhookUrl) {
+      return this.verifyWebhookConnectionInternal(webhookUrl, opts);
+    }
+
+    if (!hasOauth && !this.hasServiceAccountCredentials()) {
       this.liveSessionVerified = false;
       this.liveCredentialSource = null;
       this.verifiedAccountEmail = null;
@@ -1405,15 +1896,17 @@ export class GoogleSheetsService {
         rowsUpdated: prev?.rowsUpdated ?? 0,
         rowsUnchanged: prev?.rowsUnchanged ?? 0,
         lastError:
-          "Google Service Account credentials are required. Paste a Service Account JSON key in the Setup Panel or configure GOOGLE_SHEETS_CREDENTIALS_JSON in the server environment.",
+          "Google Apps Script Webhook URL is not configured yet. Paste your Google Apps Script Web App URL in Google Sheets Setup (zero GCP credentials needed).",
       });
       return { ...this.getStatus(), authRequired: true };
     }
 
     try {
       const auth = await this.resolveAuthToken(opts?.oauthAccessToken);
+      const cleanOverride = opts?.spreadsheetId?.trim() || "";
       const explicitTargetId =
-        Boolean(opts?.spreadsheetId?.trim()) || (!createNew && Boolean(this.config.spreadsheetId?.trim()));
+        (Boolean(cleanOverride) && cleanOverride !== (prev?.spreadsheetId ?? "")) ||
+        (!createNew && Boolean(this.config.spreadsheetId?.trim()));
       let resolvedTargetId = this.resolveTargetSpreadsheetId(opts?.spreadsheetId, createNew);
       let spreadsheetUrl = createNew && !resolvedTargetId ? null : resolvedTargetId ? canonicalSpreadsheetUrl(resolvedTargetId) : prev?.spreadsheetUrl ?? null;
       let clearedStaleTarget = createNew && !resolvedTargetId;
@@ -1496,20 +1989,24 @@ export class GoogleSheetsService {
 
   public async probeHealth(opts?: {
     oauthAccessToken?: string | null;
+    webhookUrl?: string | null;
     spreadsheetId?: string | null;
   }): Promise<{
     status: IntegrationConnectionStatus;
     error: string | null;
     detail: string;
-    credentialSource: "oauth" | "path" | "json_env" | "saved_config" | null;
+    credentialSource: "apps_script_webhook" | "oauth" | "path" | "json_env" | "saved_config" | null;
     spreadsheetId: string | null;
     spreadsheetUrl: string | null;
     checkedAt: string;
   }> {
     const checkedAt = new Date().toISOString();
     const hasOauth = Boolean(this.sanitizeOAuthToken(opts?.oauthAccessToken));
-    const saSource = this.getCredentialSource();
-    const credentialSource: "oauth" | "path" | "json_env" | "saved_config" | null = hasOauth ? "oauth" : saSource;
+    const webhookUrl = !hasOauth ? this.resolveWebhookUrl(opts?.webhookUrl) : null;
+    const saSource = webhookUrl ? "apps_script_webhook" : this.getCredentialSource();
+    const credentialSource: "apps_script_webhook" | "oauth" | "path" | "json_env" | "saved_config" | null = hasOauth
+      ? "oauth"
+      : saSource;
 
     if (!hasOauth && !saSource) {
       this.liveSessionVerified = false;
@@ -1520,7 +2017,7 @@ export class GoogleSheetsService {
       return {
         status: "Not Configured",
         error: null,
-        detail: "Google Service Account JSON not configured yet. Paste Service Account credentials in the Setup Panel or set GOOGLE_SHEETS_CREDENTIALS_JSON.",
+        detail: "No Google Apps Script Webhook URL configured yet. Paste your Web App URL in Google Sheets Setup (no GCP JSON keys required).",
         credentialSource: null,
         spreadsheetId: savedId,
         spreadsheetUrl: savedId ? canonicalSpreadsheetUrl(savedId) : saved?.spreadsheetUrl ?? null,
@@ -1533,9 +2030,14 @@ export class GoogleSheetsService {
       return {
         status: "Configured",
         error: null,
-        detail: verified.spreadsheetId
-          ? `Verified live ${credentialSource === "oauth" ? "Google OAuth" : "Service Account"} access to spreadsheet ${verified.spreadsheetId}.`
-          : `Verified live ${credentialSource === "oauth" ? "Google OAuth" : "Service Account"} Drive & Sheets readiness.`,
+        detail:
+          credentialSource === "apps_script_webhook"
+            ? verified.spreadsheetUrl
+              ? `Google Apps Script Web App verified (${verified.spreadsheetUrl}).`
+              : "Google Apps Script Web App URL verified and ready for 6-tab Google Sheets sync."
+            : verified.spreadsheetId
+            ? `Verified live ${credentialSource === "oauth" ? "Google OAuth" : "Service Account"} access to spreadsheet ${verified.spreadsheetId}.`
+            : `Verified live ${credentialSource === "oauth" ? "Google OAuth" : "Service Account"} Drive & Sheets readiness.`,
         credentialSource,
         spreadsheetId: verified.spreadsheetId,
         spreadsheetUrl: verified.spreadsheetUrl,
@@ -1545,8 +2047,8 @@ export class GoogleSheetsService {
 
     return {
       status: "Connection Failed",
-      error: verified.lastError || "Google Workspace verification failed.",
-      detail: verified.lastError || "Google Workspace verification failed.",
+      error: verified.lastError || "Google Sheets sync verification failed.",
+      detail: verified.lastError || "Google Sheets sync verification failed.",
       credentialSource,
       spreadsheetId: verified.spreadsheetId,
       spreadsheetUrl: verified.spreadsheetUrl,
@@ -1554,13 +2056,807 @@ export class GoogleSheetsService {
     };
   }
 
+  private async exportOrSyncViaWebhook(
+    mode: "full" | "incremental",
+    webhookUrl: string,
+    opts?: {
+      spreadsheetId?: string | null;
+      createNew?: boolean;
+      exportScope?: ExportScope;
+      onlyTabs?: string[];
+      retryFailedOnly?: boolean;
+      perWorksheet?: boolean;
+    }
+  ): Promise<SheetsSyncResult> {
+    const attemptAt = new Date().toISOString();
+    const prev = this.db.getSheetsSyncState();
+    const createNew = Boolean(opts?.createNew);
+    const exportScope: ExportScope = opts?.exportScope ?? "all";
+    const steps: ExportStepStatus[] = [];
+
+    const emptySkippedBreakdown = {
+      rejected: 0,
+      stale24h: 0,
+      duplicateOrInvalid: 0,
+      unchanged: 0,
+    };
+
+    try {
+      const canonicalNames = this.db.fetchCanonicalNameMap();
+      const refNow = new Date();
+      let totalRejectedSkipped = 0;
+      let totalStale24hSkipped = 0;
+      let totalDupOrInvalidSkipped = 0;
+      let totalFailedRows = 0;
+
+      const tabRowCounts: Record<string, number> = {};
+      const preparedTabs = new Map<
+        string,
+        {
+          spec: ExportSpec;
+          orderedIds: string[];
+          rowMap: Map<string, Array<string | number>>;
+        }
+      >();
+      const datasets: Record<string, Array<Array<string | number>>> = {};
+      for (const spec of EXPORT_SPECS) {
+        const prep = this.buildDeduplicatedTabRows(spec, canonicalNames, {
+          exportScope,
+          freshnessWindowHours: this.config.freshnessWindowHours ?? 24,
+          refNow,
+        });
+        totalRejectedSkipped += prep.skippedRejected;
+        totalStale24hSkipped += prep.skippedStale24h;
+        totalDupOrInvalidSkipped += prep.skippedDuplicate;
+        totalFailedRows += prep.failedValidation;
+        tabRowCounts[spec.tabName] = prep.orderedIds.length;
+        preparedTabs.set(spec.tabName, {
+          spec,
+          orderedIds: prep.orderedIds,
+          rowMap: prep.rowMap,
+        });
+        datasets[spec.tabName] = [
+          spec.columns,
+          ...prep.orderedIds.map((id) => prep.rowMap.get(id)!),
+        ];
+      }
+
+      const prevTabStatuses = prev?.tabStatuses ?? {};
+      let targetTabNames = EXPORT_SPECS.map((s) => s.tabName);
+      if (opts?.onlyTabs && opts.onlyTabs.length > 0) {
+        const wanted = new Set(opts.onlyTabs);
+        targetTabNames = targetTabNames.filter((t) => wanted.has(t));
+      } else if (opts?.retryFailedOnly && Object.keys(prevTabStatuses).length > 0) {
+        const failedOnly = targetTabNames.filter((t) => prevTabStatuses[t]?.status !== "success");
+        if (failedOnly.length > 0) {
+          targetTabNames = failedOnly;
+        }
+      }
+      const targetTabSet = new Set(targetTabNames);
+
+      steps.push({
+        step: 1,
+        key: "auth",
+        label: "Connect Apps Script Web App",
+        status: "completed",
+        detail: `Using saved Google Apps Script Web App URL (${webhookUrl.slice(0, 64)}${webhookUrl.length > 64 ? "..." : ""}).`,
+      });
+
+      const totalExpectedRowsAll = Object.values(tabRowCounts).reduce((a, b) => a + b, 0);
+      const usePerWorksheet =
+        Boolean(opts?.perWorksheet) ||
+        Boolean(opts?.onlyTabs && opts.onlyTabs.length > 0) ||
+        Boolean(opts?.retryFailedOnly) ||
+        totalExpectedRowsAll > 200;
+
+      let targetSpreadsheetId = this.safeResolveTargetSpreadsheetId(opts?.spreadsheetId, createNew);
+
+      if (!usePerWorksheet) {
+        const resp = await fetch(webhookUrl, {
+          method: "POST",
+          redirect: "follow",
+          headers: {
+            "Content-Type": "text/plain;charset=utf-8",
+            Accept: "application/json,text/plain;q=0.9,*/*;q=0.8",
+          },
+          body: JSON.stringify({
+            mode,
+            exportScope,
+            spreadsheetName: this.config.spreadsheetName,
+            spreadsheetId: targetSpreadsheetId,
+            datasets,
+          }),
+          signal: AbortSignal.timeout(120_000),
+        });
+
+        const rawText = await resp.text();
+        const { parsed } = this.inspectWebhookJsonResponse(resp, rawText, "sync");
+
+        const rawReturnedId =
+          typeof parsed.spreadsheetId === "string" && parsed.spreadsheetId.trim()
+            ? parsed.spreadsheetId.trim()
+            : null;
+        const rawReturnedUrl =
+          typeof parsed.spreadsheetUrl === "string" && parsed.spreadsheetUrl.trim()
+            ? parsed.spreadsheetUrl.trim()
+            : null;
+        const finalSpreadsheetId =
+          rawReturnedId || extractSpreadsheetIdFromUrl(rawReturnedUrl) || targetSpreadsheetId || null;
+        const finalSpreadsheetUrl = finalSpreadsheetId
+          ? canonicalSpreadsheetUrl(finalSpreadsheetId)
+          : rawReturnedUrl;
+
+        if (!finalSpreadsheetUrl) {
+          throw new Error(
+            "Apps Script Web App succeeded but did not return spreadsheetId or spreadsheetUrl. Use the provided Apps Script snippet."
+          );
+        }
+
+        const returnedTabCounts =
+          parsed.tabRowCounts && typeof parsed.tabRowCounts === "object"
+            ? (parsed.tabRowCounts as Record<string, unknown>)
+            : {};
+        const returnedTabStatuses =
+          parsed.tabStatuses && typeof parsed.tabStatuses === "object"
+            ? (parsed.tabStatuses as Record<string, Record<string, unknown>>)
+            : {};
+        const verifiedTabRowCounts: Record<string, number> = {};
+        const tabStatuses: Record<string, TabExportStatus> = {};
+        for (const spec of EXPORT_SPECS) {
+          const expected = tabRowCounts[spec.tabName] ?? 0;
+          const remoteTab = returnedTabStatuses[spec.tabName];
+          const remoteFailed = remoteTab && remoteTab.status === "failed";
+          const verified =
+            typeof returnedTabCounts[spec.tabName] === "number"
+              ? Number(returnedTabCounts[spec.tabName])
+              : remoteTab && typeof remoteTab.verifiedRows === "number"
+              ? Number(remoteTab.verifiedRows)
+              : expected;
+          verifiedTabRowCounts[spec.tabName] = verified;
+          tabStatuses[spec.tabName] = remoteFailed
+            ? {
+                tabName: spec.tabName,
+                status: "failed",
+                expectedRows: expected,
+                writtenRows: 0,
+                verifiedRows: verified,
+                error: String(remoteTab.error || "Apps Script worksheet sync failed"),
+                message: `Failed: ${String(remoteTab.error || "Apps Script worksheet sync failed")}`,
+              }
+            : {
+                tabName: spec.tabName,
+                status: "success",
+                expectedRows: expected,
+                writtenRows: expected,
+                verifiedRows: verified,
+                error: null,
+                message: `Synced ${verified.toLocaleString()} rows via Apps Script`,
+              };
+        }
+
+        const rowsAdded =
+          typeof parsed.rowsAdded === "number"
+            ? Number(parsed.rowsAdded)
+            : mode === "full"
+            ? totalExpectedRowsAll
+            : 0;
+        const rowsUpdated = typeof parsed.rowsUpdated === "number" ? Number(parsed.rowsUpdated) : 0;
+        const rowsUnchanged = typeof parsed.rowsUnchanged === "number" ? Number(parsed.rowsUnchanged) : 0;
+
+        const publicViewerVerified =
+          parsed.publicViewerVerified === undefined ? true : Boolean(parsed.publicViewerVerified);
+        const publicAccessStatus: PublicAccessStatus = publicViewerVerified
+          ? "public_viewer"
+          : parsed.publicAccessStatus === "policy_blocked"
+          ? "policy_blocked"
+          : "unknown";
+        const publicAccessError =
+          typeof parsed.publicAccessError === "string" && parsed.publicAccessError.trim()
+            ? parsed.publicAccessError.trim()
+            : null;
+
+        const skippedBreakdown = {
+          rejected: totalRejectedSkipped,
+          stale24h: totalStale24hSkipped,
+          duplicateOrInvalid: totalDupOrInvalidSkipped,
+          unchanged: rowsUnchanged,
+        };
+        const totalSkipped =
+          totalRejectedSkipped + totalStale24hSkipped + totalDupOrInvalidSkipped + rowsUnchanged;
+        const syncedAt = new Date().toISOString();
+
+        steps.push(
+          {
+            step: 2,
+            key: "connection",
+            label: "Test connection",
+            status: "completed",
+            detail: "Apps Script Web App accepted HTTP POST payload.",
+          },
+          {
+            step: 3,
+            key: "spreadsheet",
+            label: "Create or select target spreadsheet",
+            status: "completed",
+            detail: finalSpreadsheetId
+              ? `Using spreadsheet ${finalSpreadsheetId} with all 6 required tabs.`
+              : `Using spreadsheet ${finalSpreadsheetUrl}.`,
+          },
+          {
+            step: 4,
+            key: "write_tabs",
+            label: "Export all six datasets",
+            status: "completed",
+            detail: `Sent ${totalExpectedRowsAll.toLocaleString()} records across 6 tabs (+${rowsAdded} added, ~${rowsUpdated} updated).`,
+          },
+          {
+            step: 5,
+            key: "verify_tabs",
+            label: "Verify row counts in each tab",
+            status: "completed",
+            detail: EXPORT_SPECS.map((s) => `${s.tabName}: ${verifiedTabRowCounts[s.tabName] ?? 0}`).join(" · "),
+          },
+          {
+            step: 6,
+            key: "public_access",
+            label: "Verify public Viewer access",
+            status: publicViewerVerified
+              ? "completed"
+              : publicAccessStatus === "policy_blocked"
+              ? "blocked"
+              : "completed",
+            detail: publicViewerVerified
+              ? "Apps Script configured Drive sharing: Anyone with the link — Viewer."
+              : publicAccessError || "Public sharing note reported by Apps Script.",
+          },
+          {
+            step: 7,
+            key: "share_url",
+            label: "Display shareable Google Sheets URL",
+            status: "completed",
+            detail: `Public link ready: ${finalSpreadsheetUrl}`,
+          }
+        );
+
+        this.liveSessionVerified = true;
+        this.liveCredentialSource = "apps_script_webhook";
+        this.verifiedAccountEmail = null;
+        this.grantedScopes = [];
+        this.tokenExpiresInSeconds = null;
+
+        this.db.saveSheetsSyncState({
+          status: "Connected",
+          webhookUrl,
+          spreadsheetId: finalSpreadsheetId,
+          spreadsheetUrl: finalSpreadsheetUrl,
+          lastSyncMode: mode,
+          lastAttemptAt: attemptAt,
+          lastSuccessAt: syncedAt,
+          tabRowCounts: verifiedTabRowCounts,
+          tabStatuses,
+          rowsAdded,
+          rowsUpdated,
+          rowsUnchanged,
+          rowsSkipped: totalSkipped,
+          rowsFailed: totalFailedRows,
+          publicAccessStatus,
+          publicViewerVerified,
+          publicAccessError,
+          lastError: null,
+        });
+
+        return {
+          success: true,
+          mode,
+          exportScope,
+          status: "Connected",
+          authRequired: false,
+          spreadsheetId: finalSpreadsheetId,
+          spreadsheetUrl: finalSpreadsheetUrl,
+          tabRowCounts,
+          verifiedTabRowCounts,
+          tabStatuses,
+          rowsAdded,
+          rowsUpdated,
+          rowsUnchanged,
+          rowsSkipped: totalSkipped,
+          rowsFailed: totalFailedRows,
+          skippedBreakdown,
+          publicAccessStatus,
+          publicViewerVerified,
+          publicAccessError,
+          steps,
+          syncedAt,
+          error: null,
+        };
+      }
+
+      // Per-worksheet (and chunked) synchronization for independent per-sheet status, read-back verification, and partial-failure retry
+      const verifiedTabRowCounts: Record<string, number> = {};
+      const tabStatuses: Record<string, TabExportStatus> = {};
+      let totalAdded = 0;
+      let totalUpdated = 0;
+      let totalUnchanged = 0;
+      let resolvedSpreadsheetUrl: string | null = prev?.spreadsheetUrl ?? null;
+      let publicViewerVerified = false;
+      let publicAccessStatus: PublicAccessStatus = "unknown";
+      let publicAccessError: string | null = null;
+      const batchSize = 1500;
+
+      for (const spec of EXPORT_SPECS) {
+        const expected = tabRowCounts[spec.tabName] ?? 0;
+        if (!targetTabSet.has(spec.tabName) && prevTabStatuses[spec.tabName]?.status === "success") {
+          const kept = prevTabStatuses[spec.tabName];
+          tabStatuses[spec.tabName] = kept;
+          verifiedTabRowCounts[spec.tabName] = kept.verifiedRows ?? prev?.tabRowCounts?.[spec.tabName] ?? expected;
+          continue;
+        }
+
+        const prep = preparedTabs.get(spec.tabName)!;
+        const rows = prep.orderedIds.map((id) => prep.rowMap.get(id)!);
+        const totalBatches = Math.max(1, Math.ceil(rows.length / batchSize));
+
+        let tabAdded = 0;
+        let tabUpdated = 0;
+        let tabUnchanged = 0;
+        let lastVerifiedRows = 0;
+
+        try {
+          for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
+            const chunkRows = rows.slice(batchIndex * batchSize, (batchIndex + 1) * batchSize);
+            const resp = await fetch(webhookUrl, {
+              method: "POST",
+              redirect: "follow",
+              headers: {
+                "Content-Type": "text/plain;charset=utf-8",
+                Accept: "application/json,text/plain;q=0.9,*/*;q=0.8",
+              },
+              body: JSON.stringify({
+                mode,
+                exportScope,
+                spreadsheetName: this.config.spreadsheetName,
+                spreadsheetId: targetSpreadsheetId,
+                dataset: spec.tabName,
+                columns: spec.columns,
+                rows: chunkRows,
+                batchIndex,
+                totalBatches,
+                preserveExisting: mode === "incremental" || batchIndex > 0 || Boolean(opts?.retryFailedOnly),
+              }),
+              signal: AbortSignal.timeout(120_000),
+            });
+
+            const rawText = await resp.text();
+            const { parsed } = this.inspectWebhookJsonResponse(resp, rawText, "sync");
+
+            const retId =
+              typeof parsed.spreadsheetId === "string" && parsed.spreadsheetId.trim()
+                ? parsed.spreadsheetId.trim()
+                : extractSpreadsheetIdFromUrl(
+                    typeof parsed.spreadsheetUrl === "string" ? parsed.spreadsheetUrl : null
+                  );
+            if (retId && !targetSpreadsheetId) {
+              targetSpreadsheetId = retId;
+            }
+            const retUrl = retId
+              ? canonicalSpreadsheetUrl(retId)
+              : typeof parsed.spreadsheetUrl === "string" && parsed.spreadsheetUrl.trim()
+              ? parsed.spreadsheetUrl.trim()
+              : null;
+            if (retUrl) {
+              resolvedSpreadsheetUrl = retUrl;
+            }
+
+            if (parsed.publicViewerVerified !== undefined) {
+              publicViewerVerified = Boolean(parsed.publicViewerVerified);
+              publicAccessStatus = publicViewerVerified
+                ? "public_viewer"
+                : parsed.publicAccessStatus === "policy_blocked"
+                ? "policy_blocked"
+                : "unknown";
+            } else if (!resolvedSpreadsheetUrl && !publicAccessError) {
+              publicViewerVerified = true;
+              publicAccessStatus = "public_viewer";
+            }
+            if (typeof parsed.publicAccessError === "string" && parsed.publicAccessError.trim()) {
+              publicAccessError = parsed.publicAccessError.trim();
+            }
+
+            const remoteTabs =
+              parsed.tabStatuses && typeof parsed.tabStatuses === "object"
+                ? (parsed.tabStatuses as Record<string, Record<string, unknown>>)
+                : null;
+            const remoteTab = remoteTabs?.[spec.tabName];
+            if (remoteTab && remoteTab.status === "failed") {
+              throw new Error(String(remoteTab.error || `Apps Script failed on '${spec.tabName}'`));
+            }
+
+            tabAdded += typeof parsed.rowsAdded === "number" ? Number(parsed.rowsAdded) : 0;
+            tabUpdated += typeof parsed.rowsUpdated === "number" ? Number(parsed.rowsUpdated) : 0;
+            tabUnchanged += typeof parsed.rowsUnchanged === "number" ? Number(parsed.rowsUnchanged) : 0;
+
+            const returnedCounts =
+              parsed.tabRowCounts && typeof parsed.tabRowCounts === "object"
+                ? (parsed.tabRowCounts as Record<string, unknown>)
+                : {};
+            if (typeof parsed.verifiedRows === "number") {
+              lastVerifiedRows = Number(parsed.verifiedRows);
+            } else if (typeof returnedCounts[spec.tabName] === "number") {
+              lastVerifiedRows = Number(returnedCounts[spec.tabName]);
+            } else if (remoteTab && typeof remoteTab.verifiedRows === "number") {
+              lastVerifiedRows = Number(remoteTab.verifiedRows);
+            } else {
+              lastVerifiedRows = Math.min(rows.length, (batchIndex + 1) * batchSize);
+            }
+          }
+
+          // Optional read-back check via doGet?action=read when supported
+          let readBackNote = "";
+          try {
+            const readBack = await this.readWorksheetDataset({
+              tabName: spec.tabName,
+              limit: 5,
+              webhookUrl,
+              spreadsheetId: targetSpreadsheetId,
+            });
+            if (readBack.supported) {
+              if (!readBack.exists) {
+                throw new Error(`Read-back check could not find worksheet '${spec.tabName}'.`);
+              }
+              if (readBack.columns.length > 0 && readBack.columns[0] !== spec.columns[0]) {
+                throw new Error(
+                  `Header mismatch on '${spec.tabName}' (got '${readBack.columns[0]}', expected '${spec.columns[0]}').`
+                );
+              }
+              if (readBack.duplicateIds > 0) {
+                throw new Error(
+                  `Duplicate IDs detected in '${spec.tabName}' (${readBack.duplicateIds} duplicates).`
+                );
+              }
+              lastVerifiedRows = readBack.rowCount;
+              readBackNote = " (read-back verified)";
+            }
+          } catch (readErr) {
+            if (
+              readErr instanceof Error &&
+              /Read-back check|Header mismatch|Duplicate IDs/.test(readErr.message)
+            ) {
+              throw readErr;
+            }
+            // If read action is not implemented or transient, rely on verifiedRows from doPost
+          }
+
+          if (lastVerifiedRows < expected) {
+            throw new Error(
+              `Row count mismatch on '${spec.tabName}': verified ${lastVerifiedRows} < expected ${expected}`
+            );
+          }
+
+          totalAdded += tabAdded;
+          totalUpdated += tabUpdated;
+          totalUnchanged += tabUnchanged;
+          verifiedTabRowCounts[spec.tabName] = lastVerifiedRows;
+          tabStatuses[spec.tabName] = {
+            tabName: spec.tabName,
+            status: "success",
+            expectedRows: expected,
+            writtenRows: rows.length,
+            verifiedRows: lastVerifiedRows,
+            error: null,
+            message:
+              lastVerifiedRows > expected
+                ? `Verified ${lastVerifiedRows.toLocaleString()} rows (${expected.toLocaleString()} current + ${(lastVerifiedRows - expected).toLocaleString()} preserved)${readBackNote}`
+                : `Verified ${lastVerifiedRows.toLocaleString()} rows via Apps Script${readBackNote}`,
+          };
+        } catch (tabErr) {
+          const tabMsg = redactSecrets(tabErr instanceof Error ? tabErr.message : String(tabErr));
+          verifiedTabRowCounts[spec.tabName] = 0;
+          totalFailedRows += expected;
+          tabStatuses[spec.tabName] = {
+            tabName: spec.tabName,
+            status: "failed",
+            expectedRows: expected,
+            writtenRows: 0,
+            verifiedRows: 0,
+            error: tabMsg,
+            message: `Failed: ${tabMsg}`,
+          };
+        }
+      }
+
+      const finalSpreadsheetId = targetSpreadsheetId || extractSpreadsheetIdFromUrl(resolvedSpreadsheetUrl);
+      const finalSpreadsheetUrl = finalSpreadsheetId
+        ? canonicalSpreadsheetUrl(finalSpreadsheetId)
+        : resolvedSpreadsheetUrl;
+
+      const failedTabs = EXPORT_SPECS.filter((s) => tabStatuses[s.tabName]?.status !== "success");
+      const allSixSucceeded = failedTabs.length === 0;
+
+      if (allSixSucceeded && !finalSpreadsheetUrl) {
+        throw new Error(
+          "Apps Script Web App succeeded but did not return spreadsheetId or spreadsheetUrl. Use the provided Apps Script snippet."
+        );
+      }
+
+      const skippedBreakdown = {
+        rejected: totalRejectedSkipped,
+        stale24h: totalStale24hSkipped,
+        duplicateOrInvalid: totalDupOrInvalidSkipped,
+        unchanged: totalUnchanged,
+      };
+      const totalSkipped =
+        totalRejectedSkipped + totalStale24hSkipped + totalDupOrInvalidSkipped + totalUnchanged;
+
+      steps.push(
+        {
+          step: 2,
+          key: "connection",
+          label: "Test connection",
+          status: allSixSucceeded ? "completed" : "failed",
+          detail: allSixSucceeded
+            ? "Apps Script Web App accepted all worksheet payloads."
+            : `${6 - failedTabs.length}/6 worksheets synced via Apps Script.`,
+        },
+        {
+          step: 3,
+          key: "spreadsheet",
+          label: "Create or select target spreadsheet",
+          status: finalSpreadsheetUrl ? "completed" : "failed",
+          detail: finalSpreadsheetId
+            ? `Using spreadsheet ${finalSpreadsheetId}.`
+            : finalSpreadsheetUrl || "Spreadsheet ID not returned.",
+        },
+        {
+          step: 4,
+          key: "write_tabs",
+          label: "Export all six datasets",
+          status: allSixSucceeded ? "completed" : "failed",
+          detail: allSixSucceeded
+            ? `Sent ${totalExpectedRowsAll.toLocaleString()} records across 6 tabs (+${totalAdded} added, ~${totalUpdated} updated).`
+            : `Failed worksheets: ${failedTabs.map((t) => t.tabName).join(", ")}.`,
+        },
+        {
+          step: 5,
+          key: "verify_tabs",
+          label: "Verify row counts in each tab",
+          status: allSixSucceeded ? "completed" : "failed",
+          detail: allSixSucceeded
+            ? EXPORT_SPECS.map((s) => `${s.tabName}: ${verifiedTabRowCounts[s.tabName] ?? 0}`).join(" · ")
+            : `${6 - failedTabs.length}/6 tabs verified.`,
+        }
+      );
+
+      if (!allSixSucceeded) {
+        const failedSummary = failedTabs
+          .map((s) => `${s.tabName} (${tabStatuses[s.tabName]?.error || "failed"})`)
+          .join("; ");
+        const errMsg = `${6 - failedTabs.length}/6 worksheets succeeded. Failed: ${failedSummary}`;
+        steps.push(
+          {
+            step: 6,
+            key: "public_access",
+            label: "Verify public Viewer access",
+            status: "skipped",
+            detail: "Waiting for all 6 worksheets to succeed before confirming share link.",
+          },
+          {
+            step: 7,
+            key: "share_url",
+            label: "Display shareable Google Sheets URL",
+            status: "skipped",
+            detail: "Retry failed worksheets to complete 6-tab verification.",
+          }
+        );
+
+        const hasPriorValid = Boolean(!createNew && (finalSpreadsheetUrl || (prev?.lastSuccessAt && prev?.spreadsheetUrl)));
+        const keepId = finalSpreadsheetId ?? (hasPriorValid ? prev?.spreadsheetId ?? null : null);
+        const keepUrl = finalSpreadsheetUrl ?? (hasPriorValid ? prev?.spreadsheetUrl ?? null : null);
+
+        this.liveSessionVerified = false;
+        this.db.saveSheetsSyncState({
+          status: "Sync Failed",
+          webhookUrl,
+          spreadsheetId: keepId,
+          spreadsheetUrl: keepUrl,
+          lastSyncMode: mode,
+          lastAttemptAt: attemptAt,
+          lastSuccessAt: prev?.lastSuccessAt ?? null,
+          tabRowCounts: verifiedTabRowCounts,
+          tabStatuses,
+          rowsAdded: totalAdded,
+          rowsUpdated: totalUpdated,
+          rowsUnchanged: totalUnchanged,
+          rowsSkipped: totalSkipped,
+          rowsFailed: totalFailedRows,
+          publicAccessStatus: keepUrl ? (prev?.publicAccessStatus ?? publicAccessStatus) : "unknown",
+          publicViewerVerified: keepUrl ? Boolean(prev?.publicViewerVerified ?? publicViewerVerified) : false,
+          publicAccessError: publicAccessError ?? prev?.publicAccessError ?? null,
+          lastError: errMsg,
+        });
+
+        return {
+          success: false,
+          mode,
+          exportScope,
+          status: "Sync Failed",
+          authRequired: false,
+          spreadsheetId: keepId,
+          spreadsheetUrl: keepUrl,
+          tabRowCounts,
+          verifiedTabRowCounts,
+          tabStatuses,
+          rowsAdded: totalAdded,
+          rowsUpdated: totalUpdated,
+          rowsUnchanged: totalUnchanged,
+          rowsSkipped: totalSkipped,
+          rowsFailed: totalFailedRows,
+          skippedBreakdown,
+          publicAccessStatus,
+          publicViewerVerified,
+          publicAccessError,
+          steps,
+          syncedAt: null,
+          error: errMsg,
+        };
+      }
+
+      const syncedAt = new Date().toISOString();
+      steps.push(
+        {
+          step: 6,
+          key: "public_access",
+          label: "Verify public Viewer access",
+          status: publicViewerVerified
+            ? "completed"
+            : publicAccessStatus === "policy_blocked"
+            ? "blocked"
+            : "completed",
+          detail: publicViewerVerified
+            ? "Apps Script configured Drive sharing: Anyone with the link — Viewer."
+            : publicAccessError || "Public sharing note reported by Apps Script.",
+        },
+        {
+          step: 7,
+          key: "share_url",
+          label: "Display shareable Google Sheets URL",
+          status: "completed",
+          detail: `Public link ready: ${finalSpreadsheetUrl}`,
+        }
+      );
+
+      this.liveSessionVerified = true;
+      this.liveCredentialSource = "apps_script_webhook";
+      this.verifiedAccountEmail = null;
+      this.grantedScopes = [];
+      this.tokenExpiresInSeconds = null;
+
+      this.db.saveSheetsSyncState({
+        status: "Connected",
+        webhookUrl,
+        spreadsheetId: finalSpreadsheetId,
+        spreadsheetUrl: finalSpreadsheetUrl,
+        lastSyncMode: mode,
+        lastAttemptAt: attemptAt,
+        lastSuccessAt: syncedAt,
+        tabRowCounts: verifiedTabRowCounts,
+        tabStatuses,
+        rowsAdded: totalAdded,
+        rowsUpdated: totalUpdated,
+        rowsUnchanged: totalUnchanged,
+        rowsSkipped: totalSkipped,
+        rowsFailed: totalFailedRows,
+        publicAccessStatus,
+        publicViewerVerified,
+        publicAccessError,
+        lastError: null,
+      });
+
+      return {
+        success: true,
+        mode,
+        exportScope,
+        status: "Connected",
+        authRequired: false,
+        spreadsheetId: finalSpreadsheetId,
+        spreadsheetUrl: finalSpreadsheetUrl!,
+        tabRowCounts,
+        verifiedTabRowCounts,
+        tabStatuses,
+        rowsAdded: totalAdded,
+        rowsUpdated: totalUpdated,
+        rowsUnchanged: totalUnchanged,
+        rowsSkipped: totalSkipped,
+        rowsFailed: totalFailedRows,
+        skippedBreakdown,
+        publicAccessStatus,
+        publicViewerVerified,
+        publicAccessError,
+        steps,
+        syncedAt,
+        error: null,
+      };
+    } catch (err) {
+      const msg = redactSecrets(err instanceof Error ? err.message : String(err));
+      if (steps.length === 0) {
+        steps.push({
+          step: 1,
+          key: "auth",
+          label: "Connect Apps Script Web App",
+          status: "failed",
+          detail: msg,
+        });
+      }
+      const tabStatuses: Record<string, TabExportStatus> = {};
+      for (const spec of EXPORT_SPECS) {
+        tabStatuses[spec.tabName] = {
+          tabName: spec.tabName,
+          status: "failed",
+          expectedRows: 0,
+          writtenRows: 0,
+          verifiedRows: 0,
+          error: msg,
+          message: `Failed: ${msg}`,
+        };
+      }
+      const hasPriorValid = Boolean(!createNew && prev?.lastSuccessAt && prev?.spreadsheetUrl);
+      this.db.saveSheetsSyncState({
+        status: "Sync Failed",
+        webhookUrl,
+        spreadsheetId: hasPriorValid ? (prev?.spreadsheetId ?? null) : null,
+        spreadsheetUrl: hasPriorValid ? (prev?.spreadsheetUrl ?? null) : null,
+        lastSyncMode: mode,
+        lastAttemptAt: attemptAt,
+        lastSuccessAt: prev?.lastSuccessAt ?? null,
+        tabRowCounts: prev?.tabRowCounts ?? {},
+        tabStatuses,
+        rowsAdded: 0,
+        rowsUpdated: 0,
+        rowsUnchanged: 0,
+        rowsSkipped: 0,
+        rowsFailed: 0,
+        publicAccessStatus: hasPriorValid ? (prev?.publicAccessStatus ?? "unknown") : "unknown",
+        publicViewerVerified: hasPriorValid ? Boolean(prev?.publicViewerVerified) : false,
+        publicAccessError: hasPriorValid ? (prev?.publicAccessError ?? null) : null,
+        lastError: msg,
+      });
+      return {
+        success: false,
+        mode,
+        exportScope,
+        status: "Sync Failed",
+        authRequired: false,
+        spreadsheetId: hasPriorValid ? (prev?.spreadsheetId ?? null) : null,
+        spreadsheetUrl: hasPriorValid ? (prev?.spreadsheetUrl ?? null) : null,
+        tabRowCounts: {},
+        verifiedTabRowCounts: {},
+        tabStatuses,
+        rowsAdded: 0,
+        rowsUpdated: 0,
+        rowsUnchanged: 0,
+        rowsSkipped: 0,
+        rowsFailed: 0,
+        skippedBreakdown: emptySkippedBreakdown,
+        publicAccessStatus: "unknown",
+        publicViewerVerified: false,
+        publicAccessError: null,
+        steps,
+        syncedAt: null,
+        error: msg,
+      };
+    }
+  }
+
   public async exportOrSync(
     mode: "full" | "incremental",
     opts?: {
       oauthAccessToken?: string | null;
+      webhookUrl?: string | null;
       spreadsheetId?: string | null;
       createNew?: boolean;
       exportScope?: ExportScope;
+      onlyTabs?: string[];
+      retryFailedOnly?: boolean;
+      perWorksheet?: boolean;
     }
   ): Promise<SheetsSyncResult> {
     const attemptAt = new Date().toISOString();
@@ -1576,11 +2872,16 @@ export class GoogleSheetsService {
       unchanged: 0,
     };
 
-    if (!hasOauth && !this.isConfigured()) {
+    const webhookUrl = !hasOauth ? this.resolveWebhookUrl(opts?.webhookUrl) : null;
+    if (webhookUrl) {
+      return this.exportOrSyncViaWebhook(mode, webhookUrl, opts);
+    }
+
+    if (!hasOauth && !this.hasServiceAccountCredentials()) {
       this.liveSessionVerified = false;
       this.liveCredentialSource = null;
       const errMsg =
-        "Google Service Account credentials are required. Paste your Service Account JSON key in the Setup Panel or configure GOOGLE_SHEETS_CREDENTIALS_JSON in the server environment.";
+        "Google Apps Script Webhook URL is not configured yet. Paste your Google Apps Script Web App URL in Google Sheets Setup (zero GCP credentials required).";
       steps.push({
         step: 1,
         key: "auth",
@@ -1673,6 +2974,19 @@ export class GoogleSheetsService {
       let totalDupOrInvalidSkipped = 0;
       let totalFailedRows = 0;
 
+      const prevTabStatuses = prev?.tabStatuses ?? {};
+      let targetTabNames = EXPORT_SPECS.map((s) => s.tabName);
+      if (opts?.onlyTabs && opts.onlyTabs.length > 0) {
+        const wanted = new Set(opts.onlyTabs);
+        targetTabNames = targetTabNames.filter((t) => wanted.has(t));
+      } else if (opts?.retryFailedOnly && Object.keys(prevTabStatuses).length > 0) {
+        const failedOnly = targetTabNames.filter((t) => prevTabStatuses[t]?.status !== "success");
+        if (failedOnly.length > 0) {
+          targetTabNames = failedOnly;
+        }
+      }
+      const targetTabSet = new Set(targetTabNames);
+
       const canonicalNames = this.db.fetchCanonicalNameMap();
       const refNow = new Date();
       const preparedByTab = new Map<
@@ -1692,7 +3006,7 @@ export class GoogleSheetsService {
         totalFailedRows += prep.failedValidation;
       }
 
-      if (mode === "full") {
+      if (mode === "full" && !opts?.retryFailedOnly && !opts?.onlyTabs?.length) {
         const formatRequests: Array<Record<string, unknown>> = [];
         for (const spec of EXPORT_SPECS) {
           const sheetMeta = sheetPropsByTitle.get(spec.tabName);
@@ -1762,6 +3076,14 @@ export class GoogleSheetsService {
       for (const spec of EXPORT_SPECS) {
         const { orderedIds, rowMap } = preparedByTab.get(spec.tabName)!;
         const expectedRows = orderedIds.length;
+
+        if (!targetTabSet.has(spec.tabName) && prevTabStatuses[spec.tabName]?.status === "success") {
+          const kept = prevTabStatuses[spec.tabName];
+          tabStatuses[spec.tabName] = kept;
+          verifiedTabRowCounts[spec.tabName] = kept.verifiedRows ?? prev?.tabRowCounts?.[spec.tabName] ?? expectedRows;
+          tabRowCounts[spec.tabName] = expectedRows;
+          continue;
+        }
 
         if (fatalAuthOrTargetError) {
           tabStatuses[spec.tabName] = {

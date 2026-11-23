@@ -206,6 +206,7 @@ const SCHEMA_DDL_STATEMENTS: string[] = [
   `CREATE TABLE IF NOT EXISTS sheets_sync_state (
     id TEXT PRIMARY KEY,
     status TEXT NOT NULL DEFAULT 'Not Connected',
+    webhook_url TEXT,
     spreadsheet_id TEXT,
     spreadsheet_url TEXT,
     last_sync_mode TEXT,
@@ -538,6 +539,9 @@ export class AtlasDatabase {
       }
       if (!sheetsCols.has("public_access_error")) {
         conn.exec("ALTER TABLE sheets_sync_state ADD COLUMN public_access_error TEXT;");
+      }
+      if (!sheetsCols.has("webhook_url")) {
+        conn.exec("ALTER TABLE sheets_sync_state ADD COLUMN webhook_url TEXT;");
       }
 
       const paperInfoRows = conn.prepare("PRAGMA table_info(research_papers);").all() as Array<{ name: string }>;
@@ -1508,6 +1512,7 @@ export class AtlasDatabase {
 
   public getSheetsSyncState(): {
     status: "Connected" | "Not Connected" | "Sync Failed";
+    webhookUrl: string | null;
     spreadsheetId: string | null;
     spreadsheetUrl: string | null;
     lastSyncMode: string | null;
@@ -1561,6 +1566,7 @@ export class AtlasDatabase {
         : "unknown";
     return {
       status,
+      webhookUrl: (row.webhook_url as string | null) ?? null,
       spreadsheetId: (row.spreadsheet_id as string | null) ?? null,
       spreadsheetUrl: (row.spreadsheet_url as string | null) ?? null,
       lastSyncMode: (row.last_sync_mode as string | null) ?? null,
@@ -1580,8 +1586,25 @@ export class AtlasDatabase {
     };
   }
 
+  public saveSheetsWebhookUrl(webhookUrl: string | null): void {
+    this.initializeSchema();
+    const conn = this.getConnection();
+    const cleanUrl = webhookUrl?.trim() || null;
+    conn
+      .prepare(
+        `INSERT INTO sheets_sync_state (id, status, webhook_url)
+         VALUES ('default', 'Not Connected', ?)
+         ON CONFLICT(id) DO UPDATE SET
+           webhook_url = excluded.webhook_url,
+           last_error = CASE WHEN excluded.webhook_url IS NULL THEN NULL ELSE sheets_sync_state.last_error END;`
+      )
+      .run(cleanUrl);
+  }
+
   public saveSheetsSyncState(state: {
     status: "Connected" | "Not Connected" | "Sync Failed";
+    webhookUrl?: string | null;
+    clearWebhookUrl?: boolean;
     spreadsheetId: string | null;
     spreadsheetUrl: string | null;
     clearSpreadsheetTarget?: boolean;
@@ -1602,6 +1625,9 @@ export class AtlasDatabase {
   }): void {
     this.initializeSchema();
     const conn = this.getConnection();
+    const webhookSql = state.clearWebhookUrl
+      ? "excluded.webhook_url"
+      : "COALESCE(excluded.webhook_url, sheets_sync_state.webhook_url)";
     const spreadsheetIdSql = state.clearSpreadsheetTarget
       ? "excluded.spreadsheet_id"
       : "COALESCE(excluded.spreadsheet_id, sheets_sync_state.spreadsheet_id)";
@@ -1611,13 +1637,14 @@ export class AtlasDatabase {
     conn
       .prepare(
         `INSERT INTO sheets_sync_state (
-          id, status, spreadsheet_id, spreadsheet_url, last_sync_mode,
+          id, status, webhook_url, spreadsheet_id, spreadsheet_url, last_sync_mode,
           last_attempt_at, last_success_at, tab_row_counts_json, tab_statuses_json,
           rows_added, rows_updated, rows_unchanged, rows_skipped, rows_failed,
           public_access_status, public_viewer_verified, public_access_error, last_error
-        ) VALUES ('default', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES ('default', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           status = excluded.status,
+          webhook_url = ${webhookSql},
           spreadsheet_id = ${spreadsheetIdSql},
           spreadsheet_url = ${spreadsheetUrlSql},
           last_sync_mode = excluded.last_sync_mode,
@@ -1640,6 +1667,7 @@ export class AtlasDatabase {
       )
       .run(
         state.status,
+        state.webhookUrl ?? null,
         state.spreadsheetId,
         state.spreadsheetUrl,
         state.lastSyncMode,

@@ -4,6 +4,7 @@ import {
   FileText,
   GitMerge,
   LayoutDashboard,
+  Mail,
   Newspaper,
   Package,
   X,
@@ -35,6 +36,7 @@ const NAV_ITEMS: NavItem[] = [
   { id: "jobs", label: "Jobs", icon: Briefcase, countKey: "jobs" },
   { id: "news", label: "News", icon: Newspaper, countKey: "news" },
   { id: "entity_mapping_log", label: "Entity Mapping Log", icon: GitMerge, countKey: "entity_mapping_log" },
+  { id: "gmail", label: "Gmail", icon: Mail },
 ];
 
 export function Sidebar({

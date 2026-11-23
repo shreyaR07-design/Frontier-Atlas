@@ -65,8 +65,10 @@ export interface AtlasConfig {
   deepseekApiKey: string | null;
   deepseekModel: string;
   githubToken: string | null;
+  openAlexMailto: string | null;
   googleSheetsCredentialsPath: string | null;
   googleSheetsCredentialsJson: string | null;
+  appsScriptWebhookUrl: string | null;
   googleSheetsSpreadsheetId: string | null;
   googleSheetsSpreadsheetName: string;
 }
@@ -163,6 +165,10 @@ export function loadAtlasConfig(atlasDir: string): AtlasConfig {
     deepseekApiKey: process.env.DEEPSEEK_API_KEY?.trim() || null,
     deepseekModel: process.env.DEEPSEEK_MODEL?.trim() || "deepseek-chat",
     githubToken: process.env.GITHUB_TOKEN?.trim() || null,
+    openAlexMailto:
+      process.env.OPENALEX_MAILTO?.trim() ||
+      process.env.POLITE_POOL_EMAIL?.trim() ||
+      null,
     googleSheetsCredentialsPath:
       process.env.GOOGLE_SHEETS_CREDENTIALS_PATH?.trim() ||
       process.env.GOOGLE_APPLICATION_CREDENTIALS?.trim() ||
@@ -171,6 +177,7 @@ export function loadAtlasConfig(atlasDir: string): AtlasConfig {
       process.env.GOOGLE_SHEETS_CREDENTIALS_JSON?.trim() ||
       process.env.GOOGLE_SERVICE_ACCOUNT_JSON?.trim() ||
       null,
+    appsScriptWebhookUrl: process.env.APPS_SCRIPT_WEBHOOK_URL?.trim() || null,
     googleSheetsSpreadsheetId: process.env.GOOGLE_SHEETS_SPREADSHEET_ID?.trim() || null,
     googleSheetsSpreadsheetName:
       process.env.GOOGLE_SHEETS_SPREADSHEET_NAME?.trim() ||
@@ -1048,15 +1055,22 @@ class LiveSourceVerifier {
     if (existing) return existing;
 
     const isApiOrFeed = this.isPublicApiOrFeedUrl(url);
-    const res = await this.http.fetch(url, {
-      timeoutMs: opts.timeoutMs ?? Math.min(this.config.requestTimeoutMs, 10000),
-      maxAttempts: opts.maxAttempts ?? 2,
+    const isOpenAlex = url.toLowerCase().includes("api.openalex.org/");
+    const isGithubApi = url.toLowerCase().includes("api.github.com/");
+    const effectiveUrl = isOpenAlex
+      ? buildOpenAlexRequestUrl(url, this.config.openAlexMailto)
+      : url;
+    const effectiveToken = this.config.githubToken || process.env.GITHUB_TOKEN?.trim() || null;
+
+    const res = await this.http.fetch(effectiveUrl, {
+      timeoutMs: opts.timeoutMs ?? (isOpenAlex ? Math.max(this.config.requestTimeoutMs, 25000) : Math.min(this.config.requestTimeoutMs, 10000)),
+      maxAttempts: opts.maxAttempts ?? (isOpenAlex ? 3 : 2),
       maxCrawlDelayMs: opts.maxCrawlDelayMs,
       checkRobots: !isApiOrFeed,
-      headers:
-        this.config.githubToken && url.includes("api.github.com")
-          ? { Authorization: `Bearer ${this.config.githubToken}` }
-          : undefined,
+      userAgent: isOpenAlex
+        ? buildOpenAlexUserAgent(this.config.userAgent, this.config.openAlexMailto)
+        : undefined,
+      headers: isGithubApi ? buildGithubHeaders(effectiveToken) : undefined,
     });
 
     const snap = this.buildSnapshot(res.url || url, res.status, res.ok, res.content || "", res.contentType || "", res.error);
@@ -2606,7 +2620,8 @@ async function collectProducts(
   http: PoliteHttpClient,
   verifier: LiveSourceVerifier,
   limit: number,
-  page: number
+  page: number,
+  onLog?: (msg: string) => void
 ): Promise<CollectionBatchResult> {
   const safePage = Math.max(1, page);
   const errors: CollectorError[] = [];
@@ -2616,7 +2631,8 @@ async function collectProducts(
   const hnRecords: RawRecord[] = [];
   const nowIso = new Date().toISOString();
 
-  const ghTarget = config.githubToken ? Math.round(limit * 0.4) : Math.min(250, Math.round(limit * 0.3));
+  const effectiveGithubToken = config.githubToken || process.env.GITHUB_TOKEN?.trim() || null;
+  const ghTarget = effectiveGithubToken ? Math.round(limit * 0.4) : Math.min(250, Math.round(limit * 0.3));
   const hnTarget = Math.min(500, Math.round(limit * 0.3));
   const hfTarget = Math.max(limit - ghTarget - hnTarget, Math.round(limit * 0.45));
 
@@ -2692,13 +2708,12 @@ async function collectProducts(
     }
   };
 
-  // Source B: GitHub Repositories Search (respects X-RateLimit-Remaining & 403/429 gracefully)
+  // Source B: GitHub Repositories Search (uses GITHUB_TOKEN when set, logs missing token warning, handles 403/429 with backoff & partial preservation)
   const fetchGithubProducts = async () => {
-    const ghHeaders: Record<string, string> = {
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-    };
-    if (config.githubToken) ghHeaders.Authorization = `Bearer ${config.githubToken}`;
+    if (!effectiveGithubToken) {
+      warnMissingGithubTokenOnce("collectProducts", onLog);
+    }
+    const ghHeaders = buildGithubHeaders(effectiveGithubToken);
     const seenUrls = new Set<string>();
     const queries = [
       "topic:ai stars:>100",
@@ -2708,73 +2723,90 @@ async function collectProducts(
     ];
     let hitRateLimit = isGithubRateLimitedNow();
     const tel = srcTelemetry.get("github_repositories")!;
-    for (const query of queries) {
-      if (hitRateLimit || ghRecords.length >= Math.max(ghTarget, limit * 0.45)) break;
-      let curPage = safePage;
-      while (ghRecords.length < Math.max(ghTarget, limit * 0.45) && curPage < safePage + 4) {
-        if (isGithubRateLimitedNow()) {
-          hitRateLimit = true;
-          break;
-        }
-        const url = `https://api.github.com/search/repositories?q=${encodeURIComponent(query)}&sort=stars&order=desc&per_page=100&page=${curPage}`;
-        const res = await http.fetch(url, {
-          headers: ghHeaders,
-          timeoutMs: config.requestTimeoutMs,
-          maxAttempts: 2,
-          checkRobots: false,
-        });
-        tel.attempts = Math.max(tel.attempts, res.attempts);
-        tel.httpStatus = res.status || tel.httpStatus;
-        const rlState = updateGithubRateLimitFromHeaders(res.status, res.headers);
-        if (!res.ok) {
-          errors.push({ source: "github_search", url, error: res.error || "fetch_failed" });
-          if (res.status === 403 || res.status === 429 || rlState.exhausted) hitRateLimit = true;
-          break;
-        }
-        verifier.seedSnapshot(url, res.status, res.content, res.contentType);
-        try {
-          const payload = JSON.parse(res.content) as Record<string, unknown>;
-          const items = Array.isArray(payload.items) ? (payload.items as Array<Record<string, unknown>>) : [];
-          if (items.length === 0) break;
-          for (const repo of items) {
-            const name = String(repo.name ?? "").trim();
-            const htmlUrl = String(repo.html_url ?? "").trim();
-            if (!name || !htmlUrl || seenUrls.has(htmlUrl)) continue;
-            seenUrls.add(htmlUrl);
-            const homepage = validateOptionalUrl(repo.homepage);
-            const topics = Array.isArray(repo.topics) ? repo.topics : [];
-            const category = normalizeUnknownText(topics[0] ?? repo.language);
-            const owner = normalizeUnknownText((repo.owner as Record<string, unknown> | undefined)?.login);
-            ghRecords.push({
-              name,
-              description: String(repo.description ?? "").trim() || null,
-              website: homepage || htmlUrl,
-              official_website: homepage || htmlUrl,
-              category,
-              company_name: owner,
-              source_name: "github_repositories",
-              source_url: normalizeUrl(htmlUrl),
-              collected_at: nowIso,
-              source_metadata: {
-                api_url: url,
-                stars: repo.stargazers_count ?? null,
-                forks: repo.forks_count ?? null,
-                language: repo.language ?? null,
-                full_name: repo.full_name ?? null,
-              },
-            });
-          }
-          if (rlState.exhausted) {
+    if (hitRateLimit) {
+      const msg = "GitHub REST API rate-limit cooldown already active; skipping additional search queries without failing run.";
+      onLog?.(`[products/github] ${msg}`);
+      errors.push({ source: "github_search", url: "https://api.github.com/search/repositories", error: msg });
+      return;
+    }
+    try {
+      for (const query of queries) {
+        if (hitRateLimit || ghRecords.length >= Math.max(ghTarget, limit * 0.45)) break;
+        let curPage = safePage;
+        while (ghRecords.length < Math.max(ghTarget, limit * 0.45) && curPage < safePage + 4) {
+          if (isGithubRateLimitedNow()) {
             hitRateLimit = true;
             break;
           }
-          if (items.length < 100) break;
-          curPage++;
-        } catch (err) {
-          errors.push({ source: "github_search", url, error: `invalid_json: ${String(err)}` });
-          break;
+          const url = `https://api.github.com/search/repositories?q=${encodeURIComponent(query)}&sort=stars&order=desc&per_page=100&page=${curPage}`;
+          const { res, rlState } = await fetchGithubWithRateLimitRetry(http, url, {
+            headers: ghHeaders,
+            timeoutMs: config.requestTimeoutMs,
+            maxAttempts: 3,
+          });
+          tel.attempts = Math.max(tel.attempts, res.attempts);
+          tel.httpStatus = res.status || tel.httpStatus;
+          if (!res.ok) {
+            const isRl = res.status === 403 || res.status === 429 || rlState.exhausted;
+            const errMsg = isRl
+              ? `GitHub API rate limit/forbidden (HTTP ${res.status}${rlState.resetAtIso ? `, resets at ${rlState.resetAtIso}` : ""})${effectiveGithubToken ? "" : "; GITHUB_TOKEN missing (60 req/hr limit)"} — preserved ${ghRecords.length} partial repo records.`
+              : res.error || "fetch_failed";
+            errors.push({ source: "github_search", url, error: errMsg });
+            onLog?.(`[products/github] ${errMsg}`);
+            if (isRl) hitRateLimit = true;
+            break;
+          }
+          verifier.seedSnapshot(url, res.status, res.content, res.contentType);
+          try {
+            const payload = JSON.parse(res.content) as Record<string, unknown>;
+            const items = Array.isArray(payload.items) ? (payload.items as Array<Record<string, unknown>>) : [];
+            if (items.length === 0) break;
+            for (const repo of items) {
+              const name = String(repo.name ?? "").trim();
+              const htmlUrl = String(repo.html_url ?? "").trim();
+              if (!name || !htmlUrl || seenUrls.has(htmlUrl)) continue;
+              seenUrls.add(htmlUrl);
+              const homepage = validateOptionalUrl(repo.homepage);
+              const topics = Array.isArray(repo.topics) ? repo.topics : [];
+              const category = normalizeUnknownText(topics[0] ?? repo.language);
+              const owner = normalizeUnknownText((repo.owner as Record<string, unknown> | undefined)?.login);
+              ghRecords.push({
+                name,
+                description: String(repo.description ?? "").trim() || null,
+                website: homepage || htmlUrl,
+                official_website: homepage || htmlUrl,
+                category,
+                company_name: owner,
+                source_name: "github_repositories",
+                source_url: normalizeUrl(htmlUrl),
+                collected_at: nowIso,
+                source_metadata: {
+                  api_url: url,
+                  stars: repo.stargazers_count ?? null,
+                  forks: repo.forks_count ?? null,
+                  updated_at: repo.updated_at ?? null,
+                  pushed_at: repo.pushed_at ?? null,
+                  language: repo.language ?? null,
+                  full_name: repo.full_name ?? null,
+                },
+              });
+            }
+            if (rlState.exhausted) {
+              hitRateLimit = true;
+              break;
+            }
+            if (items.length < 100) break;
+            curPage++;
+          } catch (err) {
+            errors.push({ source: "github_search", url, error: `invalid_json: ${String(err)}` });
+            break;
+          }
         }
       }
+    } catch (ghErr) {
+      const msg = redactSecrets(ghErr instanceof Error ? ghErr.message : String(ghErr));
+      errors.push({ source: "github_search", url: "https://api.github.com/search/repositories", error: msg });
+      onLog?.(`[products/github] Preserved ${ghRecords.length} partial repos after unexpected error: ${msg}`);
     }
   };
 
@@ -2902,12 +2934,83 @@ function reconstructOpenAlexAbstract(inv: unknown): string | null {
   return positions.map((p) => p[1]).join(" ").trim() || null;
 }
 
+export async function fetchOpenAlexWorksPage(opts: {
+  http: PoliteHttpClient;
+  page: number;
+  perPage: number;
+  search?: string;
+  timeoutMs: number;
+  baseUserAgent: string;
+  mailto?: string | null;
+  baseUrl?: string;
+  maxAttempts?: number;
+  retryBaseDelayMs?: number;
+}): Promise<{
+  ok: boolean;
+  url: string;
+  status: number;
+  attempts: number;
+  error: string | null;
+  works: Array<Record<string, unknown>>;
+  rawContent: string;
+  contentType: string;
+}> {
+  const cleanBase = (opts.baseUrl || "https://api.openalex.org/works").replace(/\/+$/, "");
+  const queryUrl = `${cleanBase}?search=${encodeURIComponent(opts.search || "artificial intelligence")}&per-page=${opts.perPage}&page=${opts.page}&sort=publication_date:desc`;
+  const effectiveUrl = buildOpenAlexRequestUrl(queryUrl, opts.mailto);
+  const res = await opts.http.fetch(effectiveUrl, {
+    timeoutMs: Math.max(opts.timeoutMs, 1000),
+    maxAttempts: opts.maxAttempts ?? 4,
+    retryBaseDelayMs: opts.retryBaseDelayMs,
+    checkRobots: false,
+    userAgent: buildOpenAlexUserAgent(opts.baseUserAgent, opts.mailto),
+  });
+  if (!res.ok) {
+    return {
+      ok: false,
+      url: effectiveUrl,
+      status: res.status || 0,
+      attempts: Math.max(1, res.attempts),
+      error: `openalex request failed after ${Math.max(1, res.attempts)} attempt(s)${res.status ? ` (HTTP ${res.status})` : ""}: ${res.error || "fetch_failed"}`,
+      works: [],
+      rawContent: "",
+      contentType: res.contentType || "",
+    };
+  }
+  try {
+    const payload = JSON.parse(res.content) as Record<string, unknown>;
+    const works = Array.isArray(payload.results) ? (payload.results as Array<Record<string, unknown>>) : [];
+    return {
+      ok: true,
+      url: effectiveUrl,
+      status: res.status,
+      attempts: Math.max(1, res.attempts),
+      error: null,
+      works,
+      rawContent: res.content,
+      contentType: res.contentType || "application/json",
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      url: effectiveUrl,
+      status: res.status || 0,
+      attempts: Math.max(1, res.attempts),
+      error: `invalid_json: ${err instanceof Error ? err.message : String(err)}`,
+      works: [],
+      rawContent: res.content,
+      contentType: res.contentType || "",
+    };
+  }
+}
+
 async function collectResearchPapers(
   config: AtlasConfig,
   http: PoliteHttpClient,
   verifier: LiveSourceVerifier,
   limit: number,
-  page: number
+  page: number,
+  onLog?: (msg: string) => void
 ): Promise<CollectionBatchResult> {
   const safePage = Math.max(1, page);
   const errors: CollectorError[] = [];
@@ -3122,33 +3225,37 @@ async function collectResearchPapers(
     });
   };
 
-  // 3. OpenAlex API (100/page, date-only metadata — never fabricate timestamps)
+  // 3. OpenAlex API (100/page, polite pool mailto/UA + 30s timeout + 4-attempt exponential backoff, isolated error handling)
   const fetchOpenAlex = async () => {
     const pagesNeeded = Math.min(10, Math.max(1, Math.ceil((limit * 0.7) / 100)));
     let oaErr: string | null = null;
     let lastStatus: number | null = null;
     let totalAttempts = 0;
     const baseUrl = "https://api.openalex.org/works";
-    for (let offset = 0; offset < pagesNeeded && oaPapers.length < limit; offset++) {
-      const curPage = safePage + offset;
-      const perPage = Math.min(100, Math.max(15, limit));
-      const oaUrl = `${baseUrl}?search=${encodeURIComponent("artificial intelligence")}&per-page=${perPage}&page=${curPage}&sort=publication_date:desc&mailto=frontier-atlas@users.noreply.github.com`;
-      const res = await http.fetch(oaUrl, {
-        timeoutMs: Math.max(config.requestTimeoutMs, 25000),
-        maxAttempts: 2,
-        checkRobots: false,
-      });
-      totalAttempts = Math.max(totalAttempts, res.attempts);
-      lastStatus = res.status || lastStatus;
-      if (!res.ok) {
-        oaErr = res.error || "fetch_failed";
-        errors.push({ source: "openalex", url: oaUrl, error: oaErr });
-        break;
-      }
-      verifier.seedSnapshot(oaUrl, res.status, res.content, res.contentType);
-      try {
-        const payload = JSON.parse(res.content) as Record<string, unknown>;
-        const works = Array.isArray(payload.results) ? (payload.results as Array<Record<string, unknown>>) : [];
+    try {
+      for (let offset = 0; offset < pagesNeeded && oaPapers.length < limit; offset++) {
+        const curPage = safePage + offset;
+        const perPage = Math.min(100, Math.max(15, limit));
+        const pageRes = await fetchOpenAlexWorksPage({
+          http,
+          page: curPage,
+          perPage,
+          timeoutMs: Math.max(config.requestTimeoutMs, 30000),
+          baseUserAgent: config.userAgent,
+          mailto: config.openAlexMailto,
+          baseUrl,
+          maxAttempts: 4,
+        });
+        totalAttempts = Math.max(totalAttempts, pageRes.attempts);
+        lastStatus = pageRes.status || lastStatus;
+        if (!pageRes.ok) {
+          oaErr = pageRes.error || "fetch_failed";
+          errors.push({ source: "openalex", url: pageRes.url, error: oaErr });
+          onLog?.(`[research_papers/openalex] ${oaErr}`);
+          break;
+        }
+        verifier.seedSnapshot(pageRes.url, pageRes.status, pageRes.rawContent, pageRes.contentType);
+        const works = pageRes.works;
         if (works.length === 0) break;
         for (const work of works) {
           const title = String(work.title ?? "").trim();
@@ -3203,7 +3310,7 @@ async function collectResearchPapers(
             source_url: normalizeUrl(landingUrl),
             collected_at: nowIso,
             source_metadata: {
-              api_url: oaUrl,
+              api_url: pageRes.url,
               published_at_utc: exactPubAt,
               timestamp_precision: exactPubAt ? "verified_exact" : pubDate ? "date_only" : "unverified",
               openalex_id: oaId,
@@ -3213,11 +3320,11 @@ async function collectResearchPapers(
             },
           });
         }
-      } catch (err) {
-        oaErr = `invalid_json: ${String(err)}`;
-        errors.push({ source: "openalex", url: oaUrl, error: oaErr });
-        break;
       }
+    } catch (err) {
+      oaErr = redactSecrets(err instanceof Error ? err.message : String(err));
+      errors.push({ source: "openalex", url: baseUrl, error: oaErr });
+      onLog?.(`[research_papers/openalex] Unexpected error without aborting healthy sources: ${oaErr}`);
     }
     sourceOutcomes.push({
       category: "research_papers",
@@ -3379,12 +3486,14 @@ async function collectResearchPapers(
     slugToRecords.set(slug, arr);
   }
 
-  const maxSlugsToEnrich = config.githubToken ? 200 : 40;
+  const resolvedGhToken = config.githubToken || process.env.GITHUB_TOKEN?.trim() || null;
+  const maxSlugsToEnrich = resolvedGhToken ? 200 : 40;
   await enrichGithubRepoMap(slugToRecords, {
     http,
-    githubToken: config.githubToken,
+    githubToken: resolvedGhToken,
     maxSlugs: maxSlugsToEnrich,
     nowIso,
+    onLog,
   });
 
   return { records: limited, errors, hasMore: limited.length >= limit, sourceOutcomes };
@@ -4312,12 +4421,15 @@ export function updateGithubRateLimitFromHeaders(
 
   const exhausted = status === 403 || status === 429 || remaining === 0;
   if (exhausted) {
-    const candidateUntil = retryAfterMs
-      ? nowMs + Math.min(3600_000, retryAfterMs)
-      : resetMs && resetMs > nowMs
-      ? Math.min(nowMs + 3600_000, resetMs)
-      : nowMs + 60_000;
+    const candidateUntil =
+      retryAfterMs !== null
+        ? nowMs + Math.min(3600_000, retryAfterMs)
+        : resetMs && resetMs > nowMs
+        ? Math.min(nowMs + 3600_000, resetMs)
+        : nowMs + 60_000;
     githubRateLimitedUntilMs = Math.max(githubRateLimitedUntilMs, candidateUntil);
+  } else if (status >= 200 && status < 300 && (remaining === null || remaining > 0)) {
+    githubRateLimitedUntilMs = 0;
   }
   return {
     exhausted,
@@ -4327,20 +4439,148 @@ export function updateGithubRateLimitFromHeaders(
   };
 }
 
+let missingGithubTokenWarned = false;
+
+export function resetGithubWarningForTest(): void {
+  missingGithubTokenWarned = false;
+}
+
+export function warnMissingGithubTokenOnce(context: string, onLog?: (msg: string) => void): void {
+  const msg = `[GitHub:${context}] Warning: GITHUB_TOKEN is not set. Unauthenticated requests are capped at 60 req/hr; configure GITHUB_TOKEN in .env for 5,000 req/hr.`;
+  if (!missingGithubTokenWarned) {
+    missingGithubTokenWarned = true;
+    console.warn(msg);
+  }
+  onLog?.(msg);
+}
+
+export function buildGithubHeaders(githubToken?: string | null): Record<string, string> {
+  const token =
+    githubToken === undefined
+      ? process.env.GITHUB_TOKEN?.trim() || null
+      : githubToken?.trim() || null;
+  const headers: Record<string, string> = {
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+  return headers;
+}
+
+export function buildOpenAlexRequestUrl(rawUrl: string, mailto?: string | null): string {
+  const cleanMail = mailto?.trim();
+  if (!cleanMail) return rawUrl;
+  try {
+    const u = new URL(rawUrl);
+    u.searchParams.set("mailto", cleanMail);
+    return u.toString();
+  } catch {
+    return rawUrl;
+  }
+}
+
+export function buildOpenAlexUserAgent(baseUserAgent: string, mailto?: string | null): string {
+  const cleanMail = mailto?.trim();
+  if (!cleanMail) return baseUserAgent;
+  if (baseUserAgent.toLowerCase().includes("mailto:")) return baseUserAgent;
+  if (baseUserAgent.endsWith(")")) {
+    return `${baseUserAgent.slice(0, -1)}; mailto:${cleanMail})`;
+  }
+  return `${baseUserAgent} (mailto:${cleanMail})`;
+}
+
+export async function fetchGithubWithRateLimitRetry(
+  http: PoliteHttpClient,
+  url: string,
+  opts: {
+    headers: Record<string, string>;
+    timeoutMs: number;
+    maxAttempts?: number;
+    retryBaseDelayMs?: number;
+  }
+): Promise<{
+  res: Awaited<ReturnType<PoliteHttpClient["fetch"]>>;
+  rlState: ReturnType<typeof updateGithubRateLimitFromHeaders>;
+}> {
+  const maxAttempts = Math.max(1, opts.maxAttempts ?? 3);
+  const baseUnitMs = opts.retryBaseDelayMs ?? 1000;
+  let lastRes: Awaited<ReturnType<PoliteHttpClient["fetch"]>> | null = null;
+  let lastRl: ReturnType<typeof updateGithubRateLimitFromHeaders> = {
+    exhausted: false,
+    remaining: null,
+    limit: null,
+    resetAtIso: null,
+  };
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const res = await http.fetch(url, {
+      headers: opts.headers,
+      timeoutMs: opts.timeoutMs,
+      maxAttempts: 1,
+      checkRobots: false,
+    });
+    const rlState = updateGithubRateLimitFromHeaders(res.status, res.headers);
+    lastRes = res;
+    lastRl = rlState;
+
+    const isRateOrServerTransient =
+      res.status === 403 || res.status === 429 || (res.status >= 500 && res.status <= 599);
+    if (res.ok || !isRateOrServerTransient) {
+      return { res, rlState };
+    }
+
+    // If primary GitHub rate limit quota is confirmed exhausted (X-RateLimit-Remaining: 0), halt immediately to preserve partial results cleanly.
+    const retryAfterSecRaw = res.headers["retry-after"];
+    const retryAfterSec =
+      retryAfterSecRaw && /^\d+$/.test(retryAfterSecRaw.trim()) ? Number(retryAfterSecRaw.trim()) : null;
+    const isShortRetryWindow = retryAfterSec !== null && retryAfterSec <= 10;
+    const shouldRetry =
+      attempt < maxAttempts &&
+      ((res.status >= 500 && res.status <= 599) ||
+        isShortRetryWindow ||
+        (res.status === 429 && rlState.remaining !== 0));
+
+    if (!shouldRetry) {
+      return { res, rlState };
+    }
+
+    const waitMs = isShortRetryWindow
+      ? Math.max(50, retryAfterSec! * 1000)
+      : Math.min(8000, baseUnitMs * Math.pow(2, attempt - 1));
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+  }
+
+  return {
+    res: lastRes!,
+    rlState: lastRl,
+  };
+}
+
 export async function enrichGithubRepoMap(
   slugToRecords: Map<string, Array<Record<string, unknown>>>,
   opts: {
     http: PoliteHttpClient;
-    githubToken: string | null;
+    githubToken: string | null | undefined;
     maxSlugs: number;
     nowIso: string;
     apiBaseUrl?: string;
     cacheTtlMs?: number;
+    retryBaseDelayMs?: number;
+    onLog?: (msg: string) => void;
   }
 ): Promise<{ cacheHits: number; apiFetched: number; rateLimited: boolean }> {
   const ttlMs = opts.cacheTtlMs ?? GITHUB_CACHE_TTL_MS;
   const cleanBase = (opts.apiBaseUrl ?? "https://api.github.com").replace(/\/+$/, "");
-  const hasToken = Boolean(opts.githubToken && opts.githubToken.trim());
+  const effectiveToken =
+    opts.githubToken === undefined
+      ? process.env.GITHUB_TOKEN?.trim() || null
+      : opts.githubToken?.trim() || null;
+  const hasToken = Boolean(effectiveToken);
+  if (!hasToken && slugToRecords.size > 0) {
+    warnMissingGithubTokenOnce("enrichGithubRepoMap", opts.onLog);
+  }
   const cacheKeyPrefix = hasToken ? "auth:" : "anon:";
   const nowMs = Date.now();
   let cacheHits = 0;
@@ -4366,11 +4606,7 @@ export async function enrichGithubRepoMap(
   }
 
   const slugsToQuery = uncachedSlugs.slice(0, Math.max(0, opts.maxSlugs));
-  const headers: Record<string, string> = {
-    Accept: "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
-  };
-  if (hasToken) headers.Authorization = `Bearer ${opts.githubToken!.trim()}`;
+  const headers = buildGithubHeaders(effectiveToken);
 
   await mapConcurrent(slugsToQuery, 4, async (slug) => {
     const metricsCheckedAt = new Date().toISOString();
@@ -4391,13 +4627,16 @@ export async function enrichGithubRepoMap(
     }
 
     apiFetched += 1;
-    const ghRes = await opts.http.fetch(`${cleanBase}/repos/${slug}`, {
-      headers,
-      timeoutMs: 8000,
-      maxAttempts: 1,
-      checkRobots: false,
-    });
-    const rl = updateGithubRateLimitFromHeaders(ghRes.status, ghRes.headers);
+    const { res: ghRes, rlState: rl } = await fetchGithubWithRateLimitRetry(
+      opts.http,
+      `${cleanBase}/repos/${slug}`,
+      {
+        headers,
+        timeoutMs: 8000,
+        maxAttempts: 3,
+        retryBaseDelayMs: opts.retryBaseDelayMs,
+      }
+    );
 
     if (ghRes.status === 403 || ghRes.status === 429) {
       for (const rec of slugToRecords.get(slug) ?? []) {
@@ -4514,7 +4753,8 @@ export interface IntegrationHealthSummary {
 export async function probeGithubApi(
   http: PoliteHttpClient,
   githubToken: string | null,
-  apiBaseUrl = "https://api.github.com"
+  apiBaseUrl = "https://api.github.com",
+  opts?: { probeUnauthenticated?: boolean }
 ): Promise<IntegrationHealthItem> {
   const checkedAt = new Date().toISOString();
   const base: Omit<IntegrationHealthItem, "status" | "detail" | "error" | "latencyMs"> = {
@@ -4525,23 +4765,86 @@ export async function probeGithubApi(
     tested: true,
   };
 
-  if (!githubToken || !githubToken.trim()) {
+  const cleanBase = apiBaseUrl.replace(/\/+$/, "");
+  const cleanToken = githubToken?.trim() || "";
+
+  if (!cleanToken) {
+    const shouldCheckPublic =
+      opts?.probeUnauthenticated === true ||
+      (opts?.probeUnauthenticated !== false && cleanBase === "https://api.github.com");
+    if (!shouldCheckPublic) {
+      return {
+        ...base,
+        status: "Not Configured",
+        detail: "GITHUB_TOKEN is not set. Unauthenticated public GitHub endpoints remain limited to 60 requests/hour.",
+        error: null,
+        latencyMs: null,
+      };
+    }
+
+    const startedAt = Date.now();
+    const pubRes = await http.fetch(`${cleanBase}/repos/huggingface/transformers`, {
+      headers: buildGithubHeaders(null),
+      checkRobots: false,
+      timeoutMs: 8000,
+      maxAttempts: 1,
+    });
+    const latencyMs = Date.now() - startedAt;
+    const rl = updateGithubRateLimitFromHeaders(pubRes.status, pubRes.headers);
+
+    if (!pubRes.ok || rl.exhausted) {
+      let apiMessage = "";
+      try {
+        const parsed = JSON.parse(pubRes.content) as { message?: string };
+        if (parsed.message) apiMessage = redactSecrets(parsed.message);
+      } catch {
+        // Ignore parse error
+      }
+      const errText =
+        pubRes.status === 403 || pubRes.status === 429 || rl.exhausted
+          ? `GITHUB_TOKEN is not set and unauthenticated GitHub REST API is rate-limited (HTTP ${pubRes.status || 403}${rl.resetAtIso ? `, resets at ${rl.resetAtIso}` : ""}${apiMessage ? `: ${apiMessage}` : ""}). Set GITHUB_TOKEN for 5,000 req/hr.`
+          : `GITHUB_TOKEN is not set and GitHub public API probe failed (${redactSecrets(pubRes.error || `HTTP ${pubRes.status}`)}).`;
+      return {
+        ...base,
+        status: "Connection Failed",
+        detail: errText,
+        error: errText,
+        latencyMs,
+      };
+    }
+
+    let repoMetaNote = "";
+    try {
+      const repoJson = JSON.parse(pubRes.content) as Record<string, unknown>;
+      const stars = typeof repoJson.stargazers_count === "number" ? repoJson.stargazers_count : null;
+      const forks = typeof repoJson.forks_count === "number" ? repoJson.forks_count : null;
+      const updatedAt = typeof repoJson.updated_at === "string" ? repoJson.updated_at : null;
+      if (stars !== null || forks !== null || updatedAt) {
+        repoMetaNote = ` · Verified huggingface/transformers (stars=${stars ?? "?"}, forks=${forks ?? "?"}, updated_at=${updatedAt ?? "?"})`;
+      }
+    } catch {
+      // Ignore parse error
+    }
+
+    const remLabel =
+      rl.remaining !== null && rl.limit !== null
+        ? `${rl.remaining}/${rl.limit} req/hr remaining`
+        : "60 requests/hour cap";
     return {
       ...base,
       status: "Not Configured",
-      detail: "GITHUB_TOKEN is not set. Unauthenticated public GitHub endpoints remain limited to 60 requests/hour.",
+      detail: `Warning: GITHUB_TOKEN is not set — using unauthenticated GitHub REST API (${remLabel})${repoMetaNote}. Set GITHUB_TOKEN for 5,000 req/hr.`,
       error: null,
-      latencyMs: null,
+      latencyMs,
     };
   }
 
   const startedAt = Date.now();
-  const cleanBase = apiBaseUrl.replace(/\/+$/, "");
   const res = await http.fetch(`${cleanBase}/rate_limit`, {
     headers: {
       Accept: "application/vnd.github+json",
       "X-GitHub-Api-Version": "2022-11-28",
-      Authorization: `Bearer ${githubToken.trim()}`,
+      Authorization: `Bearer ${cleanToken}`,
     },
     checkRobots: false,
     timeoutMs: 8000,
@@ -4665,6 +4968,7 @@ export class AtlasBackendService {
         credentialsPath: this.config.googleSheetsCredentialsPath,
         credentialsJson: this.config.googleSheetsCredentialsJson,
         savedCredentialsPath: this.getSavedCredentialsFilePath(),
+        webhookUrl: this.config.appsScriptWebhookUrl,
         spreadsheetId: this.config.googleSheetsSpreadsheetId,
         spreadsheetName: this.config.googleSheetsSpreadsheetName,
         freshnessWindowHours: this.config.freshnessWindowHours,
@@ -5136,12 +5440,12 @@ export class AtlasBackendService {
       },
       {
         id: "google_sheets",
-        label: "Google Sheets & Drive Service Account",
-        envKey: "GOOGLE_SHEETS_CREDENTIALS_JSON (spreadsheets, drive)",
+        label: "Google Sheets Sync (Apps Script / Optional Service Account)",
+        envKey: "APPS_SCRIPT_WEBHOOK_URL (or optional GOOGLE_SHEETS_CREDENTIALS_JSON)",
         status: "Not Configured",
         detail: this.sheets.isConfigured()
-          ? "Service Account configured — awaiting live API test before marking Configured."
-          : "Google Service Account JSON not configured yet. Paste Service Account credentials in the Setup Panel or set GOOGLE_SHEETS_CREDENTIALS_JSON.",
+          ? "Google Sheets sync configured — awaiting live endpoint check."
+          : "No Google Apps Script Webhook URL saved yet. Paste a Web App URL in Google Sheets Setup (no GCP credentials required).",
         error: null,
         latencyMs: null,
         checkedAt: null,
@@ -5274,8 +5578,8 @@ export class AtlasBackendService {
         githubProbe,
         {
           id: "google_sheets",
-          label: "Google Sheets & Drive Service Account",
-          envKey: "GOOGLE_SHEETS_CREDENTIALS_JSON (spreadsheets, drive)",
+          label: "Google Sheets Sync (Apps Script / Optional Service Account)",
+          envKey: "APPS_SCRIPT_WEBHOOK_URL (or optional GOOGLE_SHEETS_CREDENTIALS_JSON)",
           status: sheetsProbe.status,
           detail: sheetsProbe.detail,
           error: sheetsProbe.error,
@@ -5687,9 +5991,10 @@ export class AtlasBackendService {
 
   private syncSheetsHealthFromStatus(st: {
     status: "Connected" | "Not Connected" | "Sync Failed";
-    credentialSource: "oauth" | "path" | "json_env" | "saved_config" | null;
+    credentialSource: "apps_script_webhook" | "oauth" | "path" | "json_env" | "saved_config" | null;
     verifiedAccountEmail?: string | null;
     spreadsheetId: string | null;
+    spreadsheetUrl?: string | null;
     lastError: string | null;
   }): void {
     if (!this.latestHealth) return;
@@ -5699,20 +6004,29 @@ export class AtlasBackendService {
         : st.status === "Sync Failed"
         ? "Connection Failed"
         : "Not Configured";
-    const srcLabel = st.credentialSource === "oauth" ? "Google OAuth" : "Service Account";
+    const srcLabel =
+      st.credentialSource === "apps_script_webhook"
+        ? "Google Apps Script Web App"
+        : st.credentialSource === "oauth"
+        ? "Google OAuth"
+        : "Service Account";
     const detail =
       mappedStatus === "Configured"
-        ? st.spreadsheetId
+        ? st.credentialSource === "apps_script_webhook"
+          ? st.spreadsheetUrl
+            ? `Verified ${srcLabel} synced to ${st.spreadsheetUrl}.`
+            : `Verified ${srcLabel} endpoint ready for 6-tab sync.`
+          : st.spreadsheetId
           ? `Verified live ${srcLabel}${st.verifiedAccountEmail ? ` (${st.verifiedAccountEmail})` : ""} access to spreadsheet ${st.spreadsheetId}.`
           : `Verified live ${srcLabel}${st.verifiedAccountEmail ? ` (${st.verifiedAccountEmail})` : ""} Drive & Sheets readiness.`
         : mappedStatus === "Connection Failed"
-        ? st.lastError || "Google Workspace verification failed."
-        : "Google Service Account JSON not configured yet. Paste Service Account credentials in the Setup Panel or set GOOGLE_SHEETS_CREDENTIALS_JSON.";
+        ? st.lastError || "Google Sheets sync verification failed."
+        : "No Google Apps Script Webhook URL saved yet. Paste a Web App URL in Google Sheets Setup (no GCP credentials required).";
     const checkedAt = new Date().toISOString();
     const updatedItem: IntegrationHealthItem = {
       id: "google_sheets",
-      label: "Google Sheets & Drive Service Account",
-      envKey: "GOOGLE_SHEETS_CREDENTIALS_JSON (spreadsheets, drive)",
+      label: "Google Sheets Sync (Apps Script / Optional Service Account)",
+      envKey: "APPS_SCRIPT_WEBHOOK_URL (or optional GOOGLE_SHEETS_CREDENTIALS_JSON)",
       status: mappedStatus,
       detail,
       error: mappedStatus === "Connection Failed" ? st.lastError || detail : null,
@@ -5727,11 +6041,64 @@ export class AtlasBackendService {
     };
   }
 
+  public async saveGoogleAppsScriptWebhook(
+    rawWebhookUrl: string | null,
+    opts?: { skipVerify?: boolean }
+  ): Promise<{
+    saved: boolean;
+    configured: boolean;
+    verified: boolean;
+    webhookUrl: string | null;
+    sheetsStatus: SheetsConnectionStatus;
+    error: string | null;
+  }> {
+    const trimmed = typeof rawWebhookUrl === "string" ? rawWebhookUrl.trim() : "";
+    const validatedUrl = trimmed ? this.sheets.validateWebhookUrl(trimmed) : null;
+    this.db.saveSheetsWebhookUrl(validatedUrl);
+    this.sheets.clearCachedAuth();
+
+    if (!validatedUrl) {
+      const sheetsStatus = this.sheets.getStatus();
+      this.syncSheetsHealthFromStatus(sheetsStatus);
+      return {
+        saved: true,
+        configured: this.sheets.isConfigured(),
+        verified: false,
+        webhookUrl: null,
+        sheetsStatus,
+        error: null,
+      };
+    }
+
+    if (opts?.skipVerify) {
+      const sheetsStatus = this.sheets.getStatus();
+      this.syncSheetsHealthFromStatus(sheetsStatus);
+      return {
+        saved: true,
+        configured: this.sheets.isConfigured(),
+        verified: false,
+        webhookUrl: validatedUrl,
+        sheetsStatus,
+        error: null,
+      };
+    }
+
+    const sheetsStatus = await this.verifyGoogleSheetsConnection({ webhookUrl: validatedUrl });
+    return {
+      saved: true,
+      configured: this.sheets.isConfigured(),
+      verified: sheetsStatus.status === "Connected",
+      webhookUrl: validatedUrl,
+      sheetsStatus,
+      error: sheetsStatus.status === "Connected" ? null : sheetsStatus.lastError,
+    };
+  }
+
   public async saveGoogleServiceAccountCredentials(rawJsonInput: string): Promise<{
     saved: boolean;
     configured: boolean;
     verified: boolean;
-    credentialSource: "path" | "json_env" | "saved_config" | null;
+    credentialSource: "apps_script_webhook" | "path" | "json_env" | "saved_config" | null;
     clientEmail: string;
     projectId: string | null;
     sheetsStatus: SheetsConnectionStatus;
@@ -5849,9 +6216,13 @@ export class AtlasBackendService {
 
   public async exportGoogleSheets(opts?: {
     oauthAccessToken?: string | null;
+    webhookUrl?: string | null;
     spreadsheetId?: string | null;
     createNew?: boolean;
     exportScope?: ExportScope;
+    onlyTabs?: string[];
+    retryFailedOnly?: boolean;
+    perWorksheet?: boolean;
   }): Promise<SheetsSyncResult> {
     const res = await this.sheets.exportOrSync("full", opts);
     this.syncSheetsHealthFromStatus(this.sheets.getStatus());
@@ -5870,9 +6241,13 @@ export class AtlasBackendService {
 
   public async syncGoogleSheets(opts?: {
     oauthAccessToken?: string | null;
+    webhookUrl?: string | null;
     spreadsheetId?: string | null;
     createNew?: boolean;
     exportScope?: ExportScope;
+    onlyTabs?: string[];
+    retryFailedOnly?: boolean;
+    perWorksheet?: boolean;
   }): Promise<SheetsSyncResult> {
     const res = await this.sheets.exportOrSync("incremental", opts);
     this.syncSheetsHealthFromStatus(this.sheets.getStatus());
@@ -5889,8 +6264,19 @@ export class AtlasBackendService {
     return res;
   }
 
+  public async readGoogleSheetsDataset(opts: {
+    tabName: string;
+    limit?: number;
+    webhookUrl?: string | null;
+    spreadsheetId?: string | null;
+    oauthAccessToken?: string | null;
+  }) {
+    return this.sheets.readWorksheetDataset(opts);
+  }
+
   public async verifyGoogleSheetsConnection(opts?: {
     oauthAccessToken?: string | null;
+    webhookUrl?: string | null;
     spreadsheetId?: string | null;
     createNew?: boolean;
   }): Promise<SheetsConnectionStatus> {
@@ -6046,8 +6432,8 @@ export class AtlasBackendService {
             const overrideFn = opts.collectorsOverride?.[cat as keyof NonNullable<typeof opts.collectorsOverride>];
             if (overrideFn) batch = await overrideFn(limit, safePage);
             else if (cat === "startups") batch = await collectStartups(this.config, this.http, this.llmRouter, verifier, limit, safePage, log);
-            else if (cat === "products") batch = await collectProducts(this.config, this.http, verifier, limit, safePage);
-            else if (cat === "research_papers") batch = await collectResearchPapers(this.config, this.http, verifier, limit, safePage);
+            else if (cat === "products") batch = await collectProducts(this.config, this.http, verifier, limit, safePage, log);
+            else if (cat === "research_papers") batch = await collectResearchPapers(this.config, this.http, verifier, limit, safePage, log);
             else if (cat === "jobs") batch = await collectJobs(this.config, this.http, verifier, limit, safePage);
             else if (cat === "news") batch = await collectNews(this.config, this.http, verifier, limit, safePage);
             else continue;

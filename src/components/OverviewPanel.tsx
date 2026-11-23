@@ -21,6 +21,7 @@ import {
   Trash2,
   XCircle,
 } from "lucide-react";
+import { GOOGLE_APPS_SCRIPT_SNIPPET } from "./AppsScriptSetupModal";
 import type {
   AtlasStatusResponse,
   DatasetCategory,
@@ -50,6 +51,13 @@ interface OverviewPanelProps {
   testingGoogleConnection: boolean;
   sheetsFeedback: SheetsFeedbackState | null;
   savingServiceAccount: boolean;
+  webhookUrlInput: string;
+  onWebhookUrlInputChange: (value: string) => void;
+  savingWebhookUrl: boolean;
+  onSaveWebhookUrl: () => Promise<boolean>;
+  onSaveAndSyncWebhook: () => Promise<boolean>;
+  onRemoveWebhookUrl: () => void;
+  onOpenAppsScriptModal: () => void;
   targetSpreadsheetId: string;
   onTargetSpreadsheetIdChange: (value: string) => void;
   onClearTargetSpreadsheetId: () => void;
@@ -176,6 +184,13 @@ export function OverviewPanel({
   testingGoogleConnection,
   sheetsFeedback,
   savingServiceAccount,
+  webhookUrlInput,
+  onWebhookUrlInputChange,
+  savingWebhookUrl,
+  onSaveWebhookUrl,
+  onSaveAndSyncWebhook,
+  onRemoveWebhookUrl,
+  onOpenAppsScriptModal,
   targetSpreadsheetId,
   onTargetSpreadsheetIdChange,
   onClearTargetSpreadsheetId,
@@ -201,6 +216,8 @@ export function OverviewPanel({
     status?.scheduler?.enabled ?? true
   );
   const [copiedUrl, setCopiedUrl] = useState(false);
+  const [copiedAppsScript, setCopiedAppsScript] = useState(false);
+  const [showAppsScriptPreview, setShowAppsScriptPreview] = useState(false);
   const [saJsonInput, setSaJsonInput] = useState("");
   const [showSaForm, setShowSaForm] = useState(false);
 
@@ -221,6 +238,16 @@ export function OverviewPanel({
       window.setTimeout(() => setCopiedUrl(false), 2000);
     } catch {
       // Clipboard API unavailable in restricted contexts
+    }
+  };
+
+  const handleCopyAppsScriptCode = async () => {
+    try {
+      await navigator.clipboard.writeText(GOOGLE_APPS_SCRIPT_SNIPPET);
+      setCopiedAppsScript(true);
+      window.setTimeout(() => setCopiedAppsScript(false), 2500);
+    } catch {
+      setShowAppsScriptPreview(true);
     }
   };
 
@@ -431,7 +458,9 @@ export function OverviewPanel({
             {(() => {
               const verifiedOpenUrl =
                 (sheetsFeedback?.success && sheetsFeedback.url) ||
-                (sheetsStatus.status === "Connected" && sheetsStatus.spreadsheetUrl
+                (sheetsStatus.spreadsheetUrl &&
+                (sheetsStatus.status === "Connected" ||
+                  (Boolean(sheetsStatus.webhookUrl) && Boolean(sheetsStatus.lastSyncAt)))
                   ? sheetsStatus.spreadsheetUrl
                   : null);
               if (!verifiedOpenUrl) return null;
@@ -601,16 +630,11 @@ export function OverviewPanel({
                 {sheetsFeedback.needsReauth && (
                   <button
                     type="button"
-                    onClick={() => {
-                      setShowSaForm(true);
-                      document
-                        .getElementById("service-account-setup-panel")
-                        ?.scrollIntoView({ behavior: "smooth", block: "center" });
-                    }}
+                    onClick={onOpenAppsScriptModal}
                     className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-sky-600 hover:bg-sky-500 text-white font-medium transition-colors"
                   >
-                    <KeyRound className="w-3 h-3" />
-                    <span>Setup Service Account</span>
+                    <Globe className="w-3 h-3" />
+                    <span>Setup Apps Script Webhook</span>
                   </button>
                 )}
                 {sheetsFeedback.success && sheetsFeedback.url && (
@@ -992,140 +1016,207 @@ export function OverviewPanel({
                       : "Not Connected"}
                   </span>
                 </span>
-                {sheetsStatus.status === "Connected" && Boolean(sheetsStatus.spreadsheetUrl) && (
-                  <a
-                    href={sheetsStatus.spreadsheetUrl!}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-sky-600 hover:bg-sky-500 text-white text-xs font-medium transition-colors"
-                  >
-                    <span>Open Google Sheet</span>
-                    <ExternalLink className="w-3 h-3" />
-                  </a>
-                )}
+                {(sheetsStatus.status === "Connected" ||
+                  (Boolean(sheetsStatus.webhookUrl) && Boolean(sheetsStatus.lastSyncAt))) &&
+                  Boolean(sheetsStatus.spreadsheetUrl) && (
+                    <a
+                      href={sheetsStatus.spreadsheetUrl!}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-sky-600 hover:bg-sky-500 text-white text-xs font-medium transition-colors"
+                    >
+                      <span>Open Google Sheet</span>
+                      <ExternalLink className="w-3 h-3" />
+                    </a>
+                  )}
               </div>
             </div>
 
+            {/* Zero-Setup Google Apps Script Webhook Setup */}
             <div
-              id="service-account-setup-panel"
-              className={`rounded-lg border p-3 space-y-2.5 ${
-                !sheetsStatus.configured
-                  ? "bg-amber-950/20 border-amber-700/50"
+              id="apps-script-webhook-setup-panel"
+              className={`rounded-lg border p-3.5 space-y-3 ${
+                sheetsStatus.webhookUrl
+                  ? "bg-[#070D1A] border-emerald-800/40"
                   : "bg-[#070D1A] border-slate-800/80"
               }`}
             >
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                 <div className="space-y-0.5 text-xs">
                   <div className="flex flex-wrap items-center gap-2">
-                    <KeyRound
+                    <Globe
                       className={`w-3.5 h-3.5 shrink-0 ${
-                        sheetsStatus.configured ? "text-emerald-400" : "text-amber-400"
+                        sheetsStatus.webhookUrl ? "text-emerald-400" : "text-sky-400"
                       }`}
                     />
                     <span className="font-medium text-slate-100">
-                      {sheetsStatus.configured
-                        ? "Google Service Account Configured"
-                        : "Google Service Account Setup Required"}
+                      Zero-Setup Google Apps Script Web App Sync
                     </span>
-                    {sheetsStatus.credentialSource && (
-                      <span className="font-mono text-[11px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300">
-                        {sheetsStatus.credentialSource === "saved_config"
-                          ? "Saved Server Key"
-                          : sheetsStatus.credentialSource === "json_env"
-                          ? "GOOGLE_SHEETS_CREDENTIALS_JSON"
-                          : sheetsStatus.credentialSource === "path"
-                          ? "Credentials File"
-                          : "OAuth"}
+                    {sheetsStatus.webhookUrl && (
+                      <span className="font-mono text-[11px] px-1.5 py-0.5 rounded bg-emerald-950/60 border border-emerald-800/60 text-emerald-300">
+                        Webhook Saved
                       </span>
                     )}
                   </div>
                   <p className="text-slate-400 leading-relaxed">
-                    {sheetsStatus.verifiedAccountEmail ? (
-                      <>
-                        Authenticating as{" "}
-                        <span className="font-mono text-emerald-300">
-                          {sheetsStatus.verifiedAccountEmail}
-                        </span>{" "}
-                        with <code className="text-slate-300">spreadsheets</code> &amp;{" "}
-                        <code className="text-slate-300">drive</code> scopes (auto-sets Anyone with the link — Viewer).
-                      </>
-                    ) : sheetsStatus.configured ? (
-                      "Service Account credentials present on server. Click Test Google Connection or Export Google Sheets to verify live Drive & Sheets API access."
-                    ) : (
-                      "Authenticates on the backend via Google Service Account (spreadsheets + drive scopes) — no browser OAuth popups required. Paste your Service Account JSON key below to enable automated 6-tab export and public link creation."
-                    )}
+                    No GCP credentials or Service Account JSON required. Paste a Google Apps Script Web App URL below to sync all 6 SQLite tabs automatically and set{" "}
+                    <strong className="text-slate-200">Anyone with the link — Viewer</strong> sharing.
                   </p>
                 </div>
-                {sheetsStatus.configured && (
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={onOpenAppsScriptModal}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-medium transition-colors"
+                  >
+                    <Globe className="w-3.5 h-3.5" />
+                    <span>Setup Apps Script Webhook</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleCopyAppsScriptCode()}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-sky-600 hover:bg-sky-500 text-white text-xs font-medium transition-colors"
+                  >
+                    {copiedAppsScript ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                    <span>{copiedAppsScript ? "Copied Apps Script Code!" : "Copy Google Apps Script Code"}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowAppsScriptPreview((v) => !v)}
+                    className="px-2.5 py-1.5 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium transition-colors"
+                  >
+                    {showAppsScriptPreview ? "Hide Script" : "View Script"}
+                  </button>
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
+                <label htmlFor="apps-script-webhook-url" className="text-xs text-slate-300 font-medium block">
+                  Google Apps Script Webhook URL
+                </label>
+                <div className="flex flex-col sm:flex-row gap-2">
+                  <input
+                    id="apps-script-webhook-url"
+                    type="text"
+                    inputMode="url"
+                    value={webhookUrlInput}
+                    onChange={(e) => onWebhookUrlInputChange(e.target.value)}
+                    placeholder="https://script.google.com/macros/s/.../exec"
+                    className="flex-1 px-3 py-1.5 rounded-lg bg-[#0B1324] border border-slate-700 text-xs font-mono text-slate-100 placeholder:text-slate-600 focus:outline-none focus:ring-2 focus:ring-sky-500"
+                  />
                   <div className="flex flex-wrap items-center gap-2 shrink-0">
                     <button
                       type="button"
-                      onClick={() => setShowSaForm((v) => !v)}
-                      className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium transition-colors"
+                      onClick={() => void onSaveWebhookUrl()}
+                      disabled={savingWebhookUrl || sheetsExporting || !webhookUrlInput.trim()}
+                      className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-100 text-xs font-medium transition-colors"
                     >
-                      {showSaForm ? "Cancel" : "Replace Key"}
+                      {savingWebhookUrl ? "Saving..." : "Save URL"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void onSaveAndSyncWebhook()}
+                      disabled={savingWebhookUrl || sheetsExporting || sheetsSyncing || !webhookUrlInput.trim()}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 text-white text-xs font-medium transition-colors"
+                    >
+                      <Play className="w-3 h-3" />
+                      <span>{sheetsExporting ? "Syncing..." : "Save & Sync Now"}</span>
+                    </button>
+                    {sheetsStatus.webhookUrl && (
+                      <button
+                        type="button"
+                        onClick={onRemoveWebhookUrl}
+                        disabled={savingWebhookUrl || sheetsExporting}
+                        className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-rose-950/60 hover:bg-rose-900/70 border border-rose-800/60 disabled:opacity-50 text-rose-200 text-xs font-medium transition-colors"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                        <span>Clear</span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              <ol className="list-decimal list-inside space-y-0.5 text-[11px] text-slate-400">
+                <li>
+                  Open a blank Google Sheet (<code className="text-slate-300">sheets.new</code>) &rarr; <strong className="text-slate-200">Extensions &rarr; Apps Script</strong>.
+                </li>
+                <li>
+                  Click <strong className="text-slate-200">Copy Google Apps Script Code</strong> above, replace <code className="text-slate-300">Code.gs</code>, and click <strong className="text-slate-200">Deploy &rarr; New deployment &rarr; Web app</strong>.
+                </li>
+                <li>
+                  Set <strong className="text-slate-200">Execute as: Me</strong> and <strong className="text-slate-200">Who has access: Anyone</strong>, authorize once, and paste the <code className="text-slate-300">/exec</code> URL above.
+                </li>
+              </ol>
+
+              {showAppsScriptPreview && (
+                <pre className="rounded-lg bg-[#0B1324] border border-slate-800 p-3 text-[11px] font-mono text-slate-300 max-h-60 overflow-y-auto whitespace-pre-wrap">
+                  {GOOGLE_APPS_SCRIPT_SNIPPET}
+                </pre>
+              )}
+
+              {/* Optional Legacy Service Account JSON */}
+              <div className="pt-2 border-t border-slate-800/70 text-xs">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-[11px] text-slate-500">
+                    Optional fallback: Backend Service Account JSON (
+                    {sheetsStatus.credentialSource === "saved_config" ||
+                    sheetsStatus.credentialSource === "json_env" ||
+                    sheetsStatus.credentialSource === "path"
+                      ? `configured via ${sheetsStatus.credentialSource}`
+                      : "not required"}
+                    )
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowSaForm((v) => !v)}
+                      className="text-[11px] text-slate-400 hover:text-slate-200 underline"
+                    >
+                      {showSaForm ? "Hide Optional Key Form" : "Configure Optional Service Account JSON"}
                     </button>
                     {sheetsStatus.credentialSource === "saved_config" && (
                       <button
                         type="button"
                         onClick={onRemoveServiceAccount}
                         disabled={savingServiceAccount}
-                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-rose-950/60 hover:bg-rose-900/70 border border-rose-800/60 disabled:opacity-60 text-rose-200 text-xs font-medium transition-colors"
+                        className="text-[11px] text-rose-300 hover:text-rose-200 underline"
                       >
-                        <Trash2 className="w-3 h-3" />
-                        <span>Remove Key</span>
+                        Remove Saved Key
                       </button>
                     )}
                   </div>
+                </div>
+                {showSaForm && (
+                  <div className="mt-2 space-y-2">
+                    <textarea
+                      rows={3}
+                      value={saJsonInput}
+                      onChange={(e) => setSaJsonInput(e.target.value)}
+                      placeholder='Optional Service Account JSON (not required when using Apps Script Webhook)'
+                      className="w-full px-3 py-2 rounded-lg bg-[#0B1324] border border-slate-700 text-[11px] font-mono text-slate-200 placeholder:text-slate-600 focus:outline-none focus:ring-2 focus:ring-sky-500"
+                    />
+                    <div className="flex justify-end">
+                      <button
+                        type="button"
+                        onClick={() => void handleSubmitServiceAccount()}
+                        disabled={savingServiceAccount || !saJsonInput.trim()}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 text-xs font-medium transition-colors"
+                      >
+                        <KeyRound className="w-3.5 h-3.5" />
+                        <span>{savingServiceAccount ? "Saving..." : "Save Optional JSON Key"}</span>
+                      </button>
+                    </div>
+                  </div>
                 )}
               </div>
-
-              {(!sheetsStatus.configured || showSaForm) && (
-                <div className="space-y-2 pt-2 border-t border-slate-800/80 text-xs">
-                  <ol className="list-decimal list-inside space-y-0.5 text-slate-400">
-                    <li>
-                      Enable <strong className="text-slate-200">Google Sheets API</strong> &amp;{" "}
-                      <strong className="text-slate-200">Google Drive API</strong> in Google Cloud Console.
-                    </li>
-                    <li>
-                      Create a <strong className="text-slate-200">Service Account</strong> and download its JSON key file.
-                    </li>
-                    <li>
-                      Paste the JSON key below (saved strictly in server storage <code className="text-slate-300">0600</code>, never in browser storage) or set <code className="text-slate-300">GOOGLE_SHEETS_CREDENTIALS_JSON</code>.
-                    </li>
-                  </ol>
-                  <textarea
-                    rows={4}
-                    value={saJsonInput}
-                    onChange={(e) => setSaJsonInput(e.target.value)}
-                    placeholder='{"type":"service_account","project_id":"...","client_email":"...@....iam.gserviceaccount.com","private_key":"-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"}'
-                    className="w-full px-3 py-2 rounded-lg bg-[#070D1A] border border-slate-700 text-[11px] font-mono text-slate-200 placeholder:text-slate-600 focus:outline-none focus:ring-2 focus:ring-sky-500"
-                  />
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <span className="text-[11px] text-slate-500">
-                      Private keys are never returned to the browser or written to CSV/ZIP exports.
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => void handleSubmitServiceAccount()}
-                      disabled={savingServiceAccount || !saJsonInput.trim()}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-sky-600 hover:bg-sky-500 disabled:opacity-50 text-white text-xs font-medium transition-colors"
-                    >
-                      <KeyRound className="w-3.5 h-3.5" />
-                      <span>
-                        {savingServiceAccount ? "Verifying & Saving..." : "Save Service Account JSON"}
-                      </span>
-                    </button>
-                  </div>
-                </div>
-              )}
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div className="space-y-1">
                 <div className="flex items-center justify-between gap-2">
                   <label htmlFor="target-spreadsheet-id" className="text-xs text-slate-400 block">
-                    Target Spreadsheet ID (blank = create new)
+                    Target Spreadsheet ID (optional override)
                   </label>
                   {targetSpreadsheetId.trim() !== "" && (
                     <button
@@ -1133,7 +1224,7 @@ export function OverviewPanel({
                       onClick={onClearTargetSpreadsheetId}
                       className="text-[11px] text-sky-400 hover:text-sky-300 underline"
                     >
-                      Clear (create new)
+                      Clear
                     </button>
                   )}
                 </div>
@@ -1142,7 +1233,7 @@ export function OverviewPanel({
                   type="text"
                   value={targetSpreadsheetId}
                   onChange={(e) => onTargetSpreadsheetIdChange(e.target.value)}
-                  placeholder="e.g. 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"
+                  placeholder="Auto-filled after Apps Script sync"
                   className="w-full px-3 py-1.5 rounded-lg bg-[#070D1A] border border-slate-800 text-xs font-mono text-slate-200 placeholder:text-slate-600 focus:outline-none focus:ring-2 focus:ring-sky-500"
                 />
               </div>
@@ -1193,38 +1284,42 @@ export function OverviewPanel({
                     </span>
                   )}
                 </div>
-                {sheetsStatus.spreadsheetUrl && sheetsStatus.status === "Connected" && (
-                  <div className="font-mono text-[11px] text-sky-300 truncate">
-                    {sheetsStatus.spreadsheetUrl}
-                  </div>
-                )}
+                {sheetsStatus.spreadsheetUrl &&
+                  (sheetsStatus.status === "Connected" ||
+                    (Boolean(sheetsStatus.webhookUrl) && Boolean(sheetsStatus.lastSyncAt))) && (
+                    <div className="font-mono text-[11px] text-sky-300 truncate">
+                      {sheetsStatus.spreadsheetUrl}
+                    </div>
+                  )}
                 {sheetsStatus.publicAccessError && (
                   <div className="text-[11px] text-amber-300/90 leading-snug">
                     {sheetsStatus.publicAccessError}
                   </div>
                 )}
               </div>
-              {sheetsStatus.spreadsheetUrl && sheetsStatus.status === "Connected" && (
-                <div className="flex items-center gap-2 shrink-0">
-                  <button
-                    type="button"
-                    onClick={() => void handleCopySpreadsheetUrl(sheetsStatus.spreadsheetUrl!)}
-                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium transition-colors"
-                  >
-                    {copiedUrl ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
-                    <span>{copiedUrl ? "Copied" : "Copy Link"}</span>
-                  </button>
-                  <a
-                    href={sheetsStatus.spreadsheetUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-sky-600 hover:bg-sky-500 text-white font-medium transition-colors"
-                  >
-                    <span>Open Google Sheet</span>
-                    <ExternalLink className="w-3 h-3" />
-                  </a>
-                </div>
-              )}
+              {sheetsStatus.spreadsheetUrl &&
+                (sheetsStatus.status === "Connected" ||
+                  (Boolean(sheetsStatus.webhookUrl) && Boolean(sheetsStatus.lastSyncAt))) && (
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => void handleCopySpreadsheetUrl(sheetsStatus.spreadsheetUrl!)}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium transition-colors"
+                    >
+                      {copiedUrl ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                      <span>{copiedUrl ? "Copied" : "Copy Link"}</span>
+                    </button>
+                    <a
+                      href={sheetsStatus.spreadsheetUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-sky-600 hover:bg-sky-500 text-white font-medium transition-colors"
+                    >
+                      <span>Open Google Sheet</span>
+                      <ExternalLink className="w-3 h-3" />
+                    </a>
+                  </div>
+                )}
             </div>
 
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
@@ -1288,7 +1383,7 @@ export function OverviewPanel({
                   {
                     step: 1,
                     key: "auth",
-                    label: "1. Configure Google Service Account",
+                    label: "1. Save Google Apps Script Webhook URL",
                     done: Boolean(sheetsStatus.configured),
                   },
                   {
@@ -1413,10 +1508,10 @@ export function OverviewPanel({
                 <ShieldCheck className="w-4 h-4 text-sky-400 shrink-0 mt-0.5" />
                 <div className="space-y-1">
                   <div className="font-medium text-slate-200">
-                    Service Account Sync &amp; Local CSV / ZIP Export Delivery
+                    Apps Script Auto-Sync &amp; Local CSV / ZIP Export Delivery
                   </div>
                   <p className="text-slate-400 leading-relaxed">
-                    Google Sheets exports authenticate directly on the backend using your Service Account (<code className="text-slate-300">spreadsheets</code> + <code className="text-slate-300">drive</code> scopes), persist the target spreadsheet ID for automated syncs, and grant <strong className="text-slate-200">Anyone with the link — Viewer</strong> access automatically. You can also download all <span className="font-mono text-slate-100">{totalRecords.toLocaleString()}</span> live SQLite records below as valid CSVs or a single ZIP archive anytime.
+                    Google Sheets exports POST all 6 SQLite tables directly to your saved Google Apps Script Web App URL (zero GCP credentials needed), preserve the returned spreadsheet link for automatic syncs, and configure <strong className="text-slate-200">Anyone with the link — Viewer</strong> sharing automatically. You can also download all <span className="font-mono text-slate-100">{totalRecords.toLocaleString()}</span> live SQLite records below as valid CSVs or a single ZIP archive anytime.
                   </p>
                 </div>
               </div>
